@@ -11,7 +11,8 @@
 #
 # What it does: Docker (from Docker's signed apt repository) and unattended-upgrades if missing; the idle-shutdown
 # timer; the game folder from the bucket when its marker changed (file times kept); the module and the deploy files
-# of the release; nfsu2.slice; /run/nfsu2/.env with the tunnel token from Secret Manager (tmpfs, 0600, root);
+# of the release; nfsu2.slice; the tunnel token from Secret Manager in /run/nfsu2/tunnel-token only (tmpfs, 0400,
+# cloudflared's uid), mounted into cloudflared and never in a container's environment; /run/nfsu2/.env (no secret);
 # then docker compose up -d. NFSU2_TURNSTILE_SITE and NFSU2_TURNSTILE_SECRET are never set: Cloudflare Access is
 # the gate.
 set -euo pipefail
@@ -32,6 +33,9 @@ DOCKER_KEY_FPR="9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
 BASE=/srv/nfsu2
 RUNDIR=/run/nfsu2
 COMPOSE_FILES="compose.yml:compose.tunnel.yml:compose.local.yml"
+TOKEN_FILE="$RUNDIR/tunnel-token"
+# the user of the cloudflare/cloudflared image (its Dockerfile at 2026.9.3: USER 65532:65532, distroless nonroot)
+CLOUDFLARED_UID=65532
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -279,29 +283,59 @@ main() {
     install -m 0644 "$dir/deploy/nfsu2.slice" /etc/systemd/system/nfsu2.slice
     systemctl daemon-reload
   fi
-  # one cloudflared, not the four of compose.tunnel.yml; the server in a cgroup namespace of its own (newer
-  # compose.yml says cgroup: host); NFSU2_COMPRESS_THREADS from .env reaches the server (compose.yml does not pass
-  # it): 0 keeps no compressed copies of the game in the state volume, and so none in the snapshots
-  cat > "$BASE/compose.local.yml" <<'LOCAL'
+  # one cloudflared, not the four of compose.tunnel.yml, reading its token from a file on tmpfs (never from its
+  # environment: Docker keeps a container's environment on the disk, and so in the snapshots). An empty TUNNEL_TOKEN
+  # replaces the placeholder of .env, and cloudflared then reads --token-file (cloudflared 2026.9.3,
+  # cmd/cloudflared/tunnel/subcommands.go: the file only when the token flag or TUNNEL_TOKEN is empty). The bind
+  # mount does not create a missing source: after a reboot cloudflared waits for this script to write the file.
+  # The server in a cgroup namespace of its own (newer compose.yml says cgroup: host). NFSU2_COMPRESS_THREADS from
+  # .env reaches the server (compose.yml does not pass it): 0 keeps no compressed copies of the game in the state
+  # volume, and so none in the snapshots.
+  cat > "$BASE/compose.local.yml" <<LOCAL
 # Written by the nfsu2 startup script at every start. Do not edit: the next start replaces it.
 services:
   cloudflared:
     scale: 1
+    command: ["tunnel", "--no-autoupdate", "run", "--token-file", "/run/secrets/tunnel-token"]
+    environment:
+      TUNNEL_TOKEN: ""
+    volumes:
+      - type: bind
+        source: $TOKEN_FILE
+        target: /run/secrets/tunnel-token
+        read_only: true
+        bind:
+          create_host_path: false
   server:
     cgroup: private
     environment:
-      NFSU2_COMPRESS_THREADS: ${NFSU2_COMPRESS_THREADS:-0}
+      NFSU2_COMPRESS_THREADS: \${NFSU2_COMPRESS_THREADS:-0}
 LOCAL
 
   # docker pulls from Artifact Registry with the VM's service account
   gcloud auth configure-docker "${image%%/*}" --quiet > /dev/null 2>&1
 
-  # the env file, on tmpfs, root only; the token is never printed
   install -d -m 0700 "$RUNDIR"
-  local token
+  # the tunnel token: only in this file on tmpfs, readable by cloudflared's user alone; never printed
+  local token rotated=0
   token="$(gcloud secrets versions access latest --secret=nfsu2-tunnel-token --project="$proj" 2> /dev/null || true)"
   [ -n "$token" ] || fail "secret nfsu2-tunnel-token has no value (or the VM may not read it)"
   [[ "$token" =~ ^[A-Za-z0-9+/=_-]+$ ]] || fail "secret nfsu2-tunnel-token does not look like a tunnel token"
+  # a directory in its place (Docker makes one for a missing bind source) goes first
+  [ -d "$TOKEN_FILE" ] && rm -rf "$TOKEN_FILE"
+  (
+    umask 077
+    printf '%s' "$token" > "$TOKEN_FILE.new"
+  )
+  unset token
+  chown "$CLOUDFLARED_UID:$CLOUDFLARED_UID" "$TOKEN_FILE.new"
+  chmod 0400 "$TOKEN_FILE.new"
+  if [ -f "$TOKEN_FILE" ] && ! cmp -s "$TOKEN_FILE.new" "$TOKEN_FILE"; then
+    rotated=1
+  fi
+  mv -f "$TOKEN_FILE.new" "$TOKEN_FILE"
+
+  # the env file, on tmpfs, root only; it holds no secret (TUNNEL_TOKEN is a placeholder for compose.tunnel.yml's check)
   (
     umask 077
     {
@@ -311,16 +345,20 @@ LOCAL
       printf 'NFSU2_IMAGE=%s\n' "$image"
       printf 'NFSU2_VAULT_GB=5\n'
       printf 'NFSU2_COMPRESS_THREADS=0\n'
-      printf 'TUNNEL_TOKEN=%s\n' "$token"
+      printf 'TUNNEL_TOKEN=unused-token-file\n'
       printf 'COMPOSE_FILE=%s\n' "$COMPOSE_FILES"
     } > "$RUNDIR/.env.new"
     mv -f "$RUNDIR/.env.new" "$RUNDIR/.env"
   )
-  unset token
   chmod 0600 "$RUNDIR/.env"
 
   log "starting release $rel"
   /usr/local/bin/nfsu2-compose up -d --remove-orphans
+  # a new token: the running cloudflared still holds the old file (a bind mount keeps the inode)
+  if [ "$rotated" = 1 ]; then
+    log "the tunnel token changed: recreating cloudflared"
+    /usr/local/bin/nfsu2-compose up -d --force-recreate cloudflared
+  fi
   docker image prune -f > /dev/null 2>&1 || true
   prune_releases "$rel"
   log "release $rel is up"

@@ -216,5 +216,8 @@ The build VM uploads only `out/web/nfsu2.wasm` and `out/web/nfsu2.json` of `out/
 
 ## Known limits
 
-- Docker keeps the tunnel token in its container configuration on the VM disk. The weekly snapshots hold that copy too. The file in `/run/nfsu2` is the only copy that the scripts write.
+- The VM keeps the tunnel token only in `/run/nfsu2/tunnel-token`. This folder is in memory, so the token is not on the disk or in the snapshots.
+- The file belongs to the cloudflared user (uid 65532) and has the mode 0400. cloudflared reads it with `--token-file`.
+- No container gets the token in its environment. `docker inspect` shows `TUNNEL_TOKEN` as empty.
+- After you change the token in Secret Manager, run `fork/gcp/release.sh <current commit>` or restart the VM.
 - Nobody has run these scripts against a real project or a real Cloudflare account yet. Run each script with `DRY_RUN=1` first.
