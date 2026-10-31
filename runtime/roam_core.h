@@ -21,8 +21,10 @@
 #include <stddef.h>
 
 #define RC_PROTO_VER     1          /* header byte 4; a different value is ignored */
-#define RC_CORE_VER      5          /* HELLO: implementation revision (2: lists of up to RC_MAX_PEERS; 3: RC_MSG_DUEL;
-                                       4: state extensions, RC_HF_STATEX; 5: race lobbies, RC_HF_LOBBY) */
+#define RC_CORE_VER      9          /* HELLO: implementation revision (2: lists of up to RC_MAX_PEERS; 3: RC_MSG_DUEL;
+                                       4: state extensions, RC_HF_STATEX; 5: race lobbies, RC_HF_LOBBY; 6: quick chat,
+                                       RC_HF_SAY; 7: crews, RC_HF_CREW; 8: crews from the hub, RC_HF_HUBCREW;
+                                       9: a HELLO to one peer names only that peer, roam_core.c fill_hello) */
 #define RC_MAGIC0        0x4E       /* "N2FR" */
 #define RC_MAGIC1        0x32
 #define RC_MAGIC2        0x46
@@ -55,25 +57,38 @@
 #define RC_EXT_PERF      1
 #define RC_EXT_HORN      2          /* car-look record extension 2: the player's horn, 1 byte */
 #define RC_DUEL_INBOX    16         /* DUEL messages held for the game side */
-#define RC_MAP_ENTRY     5          /* a MAP entry: x, y (int16, m), heading (u8, 256 a turn) */
-#define RC_MAP_PER       230        /* entries per MAP datagram at most */
-#define RC_MAP_PARTS     3          /* MAP datagrams per answer at most */
-#define RC_MAP_MAX       512        /* entries per answer at most (the hub's nearest) */
+#define RC_MAP_MAX       2048       /* entries per answer at most (the hub's nearest) */
+#define RC_MAPD_GONE     0x8000u    /* a MAPD entry's key (u16: the hub's slot of the player) with this: it went */
+#define RC_MAPD_PLACE    9          /* ...without: x, y (int16, m), heading (u8), velocity x, y (int8, m/s) follow */
+#define RC_MAPD_BYTES    1152       /* entries' bytes per MAPD datagram at most */
+#define RC_MAPD_PARTS    16         /* MAPD datagrams per answer at most */
 #define RC_LOBBY_MAX     6          /* players in a race lobby: the game's network race takes 6 */
 #define RC_LOBBY_INBOX   16         /* LOBBY messages held for the game side */
 #define RC_LOBBIES_ENTRY 11         /* a LOBBIES entry: x, y (int16, m), race (u32), n, max, state (u8) */
 #define RC_LOBBIES_MAX   96         /* entries per LOBBIES datagram (the hub's nearest) */
+#define RC_RACEREP_BYTES 64         /* a RACEREP's payload: lobby, race (u32); mode, laps (u8); track (u16); place, players,
+                                       flags, type, class (u8), 3 bytes 0; rating, field, factor, kW, kg, km/h, time (f32);
+                                       the name (16 bytes, NUL padded) */
+#define RC_RACEREP_NAME  16         /* its car type's name */
+#define RC_RACERES_HEAD  12         /* a RACERES's payload: lobby, race (u32); mode, laps, n (u8), a byte 0; then n rows */
+#define RC_RACERES_ROW   20         /* ...each: the player's id (u32), flags (u8), 3 bytes 0, its time, how far it came,
+                                       the way it drove (f32) */
+#define RC_SAY_INBOX     16         /* SAY messages held for the game side */
 
 /* message types (header byte 5) */
 enum { RC_MSG_HELLO = 1, RC_MSG_PEERS = 2, RC_MSG_SNAP = 3, RC_MSG_CFG = 4, RC_MSG_CFG_REQ = 5,
        RC_MSG_PING = 6, RC_MSG_PONG = 7, RC_MSG_BYE = 8, RC_MSG_DUEL = 9,
        /* the world map's other players: MAPREQ (req: our number for the
-        * question) only to the hub, which answers with MAP datagrams (req
-        * echoed; part of nparts; total: the players in our room past us and
-        * our peers; n entries of RC_MAP_ENTRY bytes: the ones nearest to us,
-        * past our peers, RC_MAP_MAX at most).  A hub before them ignores a
-        * MAPREQ, and only a core that asked gets a MAP */
-       RC_MSG_MAPREQ = 10, RC_MSG_MAP = 11,
+        * question; max: the most entries we take; base: the answer the core
+        * holds, 0 none) only to the hub, which answers with MAPD datagrams:
+        * req echoed, base (that answer, or 0: from nothing), part of nparts,
+        * total (the players in our room past us and our peers), n entries by
+        * the hub's slot of each player, in its order, the nearest max at
+        * most: each one come or moved off where the core moved it placed
+        * (RC_MAPD_PLACE: the core moves it on at its velocity), each one gone
+        * gone (RC_MAPD_GONE).  (11 was MAP, the whole list, before MAPD.) */
+       RC_MSG_MAPREQ = 10,
+       RC_MSG_MAPD = 17,
        /* a multiplayer race from free roam (roam_game.c mp_*): LOBBY between
         * players (op RC_LOBBY_*), only to a peer whose HELLO carries
         * RC_HF_LOBBY; the host's ADVERT also to the hub (to 0), which keeps
@@ -81,7 +96,27 @@ enum { RC_MSG_HELLO = 1, RC_MSG_PEERS = 2, RC_MSG_SNAP = 3, RC_MSG_CFG = 4, RC_M
         * with one LOBBIES datagram after its MAP (req echoed; n entries of
         * RC_LOBBIES_ENTRY bytes, nearest first: where each lobby's race
         * starts, its race, players, most players and state) */
-       RC_MSG_LOBBY = 12, RC_MSG_LOBBIES = 13 };
+       RC_MSG_LOBBY = 12, RC_MSG_LOBBIES = 13,
+       /* a player's report of a multiplayer race it raced (rc_racerep), only
+        * to the hub, once back in free roam: the server logs it.  A hub before
+        * it ignores the type, and no player is sent one */
+       RC_MSG_RACEREP = 14,
+       /* quick chat (roam_game.c say_*): one of the fixed phrases (a number:
+        * each player reads it in their own language, nobody types), to every
+        * established peer whose HELLO carries RC_HF_SAY; seq tells a repeat
+        * from a new one.  Two more bytes, 0 for now */
+       RC_MSG_SAY = 15,
+       /* the race's results as the reporter's game showed them (rc_raceres), only to the hub, with its RACEREP: every
+        * racer's place in them, by its player's id, its time and how far it came.  The server compares the players'
+        * games' results for a racer far ahead of the others (a teleport to the finish, a speed hack).  A hub before it
+        * ignores the type, and no player is sent one */
+       RC_MSG_RACERES = 16 };
+/* RACEREP flags */
+#define RC_RR_HOST       0x01       /* the reporter hosted the race */
+#define RC_RR_QUIT       0x02       /* ...left it with its pause menu's Quit */
+/* RACERES row flags */
+#define RC_RS_FINISHED   0x01       /* the racer finished (its time is the race's) */
+#define RC_RS_OURS       0x02       /* the reporter's own row (one at most) */
 /* LOBBY ops.  lobby: the host's id for it (nonzero); race: the career race's
  * name hash (race record +8, the same table in every game); x, y: where it
  * starts (m); ids: the players in it, the host first */
@@ -148,6 +183,30 @@ enum { RC_PLAT_MAC = 1, RC_PLAT_WIN = 2, RC_PLAT_TOOL = 3 };
  * after the engine of the longest form, and is skipped.  Only to a peer
  * whose HELLO carries the flag: an older core counts the longer SNAP as bad */
 #define RC_HF_STATEX     0x0040
+/* header flags (HELLO): this player takes quick chat (RC_MSG_SAY); an older
+ * core sends none and counts the type as bad */
+#define RC_HF_SAY        0x0100
+/* header flags (HELLO): this player reads crews.  A HELLO with it may end,
+ * after its ids, in its crews (the Crews setting): a count byte, at most
+ * RC_CREW_MAX, then that many rc_room_hash values (u32, none 0); whatever a
+ * newer core adds after them is skipped.  The crews go to the hub; to a peer
+ * whose HELLO carries the flag (an older core counts the longer HELLO as
+ * bad) only without a hub (a LAN of its own), and never in the beacon.
+ * Players who share a crew are linked first by the hub, wherever they are,
+ * and see each other in the crew's colour (roam_game.c).
+ * On a PEERS from the hub the same flag says the list ends in crew marks
+ * (only to a player whose HELLO carries RC_HF_HUBCREW): after the entries, the
+ * receiver's own crews as the hub has them (a count byte, at most
+ * RC_CREW_MAX, then that many hashes, none 0), then a byte per entry, bit c
+ * set: that player is in crew c of those too; whatever a newer hub adds
+ * after them is skipped.  So with a hub no player ever learns another's
+ * crews: a crew's hash would be all a stranger near us needs to be linked
+ * with us anywhere on the map, and a short crew name is easy to find from it */
+#define RC_HF_CREW       0x0200
+#define RC_CREW_MAX      4
+/* header flags (HELLO, core 8 and up): this player reads the crew marks of
+ * the hub's PEERS (RC_HF_CREW above); a hub sends them to no other */
+#define RC_HF_HUBCREW    0x0400
 /* decoder results */
 enum { RC_OK = 0, RC_E_SHORT = -1, RC_E_MAGIC = -2, RC_E_VERSION = -3, RC_E_LENGTH = -4,
        RC_E_CRC = -5, RC_E_TYPE = -6, RC_E_FIELD = -7, RC_E_TRAIL = -8, RC_E_RANGE = -9 };
@@ -168,7 +227,8 @@ uint32_t rc_get32(rc_r *r);
 float    rc_getf(rc_r *r);
 void     rc_getb(rc_r *r, void *dst, uint32_t n);
 uint32_t rc_crc32(const uint8_t *p, uint32_t n);
-uint32_t rc_fnv1a(const char *s);           /* room names -> room hash (0 for "") */
+uint32_t rc_fnv1a(const char *s);           /* 0 for "" */
+uint32_t rc_room_hash(const char *s);       /* room names -> room hash: capitals, blanks and invisible characters do not count (0: none) */
 uint32_t rc_fnv1a_bytes(const uint8_t *p, uint32_t n);
 uint32_t rc_fbits(float f);
 float    rc_bitsf(uint32_t u);
@@ -219,25 +279,64 @@ typedef struct {
     int16_t  x, y;                 /* where the race starts (m) */
     uint16_t t_ms;                 /* START: in this many ms */
     uint8_t  n;                    /* players in it */
+    uint8_t  away_s;               /* ADVERT: its host seems away, the lobby closes in this many s (0: not); the byte
+                                    * after n, reserved before it: older games send 0 and skip it, as the hub does */
     uint32_t ids[RC_LOBBY_MAX];    /* the host first */
 } rc_lobby;
+
+/* a RACEREP (RC_RACEREP_BYTES on the wire): the race (its lobby, the career
+ * race's name hash, the network race's type, track and laps), how the
+ * reporter did, and its car as the game rated it (mprace.c CarPerf) */
+typedef struct {
+    uint32_t lobby, race;
+    uint8_t  mode;                 /* the network race's type: 0 circuit, 1 sprint, 2 drag, 3 drift, 4 URL, 10 Street X */
+    uint8_t  laps;
+    uint16_t track;
+    uint8_t  place;                /* 1 .. players; 0: not finished */
+    uint8_t  players;              /* the race's cars (1 .. RC_LOBBY_MAX) */
+    uint8_t  flags;                /* RC_RR_* */
+    uint8_t  type;                 /* the car's CarTypeInfo index */
+    int8_t   cls;                  /* the game's class: 0 fastest .. 3, -1 not rated */
+    float    rating;               /* the game's rating of the car */
+    float    field;                /* the average rating of the race's cars */
+    float    factor;               /* the car's engine power times this in the race (1: as it is) */
+    float    kw, kg, kmh;          /* its engine's most power, its mass, its top speed */
+    float    time;                 /* the race's time, s (0: none) */
+    char     name[RC_RACEREP_NAME + 1];   /* the car type's name, printable */
+} rc_racerep;
+
+/* a RACERES: the race (its lobby and the career race's name hash, the network race's type and laps) and its results'
+ * rows in the game's order (1 .. RC_LOBBY_MAX): each racer's player id (0: a racer the reporter could not name),
+ * whether it finished and is ours (RC_RS_*), its row's time (s: a finisher's its finish; one still on the way, when
+ * the race ended, 30 s after the first), how far it came (laps: the game's count, a finisher as many whole laps as
+ * the farthest) and the way it drove (m: its average speed for its time, as the game counts it) */
+typedef struct {
+    uint32_t lobby, race;
+    uint8_t  mode, laps, n;
+    struct { uint32_t id; uint8_t flags; float time, done, dist; } row[RC_LOBBY_MAX];
+} rc_raceres;
 
 typedef struct {
     rc_hdr h;
     union {
         struct { uint16_t core_ver; uint8_t platform, status; uint16_t listen_port, cfg_rev;
-                 uint32_t room; char name[RC_NAME_MAX + 1]; uint8_t n_seen; uint32_t seen[RC_MAX_PEERS]; } hello;
-        struct { uint8_t n; struct { uint32_t ip; uint16_t port; uint32_t id; } e[RC_MAX_PEERS]; } peers;
+                 uint32_t room; char name[RC_NAME_MAX + 1]; uint8_t n_seen; uint32_t seen[RC_MAX_PEERS];
+                 uint8_t n_crews; uint32_t crews[RC_CREW_MAX]; } hello;   /* crews: with RC_HF_CREW only */
+        struct { uint8_t n; struct { uint32_t ip; uint16_t port; uint32_t id; } e[RC_MAX_PEERS];
+                 uint8_t n_mine; uint32_t mine[RC_CREW_MAX]; uint8_t crew[RC_MAX_PEERS]; } peers;   /* the crew marks: with RC_HF_CREW only */
         struct { uint8_t status, epoch; uint16_t cfg_rev; uint8_t n, clock; rc_state s[RC_SNAP_STATES]; } snap;
         struct { uint16_t cfg_rev; uint8_t frag, nfrag; uint16_t total, dlen; const uint8_t *data; } cfg;
         struct { uint16_t cfg_rev; uint8_t have_mask; } cfgreq;
         struct { uint32_t t0, t1, t2; } ping;          /* PING: t0 only */
         struct { uint8_t reason; } bye;
         struct { uint8_t op, arg; uint32_t to, duel; } duel;      /* to: the player it is for */
-        struct { uint16_t req; } mapreq;
-        struct { uint16_t req, total; uint8_t part, nparts, n; const uint8_t *data; } map;   /* data: n entries */
+        struct { uint16_t req, max, base; } mapreq;
+        struct { uint16_t req, base, total, len; uint8_t part, nparts, n; const uint8_t *data; } mapd;   /* data: n entries, len bytes */
         rc_lobby lobby;
         struct { uint16_t req; uint8_t n; const uint8_t *data; } lobbies;   /* data: n entries */
+        rc_racerep racerep;
+        struct { uint8_t phrase, seq; } say;
+        rc_raceres raceres;
     } u;
 } rc_msg;
 
@@ -345,10 +444,17 @@ typedef struct {
 } rc_io;
 enum { RC_EV_JOIN = 1, RC_EV_LEAVE = 2, RC_EV_NOTE = 3, RC_EV_CFG = 4, RC_EV_RESTART = 5 };
 
+/* a player on the world map (MAPD): the hub's key for it, where it was and
+ * its heading and velocity (m/s) at at_us, when the hub said so; it is
+ * x + vx * (now - at_us) on */
+typedef struct { uint16_t id; int16_t x, y; uint8_t heading; int8_t vx, vy; int64_t at_us; } rc_mapent;
+
 typedef struct {
     uint32_t self_id;              /* random, nonzero, per start */
     uint16_t port;                 /* our listen port (HELLO) */
-    uint32_t room;                 /* rc_fnv1a(room name) */
+    uint32_t room;                 /* rc_room_hash(room name) */
+    uint32_t crews[RC_CREW_MAX];   /* rc_room_hash(crew name), each its own, in the player's order (n_crews of them) */
+    int      n_crews;
     char     name[RC_NAME_MAX + 1];
     uint8_t  platform;
     int      discovery;            /* beacon through io.broadcast every 2 s */
@@ -361,7 +467,7 @@ typedef struct {
     int      snap_states;
     /* a free-roam hub (the browser's server, web/server-rs/crates/roam), or 0:
      * it gets a HELLO every second and a SNAP twice a second, and answers
-     * every second with a PEERS list of the players near us.  While it
+     * every half second with a PEERS list of the players near us.  While it
      * answers, that list is who our peers are: nobody else is taken, a peer
      * it no longer lists goes ("out of range"), and there is no discovery
      * and no gossip.  Silent for 10 s (or from the start): discovery and
@@ -370,6 +476,7 @@ typedef struct {
     uint16_t hub_port;
     int      duels;                /* we take outrun challenges (HELLO says so: RC_HF_DUELS) */
     int      lobbies;              /* we take race lobbies (HELLO says so: RC_HF_LOBBY) */
+    int      say;                  /* we take quick chat (HELLO says so: RC_HF_SAY) */
 } rc_config;
 
 enum { RC_PS_FREE = 0, RC_PS_CANDIDATE = 1, RC_PS_HEARD = 2, RC_PS_EST = 3 };
@@ -388,6 +495,10 @@ typedef struct {
     uint8_t  duels;                /* its HELLO says it takes outrun challenges (RC_HF_DUELS) */
     uint8_t  lobbies;              /* its HELLO says it takes race lobbies (RC_HF_LOBBY) */
     uint8_t  statex;              /* its HELLO says it reads state extensions (RC_HF_STATEX) */
+    uint8_t  say;                  /* its HELLO says it takes quick chat (RC_HF_SAY) */
+    uint8_t  reads_crews;          /* its HELLO says it reads crews (RC_HF_CREW) */
+    uint8_t  n_crews;  uint32_t crews[RC_CREW_MAX];   /* its crews, as its last HELLO had them (an older core's, or no hub) */
+    uint8_t  n_hub_crews; uint32_t hub_crews[RC_CREW_MAX];   /* our crews it is in too, as the hub's last list naming it said */
     uint16_t cfg_rev_seen;         /* what the peer announces */
     int      hears_us, lost;
     int      hears_miss;           /* with the hub: one HELLO without our id forgiven (hub mode only) */
@@ -441,13 +552,16 @@ typedef struct {
     int       n_duel_in;
     uint32_t  duel_dropped;        /* the inbox was full */
     /* the world map's other players (rc_ask_map): our last question, the
-     * answer's parts so far, and the last complete answer (map_gen +1 for
-     * each); entry k of part j at j * RC_MAP_PER + k */
+     * answer's parts so far (part j at j * RC_MAPD_BYTES), and the players
+     * as of the last complete answer (map_held its question; map_gen +1 for
+     * each), by id */
     uint16_t  map_req;  int64_t map_asked_us;
-    uint8_t   map_mask, map_nparts;  uint8_t map_part_n[RC_MAP_PARTS];  uint16_t map_asm_total;
-    uint8_t   map_asm[RC_MAP_PARTS * RC_MAP_PER * RC_MAP_ENTRY];
+    uint16_t  map_mask;  uint8_t map_nparts;  uint8_t map_part_n[RC_MAPD_PARTS];  uint16_t map_part_len[RC_MAPD_PARTS];
+    uint16_t  map_asm_total, map_asm_base;
+    uint8_t   map_asm[RC_MAPD_PARTS * RC_MAPD_BYTES];
+    uint16_t  map_held;
     uint32_t  map_gen;  int map_n;  uint16_t map_total;
-    struct { int16_t x, y; uint8_t heading; } map_e[RC_MAP_PARTS * RC_MAP_PER];
+    rc_mapent map_e[RC_MAP_MAX], map_tmp[RC_MAP_MAX];
     /* LOBBY messages for us (to our id) from established peers, oldest
      * first, until the game side takes them (rc_take_lobby) */
     struct { uint32_t from; rc_lobby l; } lobby_in[RC_LOBBY_INBOX];
@@ -457,6 +571,11 @@ typedef struct {
      * question (lobbies_gen +1 for each) */
     uint32_t  lobbies_gen;  int lobbies_n;  uint16_t lobbies_req;   /* (the question they answered) */
     struct { int16_t x, y; uint32_t race; uint8_t n, max, state; } lobbies_e[RC_LOBBIES_MAX];
+    /* SAY messages from established peers, oldest first, until the game
+     * side takes them (rc_take_say) */
+    struct { uint32_t from; uint8_t phrase, seq; } say_in[RC_SAY_INBOX];
+    int       n_say_in;
+    uint32_t  say_dropped;         /* the inbox was full */
 } rc_session;
 
 void rc_session_init(rc_session *s, const rc_config *cfg, const rc_io *io);
@@ -475,19 +594,44 @@ void rc_bump_epoch(rc_session *s);       /* teleport: receivers snap */
 void rc_bump_clock(rc_session *s);       /* stamps re-anchored: receivers re-sync, blended */
 void rc_shutdown(rc_session *s, uint8_t reason);   /* BYE x3 to every peer, then the session is silent */
 int  rc_established(const rc_session *s);
+/* peer i is on the hub's last list (or there is no hub): a peer left out goes within T_HUB_GRACE, and the game gives
+ * its car's slot to one the hub lists */
+int  rc_peer_listed(const rc_session *s, int i);
+/* the first of our crews (conf.crews) that peer i is in too: 0 .. n_crews - 1, or -1 (as the hub's list marks it,
+ * or as its HELLO names its crews: an older core's, or without a hub) */
+int  rc_peer_crew(const rc_session *s, int i);
+/* our crews changed while the session runs: at most RC_CREW_MAX, 0s and
+ * repeats left out; the hub (or without one, the peers) hears them at the
+ * next tick */
+void rc_set_crews(rc_session *s, const uint32_t *crews, int n);
+/* our room changed while the session runs (rc_room_hash, 0: none): every
+ * peer of the old one goes, with the world map's markers and lobbies, and the
+ * hub (or the peers) hears the new one at the next tick.  The number of
+ * established peers that went (0 also for the same room: nothing changes) */
+int  rc_set_room(rc_session *s, uint32_t room);
 /* a DUEL message to the established peer with id `to`, if its HELLO said it
  * takes them; 1 when sent */
 int  rc_send_duel(rc_session *s, uint32_t to, uint8_t op, uint8_t arg, uint32_t duel);
 /* the oldest DUEL message for us not taken yet; 1 when there was one */
 int  rc_take_duel(rc_session *s, uint32_t *from, uint8_t *op, uint8_t *arg, uint32_t *duel);
-/* asks the hub (while it answers) for the world map's other players; 1 when
- * asked.  The answer is in map_e[0 .. map_n) once map_gen changes */
-int  rc_ask_map(rc_session *s, int64_t now_us);
+/* asks the hub (while it answers) for the world map's other players, max at
+ * most (RC_MAP_MAX), as what changed since the answer we hold; 1 when asked.
+ * The players are in map_e[0 .. map_n) once map_gen changes */
+int  rc_ask_map(rc_session *s, int64_t now_us, int max);
 /* a LOBBY message to the established peer with id l->to, if its HELLO said
  * it takes them, or (to 0) to the hub while it answers; 1 when sent */
 int  rc_send_lobby(rc_session *s, const rc_lobby *l);
 /* the oldest LOBBY message for us not taken yet; 1 when there was one */
 int  rc_take_lobby(rc_session *s, uint32_t *from, rc_lobby *l);
+/* a race report to the hub (RC_MSG_RACEREP), while it answers; 1 when sent */
+int  rc_send_racerep(rc_session *s, const rc_racerep *r);
+/* the race's results to the hub (RC_MSG_RACERES), while it answers; 1 when sent */
+int  rc_send_raceres(rc_session *s, const rc_raceres *r);
+/* a quick-chat phrase to every established peer whose HELLO said it takes
+ * them; how many it went to */
+int  rc_send_say(rc_session *s, uint8_t phrase, uint8_t seq);
+/* the oldest SAY not taken yet; 1 when there was one */
+int  rc_take_say(rc_session *s, uint32_t *from, uint8_t *phrase, uint8_t *seq);
 const char *rc_status_name(int st);
 
 #endif

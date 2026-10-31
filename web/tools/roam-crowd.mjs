@@ -2,14 +2,20 @@
 // tests/roam_crowd.c, built here for wasm without a C library) on its own WebSocket to a server's switch,
 // driving along a track.  Real game pages (web/tools/roam-pair.mjs) can join the same server meanwhile.
 //
-//   node web/tools/roam-crowd.mjs [--base http://localhost:8655] [--n 62] [--seconds 120] [--room <name>]
+//   node web/tools/roam-crowd.mjs [--base http://localhost:8655] [--n 62] [--seconds 120] [--room <name>] [--crew <name>]
 //        [--track <pose.csv>] [--speed 15] [--spread 20] [--car 350Z] [--cars A,B,..|all] [--parts <list>|@<file>] [--stagger 50] [--states 1]
 //        [--out <summary.json>]
-//        [--race 1-3:60:120] [--bundle] [--first 0]
+//        [--race 1-3:60:120] [--bundle] [--first 0] [--loop-ms 10] [--hold 50] [--lobbies 7:S2_SPRINT_3,S2_URL_2]
 //
 // --bundle the players send and take bundles as the page does (web/src/net/index.ts TxBundle, nfsu2-lan kind 32): what
 //          one tick or one received message made them send goes as one message, a snapshot to several friends once
 //          with their addresses.  Without it each datagram is a message of its own, as a page of before sends them.
+// --loop-ms the core's timers run this often (the game's network thread: runtime/web/roam_web.c, rc_tick every 10 ms),
+//          each pass's datagrams one message, a car state still 20 times a second; without it everything runs once a
+//          car state (50 ms), so a player's pings, pongs and HELLOs mostly go with its snapshots: fewer messages than
+//          a page sends.
+// --hold   a player's own datagrams (pings, pongs, HELLOs, the SNAP to the hub) wait for its next car state to a friend,
+//          this many ms after its last message at most, as the page holds them (web/src/net/index.ts TX_HOLD_MS)
 // --first  the first player's number (from 0), for several of these at once on one server: their names and client
 //          addresses stay apart.
 // --cars   the players' cars in turn (car type names, CarTypeInfo +0), or all: the game's 31 player cars, PEUGOT to
@@ -17,8 +23,13 @@
 // --parts  the players' cars' parts instead of the stock ones, slot:key:owner in hex, comma-separated (or from a file): a
 //          record names every part (tests/scripts/roam_crowd_rims.parts: a 350Z with the rim shops' rims).
 // --states the car states in each SNAP: 1 as the browsers send them (roam_web.c), 3 as a LAN does.
+// --crew   every player is in this crew (the Crews setting's one name): the hub links them to the players who share it
+//          first, wherever they are, and those see them in the crew's colour.
 // --race   players first to last (Bot01 is 1) are in a race from one second to the other after the start: they
 //          announce it (RC_ST_EVENT) and send no car meanwhile, as a game in a race does.
+// --lobbies every n-th player hosts a race lobby where it is at its first tick, one of these career races in turn (their
+//          names: the hub keeps the race's name hash), with 1 to 5 players, its advert to the hub once a second: the world
+//          map's lobby icons and labels (tests/scripts/roam_map_filter.txt).
 // --track  a pose log (NFSU2_ROAM_POSELOG): the first player's L rows, a real drive; every simulated player
 //          follows it from its own point along it, so they spread over the route.  Without one: circles of 20 to
 //          120 m around the new career's start (1695, -884, 24), or --spread m apart (6 circles, the first at --spread).
@@ -35,15 +46,17 @@ import { WebSocket } from 'ws';
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const argv = process.argv.slice(2);
 const opt = (k, d) => { const i = argv.indexOf('--' + k); return i >= 0 && i + 1 < argv.length ? argv[i + 1] : d; };
-const BASE = opt('base', 'http://localhost:8655'), N = +opt('n', 62), SECONDS = +opt('seconds', 120), ROOM = opt('room', '');
+const BASE = opt('base', 'http://localhost:8655'), N = +opt('n', 62), SECONDS = +opt('seconds', 120), ROOM = opt('room', ''), CREW = opt('crew', '');
 const SPEED = +opt('speed', 15), CAR = opt('car', '350Z'), STAGGER = +opt('stagger', 50), TRACK = opt('track', ''), OUTF = opt('out', '');
 const STATES = +opt('states', 1), SPREAD = +opt('spread', 20), BUNDLE = argv.includes('--bundle'), FIRST = +opt('first', 0);
+const LOOP_MS = +opt('loop-ms', 0), HOLD = +opt('hold', 0);
 const PARTS = (p => p.startsWith('@') ? fs.readFileSync(p.slice(1), 'utf8').trim() : p)(opt('parts', ''));
 const RACE = (opt('race', '').match(/^(\d+)-(\d+):(\d+):(\d+)$/) ?? []).slice(1).map(Number);
 const ALL_CARS = ['PEUGOT', 'FOCUS', 'COROLLA', '240SX', 'MIATA', 'CIVIC', 'PEUGOT106', 'CORSA', 'HUMMER', 'NAVIGATOR', 'ESCALADE', 'TIBURON',
   'SENTRA', 'CELICA', 'IS300', 'SUPRA', 'GOLF', 'A3', 'RSX', 'ECLIPSE', 'TT', 'RX8', '350Z', 'G35', '3000GT', 'GTO', 'MUSTANGGT', 'SKYLINE',
   'LANCEREVO8', 'RX7', 'IMPREZAWRX'];
 const CARS = opt('cars', '') === 'all' ? ALL_CARS : opt('cars', '') ? opt('cars', '').split(',') : [CAR];
+const LOBBIES = (opt('lobbies', '').match(/^(\d+):(.+)$/) ?? []).slice(1);
 const HUB = 0x0A4D00FD, PORT = 47210;
 
 // the core for wasm: no C library (wasip1 for its headers: names.h's <string.h>), bulk memory for the copies
@@ -54,7 +67,17 @@ execFileSync(path.join(WASI, 'bin/clang'), ['--target=wasm32-wasip1', '-O2', '-f
   '-Iruntime', '-Wl,--no-entry', '-Wl,--export-dynamic', '-o', WASM, 'tests/roam_crowd.c', 'runtime/roam_core.c'], { cwd: REPO, stdio: 'inherit' });
 const mod = await WebAssembly.compile(fs.readFileSync(WASM));
 
-const fnv1a = s => { if (!s) return 0; let h = 0x811C9DC5; for (const c of Buffer.from(s, 'latin1')) { h ^= c; h = Math.imul(h, 0x01000193) >>> 0; } return h || 1; };
+// a room's hash as roam_core.c rc_room_hash makes it of an ASCII name (capitals and spaces do not count; the core also
+// folds capitals past A to Z and Unicode's blanks, which a crowd's names here never have)
+const roomHash = s => {
+  let h = 0x811C9DC5, kept = 0;
+  for (let c of Buffer.from(s, 'utf8')) {
+    if (c === 32 || (c >= 9 && c <= 13)) continue;
+    if (c >= 65 && c <= 90) c += 32;
+    h ^= c; h = Math.imul(h, 0x01000193) >>> 0; kept++;
+  }
+  return !kept ? 0 : h || 1;
+};
 const bhash = s => { let h = 0xFFFFFFFF; for (const c of Buffer.from(s, 'latin1')) h = (Math.imul(h, 33) + c) >>> 0; return h; };   // the game's bStringHash
 const nowUs = () => (performance.timeOrigin + performance.now()) * 1000;
 
@@ -134,11 +157,11 @@ class Bot {
       if (!bin) {
         const m = JSON.parse(String(d));
         if (m.t === 'welcome' && !this.vip) {
-          this.vip = m.vip >>> 0; this.bundles = BUNDLE && m.bundle === 1;
-          ws.send(JSON.stringify({ t: 'hello', name: this.name, deltas: 1, ...(BUNDLE ? { bundle: 1 } : {}) }));
+          this.vip = m.vip >>> 0; this.bundles = BUNDLE;
+          ws.send(JSON.stringify({ t: 'hello', name: this.name, ...(BUNDLE ? { bundle: 1 } : {}) }));
           const io = this.x.crowd_io(), m8 = this.mem();
           const b = Buffer.from(`${this.name}\0${this.car}\0${PARTS}\0`, 'latin1'); m8.set(b, io);
-          this.x.crowd_init(this.id, fnv1a(ROOM), HUB, PORT, bhash(this.car), STATES, nowUs());
+          this.x.crowd_init(this.id, roomHash(ROOM), roomHash(CREW), HUB, PORT, bhash(this.car), STATES, nowUs());
           this.ready = true;
         }
         return;
@@ -171,30 +194,41 @@ class Bot {
     if (this.bundles) this.q.push(f); else { this.ws.send(f); st.outMsg++; }
   }
   /** what waits, as bundles */
-  flush() {
+  flush(now = false) {
     if (!this.q.length) return;
+    if (HOLD && !now && performance.now() - (this.sent ?? 0) < HOLD && !this.q.some(f => f[21] === 3 && f.readUInt32BE(8) !== HUB)) return;
     if (this.ws.readyState === 1) for (const m of bundled(this.q)) { this.ws.send(m); st.outMsg++; }
-    this.q = [];
+    this.q = []; this.sent = performance.now();
   }
-  tick(t) {
+  tick(t, snap = true) {
     if (!this.ready) return;
     const racing = RACE.length === 4 && this.i + 1 >= RACE[0] && this.i + 1 <= RACE[1] && t >= RACE[2] && t < RACE[3];
     if (racing !== !!this.racing) {
       this.racing = racing; this.x.crowd_status(racing ? 3 : 2);
       console.log(`roam-crowd: t=${t.toFixed(0)}s ${this.name} ${racing ? 'in a race' : 'back in free roam'}`);
     }
-    if (racing) { this.x.crowd_wait(nowUs()); this.flush(); return; }
+    if (racing || !snap) { this.x.crowd_wait(nowUs()); this.flush(); return; }
     const { p, v } = track(t, this.i);
     this.x.crowd_tick(nowUs(), p[0], p[1], p[2], v[0], v[1], v[2], Math.atan2(v[1], v[0]));
+    if (LOBBIES.length && this.i % +LOBBIES[0] === 0 && t - (this.advT ?? -9) >= 1) {
+      const races = LOBBIES[1].split(',');
+      this.advT = t;
+      this.lob ??= { id: (this.id ^ 0x5a5a) >>> 0, race: bhash(races[(this.i / +LOBBIES[0] | 0) % races.length]), x: Math.round(p[0]), y: Math.round(p[1]), n: 1 + this.i % 5 };
+      this.x.crowd_lobby(this.lob.id, this.lob.race, this.lob.x, this.lob.y, this.lob.n, 6);
+    }
     this.flush();
   }
-  stop() { if (this.ready) { this.x.crowd_stop(); this.flush(); } setTimeout(() => this.ws.close(), 200); }
+  stop() { if (this.ready) { this.x.crowd_stop(); this.flush(true); } setTimeout(() => this.ws.close(), 200); }
 }
 
 const bots = [];
 for (let i = 0; i < N; i++) { const b = new Bot(FIRST + i); bots.push(b); await b.start(); await new Promise(r => setTimeout(r, STAGGER)); }
 const t0 = performance.now();
-const timer = setInterval(() => { const t = (performance.now() - t0) / 1000; for (const b of bots) b.tick(t); }, 50);
+let passes = 0;
+const timer = setInterval(() => {
+  const t = (performance.now() - t0) / 1000, snap = !LOOP_MS || passes++ % Math.round(50 / LOOP_MS) === 0;
+  for (const b of bots) b.tick(t, snap);
+}, LOOP_MS || 50);
 let last = { ...st }, lastT = performance.now();
 const samples = [];
 const report = setInterval(() => {

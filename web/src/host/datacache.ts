@@ -11,15 +11,17 @@ export const CACHE_DIR = 'cache';
 export const MANIFEST_URL = '/data-manifest', DATA_BASE = '/data/';
 
 /** the server's /data-manifest: every file and folder of the install folder it serves, and where it serves runs
- *  of their blocks compressed (an older server has no "blocks": byte ranges of /data/ then) */
+ *  of their blocks compressed */
 export interface Manifest {
   files: { p: string; d?: number; s?: number; m?: number }[];
-  blocks?: { url: string; size: number; max: number };
+  blocks: { url: string; size: number; max: number };
 }
-/** The manifest's compressed runs, if it has them in this cache's block size: [url, most blocks a request]. */
-export function blockRuns(m: Manifest): { url: string; max: number } | null {
+/** The manifest's compressed runs in this cache's block size: [url, most blocks a request]; throws when it names
+ *  none. */
+export function blockRuns(m: Manifest): { url: string; max: number } {
   const b = m.blocks;
-  return b && typeof b.url === 'string' && b.url.startsWith('/') && b.size === BLOCK && b.max >= 1 ? { url: b.url, max: b.max } : null;
+  if (b && typeof b.url === 'string' && b.url.startsWith('/') && b.size === BLOCK && b.max >= 1) return { url: b.url, max: b.max };
+  throw new Error(`the list of game files names no blocks of ${BLOCK} bytes (${JSON.stringify(b ?? null)})`);
 }
 /** blocks first .. first+n-1 of a file, compressed: a 200 whose body (decoded by the browser) is exactly their bytes.  The
  *  file's mtime and size (m, s) make a changed file a new address, so the server lets Cloudflare keep the answer for
@@ -32,18 +34,36 @@ export interface CacheFile { h: FileSystemSyncAccessHandle; have: Uint8Array; ha
 export const manifestFiles = (m: Manifest): DataFile[] => m.files.filter(f => !f.d).map(f => ({ path: f.p, size: f.s ?? 0, mtime: f.m ?? 0 }));
 const parts = (f: DataFile) => f.path.toLowerCase().split('/');
 /** The files a game in this language reads: the folder's, but where its language pack (LANGPACKS/<language>,
- *  runtime/language.c) has a file of the same path, that one; no other language's pack. */
-function gameFiles(files: DataFile[], language: string): DataFile[] {
+ *  runtime/language.c) has a file of the same path, that one; no other language's pack; of the texture packs
+ *  (TEXPACKS/<name>.pak, runtime/web/texrep_web.c) only the one picked (texpack, '' for none). */
+function gameFiles(files: DataFile[], language: string, texpack: string): DataFile[] {
   const own = new Set(files.filter(f => { const p = parts(f); return p[0] === 'langpacks' && p[1] === language; })
     .map(f => parts(f).slice(2).join('/')));
-  return files.filter(f => { const p = parts(f); return p[0] === 'langpacks' ? p[1] === language : !own.has(p.join('/')); });
+  return files.filter(f => {
+    const p = parts(f);
+    if (p[0] === 'texpacks') return p.length === 2 && p[1] === `${texpack}.pak`;
+    return p[0] === 'langpacks' ? p[1] === language : !own.has(p.join('/'));
+  });
 }
 const isMovie = (f: DataFile) => { const p = parts(f); return (p[0] === 'langpacks' ? p[2] : p[0]) === 'movies'; };
+/** The AV1 copy of a movie (tools/movies_av1.py, played where the browser decodes AV1: movie.ts): MOVIES/<name>.vp6 ->
+ *  MOVIES/AV1/<name>.vp6, the same in a language pack's MOVIES; null for any other path. */
+export function av1Path(path: string): string | null {
+  const p = path.split('/'), i = p[0].toLowerCase() === 'langpacks' ? 2 : 0;
+  if (p.length !== i + 2 || p[i].toLowerCase() !== 'movies' || !p[i + 1].toLowerCase().endsWith('.vp6')) return null;
+  return [...p.slice(0, i + 1), 'AV1', p[i + 1]].join('/');
+}
 /** What "Preload the game data" fetches: all but the movies (MOVIES/, a third of the folder in VP6 video that
- *  does not compress).  They stream as they play, and with Movies off the game never opens them. */
-export const aheadFiles = (files: DataFile[], language: string) => gameFiles(files, language).filter(f => !isMovie(f));
-/** The movies a game in this language can open. */
-export const languageMovies = (files: DataFile[], language: string) => gameFiles(files, language).filter(isMovie);
+ *  does not compress, and their AV1 copies).  They stream as they play, and with Movies off the game never opens
+ *  them. */
+export const aheadFiles = (files: DataFile[], language: string, texpack = '') =>
+  gameFiles(files, language, texpack).filter(f => !isMovie(f));
+/** The movies a game in this language can open: its VP6 files, or where it plays AV1 (av1) their AV1 copies, the
+ *  VP6 file where a movie has none (as the I/O worker opens them, io-worker.ts dataFile). */
+export function languageMovies(files: DataFile[], language: string, av1 = false): DataFile[] {
+  const all = gameFiles(files, language, '').filter(isMovie), byPath = new Map(all.map(f => [f.path.toLowerCase(), f]));
+  return all.filter(f => av1Path(f.path) !== null).map(f => (av1 && byPath.get(av1Path(f.path)!.toLowerCase())) || f);
+}
 export const dataUrl = (base: string, path: string) => base + path.split('/').map(encodeURIComponent).join('/');
 export function cacheKey(f: DataFile) { return `${f.path.replace(/[^A-Za-z0-9._-]/g, '_')}.${f.size}.${f.mtime}`; }
 export const blockCount = (size: number) => Math.ceil(size / BLOCK);

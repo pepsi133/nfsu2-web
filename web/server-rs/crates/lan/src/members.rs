@@ -12,8 +12,9 @@ use nfsu2_util::{Bucket, now_ms, vip_str};
 use serde_json::{Map, Value};
 
 use crate::conn::{Conn, Out};
+use crate::queue::Line;
 use crate::text::{js_string, new_token, token_fits, token_hash};
-use crate::{ADDRS, AttachCtx, CtlBuckets, LAN_OFF, LAN_ON, LanSwitch, MASK, Pair, Peer, slot, vip_at};
+use crate::{ADDRS, AttachCtx, CtlBuckets, LanSwitch, MASK, Pair, Peer, slot, vip_at};
 
 /// A departed holder's address, kept for its token only.
 pub(crate) struct Reservation {
@@ -32,16 +33,16 @@ pub(crate) struct Members {
     pub(crate) reserved: IndexMap<u32, Reservation>,
     next: usize,
     /// the peer list: addresses that joined, got their name or left since the last change went out, and the ones
-    /// that left; when the whole list last went to the clients that take no changes
+    /// that left
     changed: IndexSet<u32>,
     left: IndexSet<u32>,
     delta_armed: bool,
-    full_armed: bool,
-    full_at: f64,
     /// the store: a save waits (`era` tells a stale timer), the order of what was saved
     save_armed: bool,
     save_gen: u64,
     save_seq: u64,
+    /// the pages waiting for a place (queue.rs)
+    pub(crate) line: Line,
 }
 
 impl Members {
@@ -54,19 +55,16 @@ impl Members {
             changed: IndexSet::new(),
             left: IndexSet::new(),
             delta_armed: false,
-            full_armed: false,
-            full_at: f64::NEG_INFINITY,
             save_armed: false,
             save_gen: 0,
             save_seq: 0,
+            line: Line::default(),
         }
     }
 
     /// a free address that is nobody's reservation, or 0: a reservation is never given to anyone but its token (the
-    /// review of the audit's F1, in the crate doc)
+    /// review of the audit's F1, in the crate doc).  (The expired ones went just before: `LanSwitch::expire`.)
     pub(crate) fn allocate(&mut self) -> u32 {
-        let now = now_ms();
-        self.reserved.retain(|_, r| r.until > now);
         for i in 0..ADDRS {
             let k = (self.next + i) % ADDRS;
             let c = vip_at(k);
@@ -78,70 +76,98 @@ impl Members {
         0
     }
 
-    /// a newcomer would get "LAN full" now: every place taken, or every address in use or kept for its player
+    /// a newcomer has no place now: every place is taken, by a player or kept for one who dropped (a reservation holds
+    /// its place as it holds its address, also where there are more addresses than places), so also every address
+    /// (no address is both held and kept)
     pub(crate) fn full(&self, max_peers: usize) -> bool {
-        if self.peers.len() >= max_peers {
-            return true;
-        }
-        // fewer addresses held and kept than there are: one is free (the scan below took 8 us at 1000 players, under
-        // this lock, for every /players a start page, or anyone, asks for)
-        if self.peers.len() + self.reserved.len() < ADDRS {
-            return false;
-        }
         let now = now_ms();
-        !(0..ADDRS).map(vip_at).any(|c| !self.peers.contains_key(&c) && !self.reserved.get(&c).is_some_and(|r| r.until > now))
+        self.peers.len() + self.reserved.values().filter(|r| r.until > now).count() >= max_peers.min(ADDRS)
     }
 }
 
 impl LanSwitch {
     /// A connection admitted: the address (given back only to the token that held it), the welcome, the peer list.
-    /// None: not admitted (closed already, or "LAN full").
-    pub(crate) fn admit(&self, conn: &Arc<Conn>, ctx: &AttachCtx, hello: Option<Map<String, Value>>) -> Option<Arc<Peer>> {
+    /// None: not admitted now (closed already; "LAN full"; or, for a page that can wait, in line: queue.rs, the reader
+    /// finds its peer once the line admits it).
+    pub(crate) fn admit(&self, conn: &Arc<Conn>, ctx: &Arc<AttachCtx>, hello: Option<Map<String, Value>>) -> Option<Arc<Peer>> {
         if !conn.open() {
             return None;
         }
-        let o = &self.o;
-        let token = new_token();
         let mut m = self.members.lock();
-        let mut vip = 0;
-        let mut old: Option<Arc<Peer>> = None;
-        if let Some(Value::String(tok)) = hello.as_ref().and_then(|h| h.get("token")) {
-            let w = crate::vip_num(&js_string(hello.as_ref().and_then(|h| h.get("vip"))));
-            let holder = m.peers.get(&w).cloned();
-            match holder {
-                None => {
-                    if m.reserved.get(&w).is_some_and(|r| r.until > now_ms() && token_fits(tok, &r.hash)) {
-                        vip = w;
-                    }
+        let mut held = held_address(&m, hello.as_ref());
+        // a page back with its ticket: its place in line again (it never had an address), or the place the line gave
+        // it as its link went (its welcome lost with it: queue.rs `seated`)
+        if held.0 == 0 && ctx.queue {
+            if let Some(Value::String(t)) = hello.as_ref().and_then(|h| h.get("ticket")) {
+                let t = t.clone();
+                if self.rejoin(&mut m, conn, ctx, hello.clone(), &t) {
+                    drop(m);
+                    self.let_in();
+                    return conn.peer.lock().clone();
                 }
-                Some(h) => {
-                    if token_fits(tok, &h.token_hash) {
-                        vip = w;
-                        old = Some(h);
-                    }
-                }
+                held = m.line.seated_for(&m.peers, &m.reserved, &t);
             }
         }
-        // a connection that replaces its own older one takes no new place
-        if old.is_none() && m.peers.len() >= o.max_peers {
-            self.stats.refused.inc();
-            drop(m);
-            conn.close(lan_full());
-            return None;
-        }
-        let resumed = vip != 0;
-        if resumed {
-            m.reserved.shift_remove(&vip);
-            self.stats.resumed.inc();
-        } else {
-            vip = m.allocate();
-            if vip == 0 {
-                self.stats.refused.inc();
+        // a newcomer waits while anyone does
+        let place = self.place(&mut m, held, false);
+        match place {
+            Some((vip, old, resumed)) => {
+                let (peer, count) = self.seat(&mut m, conn, ctx, hello, vip, old);
                 drop(m);
-                conn.close(lan_full());
+                if let Some(f) = &ctx.on_join {
+                    f(peer.vip, resumed, count);
+                }
+                Some(peer)
+            }
+            None => {
+                if !(ctx.queue && self.enqueue(&mut m, conn, ctx, hello)) {
+                    self.stats.refused.inc();
+                    drop(m);
+                    conn.close(lan_full());
+                }
+                None
+            }
+        }
+    }
+
+    /// A place for one who asks: the address its token held (`held`: it, and the connection of the same client it
+    /// replaces, which takes no new place; a reservation's place was never free), or a free one; None when there is
+    /// none for it now: the switch full, or (unless `first`, the line's first) others waiting before it.  A resumed
+    /// address leaves its reservation here.
+    pub(crate) fn place(&self, m: &mut Members, held: (u32, Option<Arc<Peer>>), first: bool) -> Option<(u32, Option<Arc<Peer>>, bool)> {
+        self.expire(m);
+        let (vip, old) = held;
+        if vip != 0 {
+            // (more players than places only after a restart with fewer: the store's reservations)
+            if old.is_none() && m.peers.len() >= self.o.max_peers {
                 return None;
             }
+            m.reserved.shift_remove(&vip);
+            self.stats.resumed.inc();
+            return Some((vip, old, true));
         }
+        if (!first && m.line.before_newcomers()) || m.full(self.o.max_peers) {
+            return None;
+        }
+        match m.allocate() {
+            0 => None,
+            v => Some((v, None, false)),
+        }
+    }
+
+    /// The connection takes its place: its peer, the welcome, the peer list, the table; the holder it replaces goes.
+    /// The players on the switch now come back with it (for `on_join`, which the caller runs once the lock is gone).
+    pub(crate) fn seat(
+        &self,
+        m: &mut Members,
+        conn: &Arc<Conn>,
+        ctx: &AttachCtx,
+        hello: Option<Map<String, Value>>,
+        vip: u32,
+        old: Option<Arc<Peer>>,
+    ) -> (Arc<Peer>, usize) {
+        let o = &self.o;
+        let token = new_token();
         let now = nfsu2_util::mono_ms();
         // (for its writer: a compact bundle leaves out the address a datagram was sent to, its own)
         conn.vip.store(vip, std::sync::atomic::Ordering::Relaxed);
@@ -153,9 +179,8 @@ impl LanSwitch {
             token_hash: token_hash(&token),
             name: Default::default(),
             hello: false.into(),
-            deltas: false.into(),
             bundle: false.into(),
-            lan: crate::LAN_NULL.into(),
+            lan: false.into(),
             frames_in: 0.into(),
             frames_out: 0.into(),
             fed_online: false.into(),
@@ -165,59 +190,62 @@ impl LanSwitch {
             last_in: now_ms().into(),
             probe: parking_lot::Mutex::new(crate::lag::Probe::new(now)),
             share: crate::lag::SHARE_FULL.into(),
+            away: false.into(),
+            listed: false.into(),
+            ident: ctx.ident.clone(),
+            since: now_ms(),
         });
         if let Some(h) = &hello {
             peer.ctl.lock().texts.take_at(now, 1.0);
-            greet(&peer, h);
+            greet(&peer, h, self.o.fpred);
+            self.hand_hub(&peer, h);
         }
         m.peers.insert(vip, peer.clone());
         // (a replaced holder's place on it goes with it)
         m.lan.swap_remove(&vip);
-        if peer.lan() != Some(false) {
+        if peer.lan() {
             m.lan.insert(vip, peer.clone());
         }
         *conn.peer.lock() = Some(peer.clone());
         // the welcome (and a resume's whole list, which has the newcomer on it) are queued before the other players'
         // readers can find the newcomer: nothing they route to it comes first (Node sent both before it went back to
         // its event loop)
-        let welcome = format!(r#"{{"t":"welcome","vip":{vip},"vipStr":"{}","mask":"{MASK}","token":"{token}","bundle":1}}"#, vip_str(vip));
+        let welcome = format!(r#"{{"t":"welcome","vip":{vip},"vipStr":"{}","mask":"{MASK}","token":"{token}"}}"#, vip_str(vip));
         conn.push(Out::Text(Bytes::from(welcome)));
         if peer.hello.load(Relaxed) {
-            let list = self.peer_list(&m);
+            let list = self.list_for(m, &peer);
             self.send(&peer, Out::Text(list));
         }
         if let Some(i) = slot(vip) {
             self.table[i].store(Some(peer.clone()));
         }
-        self.publish(&m);
+        self.publish(m);
         // the same client's older connection (it died without a close): it goes, and its late close changes nothing
         if let Some(old) = old {
             old.conn.terminate();
         }
-        self.peers_changed(&mut m, vip, false);
-        self.persist(&mut m);
-        let count = m.peers.len();
-        drop(m);
-        if let Some(f) = &ctx.on_join {
-            f(vip, resumed, count);
-        }
-        Some(peer)
+        self.peers_changed(m, vip, false);
+        self.persist(m);
+        (peer, m.peers.len())
     }
 
     /// the 'close' of a connection: its client's limits let go, and for the holder of an address, the address
     /// reserved for its token (not when the page closed the connection itself, 1000 "idle" or "closed": no network
-    /// feature in use, or the game ended; such a page comes back without a token, so its address is free at once).
+    /// feature in use, or the game ended; such a page comes back without a token, so its address is free at once; nor
+    /// when the operator removed it).  It is kept a while for the operator's `who`.
     /// An old connection's late close must not take the address from a new holder.
     pub(crate) fn closed(&self, conn: &Arc<Conn>, ctx: &AttachCtx) {
         self.leave_group(false, &ctx.group);
         if let Some(s) = &ctx.site {
             self.leave_group(true, s);
         }
-        let Some(peer) = conn.peer.lock().take() else { return };
+        let Some(peer) = conn.peer.lock().take() else {
+            self.left_line(conn);
+            return;
+        };
         self.streams.lock().remove(conn.id);
         conn.streaming.store(false, Relaxed);
         let vip = peer.vip;
-        let (code, reason) = conn.close_code();
         let mut m = self.members.lock();
         if !m.peers.get(&vip).is_some_and(|p| Arc::ptr_eq(p, &peer)) {
             return;
@@ -228,8 +256,7 @@ impl LanSwitch {
             self.table[i].store(None);
         }
         self.publish(&m);
-        let done = code == 1000 && (&reason[..] == b"idle" || &reason[..] == b"closed");
-        if done {
+        if conn.let_go() {
             self.stats.released.inc();
         } else {
             self.reserve(&mut m, vip, &peer);
@@ -247,12 +274,21 @@ impl LanSwitch {
             h.peer_gone(vip);
         }
         drop(m);
+        {
+            let mut g = self.gone.lock();
+            if g.len() >= crate::GONE_MAX {
+                g.pop_front();
+            }
+            g.push_back(peer.who("", Some(now_ms())));
+        }
         if let Some(im) = &self.impair {
             im.forget(vip);
         }
         if let Some(f) = &ctx.on_leave {
             f(vip, peer.name(), count);
         }
+        // (its place to the line's first, when it went back at once)
+        self.let_in();
     }
 
     /// the copy-on-write lists of every peer (in the order of `peers`) and of those with LAN play open, after a change
@@ -269,8 +305,29 @@ impl LanSwitch {
     /// logic runs after that reader ended): on the list of those with LAN play open or not, while it holds its address
     pub(crate) fn set_lan(&self, peer: &Arc<Peer>, on: bool) {
         let mut m = self.members.lock();
-        peer.lan.store(if on { LAN_ON } else { LAN_OFF }, Relaxed);
+        peer.lan.store(on, Relaxed);
         self.lan_changed(&mut m, peer);
+        // the peer list follows LAN play (`list_for`): the whole list as it opens, no changes while it is shut
+        if !m.peers.get(&peer.vip).is_some_and(|p| Arc::ptr_eq(p, peer)) || !peer.hello.load(Relaxed) {
+            return;
+        }
+        if !on {
+            peer.listed.store(false, Relaxed);
+        } else if !peer.listed.swap(true, Relaxed) {
+            let list = self.peer_list(&m);
+            self.send(peer, Out::Text(list));
+        }
+    }
+
+    /// the list a peer gets with its hello: the whole list, and the changes after it (`listed`), unless its LAN play is
+    /// shut: then only the server's own hosts (the Online host, which the game connects to as it opens the Online
+    /// screens, before the whole list could come).  Only LAN play needs the other players' addresses (the module's
+    /// peer bits answer a connect to an address nobody holds at once; runtime/web/net_lan.c); free roam's come from
+    /// its hub.
+    fn list_for(&self, m: &Members, peer: &Peer) -> Bytes {
+        let all = peer.lan();
+        peer.listed.store(all, Relaxed);
+        if all { self.peer_list(m) } else { self.hosts_list() }
     }
 
     fn lan_changed(&self, m: &mut Members, peer: &Arc<Peer>) {
@@ -278,7 +335,7 @@ impl LanSwitch {
         if !m.peers.get(&vip).is_some_and(|p| Arc::ptr_eq(p, peer)) {
             return;
         }
-        let want = peer.lan() != Some(false);
+        let want = peer.lan();
         if want == m.lan.contains_key(&vip) {
             return;
         }
@@ -288,6 +345,36 @@ impl LanSwitch {
             m.lan.swap_remove(&vip);
         }
         self.publish_lan(m);
+    }
+
+    /// The reservations past their time go.  The hosts hear of each one from the store that goes so (`Host::peer_gone`):
+    /// a player of before a restart who did not come back for its address, whose leaving they never saw (the Online
+    /// host keeps the races going on over a restart, and their players' names, until it hears they left).  The ones
+    /// a departure made, they heard of at the departure.  Whether any went.
+    pub(crate) fn expire(&self, m: &mut Members) -> bool {
+        let now = now_ms();
+        let before = m.reserved.len();
+        let mut lapsed = Vec::new();
+        m.reserved.retain(|v, r| {
+            if r.until > now {
+                return true;
+            }
+            if r.group.is_none() {
+                lapsed.push(*v);
+            }
+            false
+        });
+        // (under the lock: a page that takes the address later can only be admitted after, so its frames never reach
+        // a host before this; posting only queues)
+        for vip in lapsed {
+            if let Some(h) = &self.online {
+                h.peer_gone(vip);
+            }
+            if let Some(h) = &self.roam {
+                h.peer_gone(vip);
+            }
+        }
+        m.reserved.len() != before
     }
 
     /// vip is kept for its token for `reserve_ms`; past its client's (and site's) share of reservations
@@ -322,10 +409,19 @@ impl LanSwitch {
 
     /// the whole peer list, as a message (the Online host on it as `server: true`)
     pub(crate) fn peer_list(&self, m: &Members) -> Bytes {
-        let mut s = String::with_capacity(32 + 48 * m.peers.len());
+        self.list_of(m.peers.values())
+    }
+
+    /// the list of the server's own hosts alone
+    fn hosts_list(&self) -> Bytes {
+        self.list_of(std::iter::empty())
+    }
+
+    fn list_of<'a>(&self, peers: impl ExactSizeIterator<Item = &'a Arc<Peer>>) -> Bytes {
+        let mut s = String::with_capacity(32 + 48 * peers.len());
         s.push_str(r#"{"t":"peers","peers":["#);
         let mut first = true;
-        for p in m.peers.values() {
+        for p in peers {
             if !first {
                 s.push(',');
             }
@@ -356,11 +452,6 @@ impl LanSwitch {
         if !m.delta_armed {
             m.delta_armed = true;
             self.after(Duration::from_millis(self.o.peers_ms), |sw| sw.send_delta());
-        }
-        if !m.full_armed {
-            m.full_armed = true;
-            let ms = (self.o.peers_ms as f64).max(m.full_at + self.o.full_peers_ms - nfsu2_util::mono_ms());
-            self.after(Duration::from_secs_f64(ms / 1000.0), |sw| sw.send_full());
         }
     }
 
@@ -408,23 +499,7 @@ impl LanSwitch {
         m.left.clear();
         let msg = Bytes::from(s);
         for p in m.peers.values() {
-            if p.deltas.load(Relaxed) && p.open() {
-                self.send(p, Out::Text(msg.clone()));
-            }
-        }
-    }
-
-    /// the whole list to the clients that take no changes, at most every `full_peers_ms`
-    fn send_full(&self) {
-        let mut m = self.members.lock();
-        m.full_armed = false;
-        m.full_at = nfsu2_util::mono_ms();
-        if !m.peers.values().any(|p| !p.deltas.load(Relaxed) && p.open()) {
-            return;
-        }
-        let msg = self.peer_list(&m);
-        for p in m.peers.values() {
-            if !p.deltas.load(Relaxed) && p.open() {
+            if p.listed.load(Relaxed) && p.open() {
                 self.send(p, Out::Text(msg.clone()));
             }
         }
@@ -437,12 +512,26 @@ impl LanSwitch {
             return;
         }
         let was = peer.name().to_string();
-        greet(peer, msg);
+        greet(peer, msg, self.o.fpred);
+        self.hand_hub(peer, msg);
         self.lan_changed(&mut m, peer);
-        let list = self.peer_list(&m);
+        let list = self.list_for(&m, peer);
         self.send(peer, Out::Text(list));
         if peer.name() != was {
             self.peers_changed(&mut m, peer.vip, false);
+        }
+    }
+
+    /// A hello's name (as the peer took it) and "block" to the free-roam hub, with the page's address: every
+    /// connection's hello, a new one's (`hello`), a resumed one's or one let in from the line (`seat`), as the hub
+    /// forgets a page's when its connection goes (`Host::peer_gone`, posted before a resume can take the address).
+    fn hand_hub(&self, peer: &Peer, hello: &Map<String, Value>) {
+        if let Some(h) = &self.roam {
+            h.page_name(peer.vip, peer.name());
+            let names = block_names(hello);
+            if !names.is_empty() {
+                h.blocks(peer.vip, names);
+            }
         }
     }
 
@@ -521,6 +610,18 @@ fn store_list(m: &Members) -> String {
     s
 }
 
+/// the address a hello's token held: one reserved for it, or one a connection of the same client holds (which this one
+/// replaces); 0 for none
+pub(crate) fn held_address(m: &Members, hello: Option<&Map<String, Value>>) -> (u32, Option<Arc<Peer>>) {
+    let Some(Value::String(tok)) = hello.and_then(|h| h.get("token")) else { return (0, None) };
+    let w = crate::vip_num(&js_string(hello.and_then(|h| h.get("vip"))));
+    match m.peers.get(&w) {
+        None if m.reserved.get(&w).is_some_and(|r| r.until > now_ms() && token_fits(tok, &r.hash)) => (w, None),
+        Some(h) if token_fits(tok, &h.token_hash) => (w, Some(h.clone())),
+        _ => (0, None),
+    }
+}
+
 /// `{"vip":N,"name":"..."}`
 fn entry(s: &mut String, vip: u32, name: &str) {
     s.push_str(r#"{"vip":"#);
@@ -531,24 +632,43 @@ fn entry(s: &mut String, vip: u32, name: &str) {
 }
 
 /// a full switch's answer (a fixed reason)
-fn lan_full() -> Bytes {
+pub(crate) fn lan_full() -> Bytes {
     let mut p = 1013u16.to_be_bytes().to_vec();
     p.extend_from_slice(b"LAN full");
     Bytes::from(p)
 }
 
-/// a connection's first hello: its player's name, and whether it takes the changes to the peer list, bundles, and has
-/// LAN play open (a page of before says nothing: it gets every broadcast)
-fn greet(peer: &Peer, m: &Map<String, Value>) {
+/// a hello's "block": the names (as the game shows them over cars: printable ASCII, at most 24) of the players the page
+/// blocks, at most BLOCK_MAX of them, each trimmed; what is not a string, an empty one and those past the cap are left
+/// out, a longer one is cut
+const BLOCK_MAX: usize = 32;
+fn block_names(m: &Map<String, Value>) -> Vec<String> {
+    let Some(Value::Array(a)) = m.get("block") else { return Vec::new() };
+    a.iter()
+        .filter_map(|v| v.as_str())
+        .map(|s| s.chars().filter(|c| (' '..='~').contains(c)).take(24).collect::<String>().trim().to_string())
+        .filter(|s| !s.is_empty())
+        .take(BLOCK_MAX)
+        .collect()
+}
+
+/// a connection's first hello: its player's name, whether it takes bundles (and which), and whether it has LAN play
+/// open
+fn greet(peer: &Peer, m: &Map<String, Value>, fpred: bool) {
     use nfsu2_util::json::is_num;
     peer.hello.store(true, Relaxed);
-    peer.deltas.store(is_num(m.get("deltas"), 1.0), Relaxed);
     peer.bundle.store(is_num(m.get("bundle"), 1.0), Relaxed);
-    peer.conn.compact.store(is_num(m.get("compact"), 1.0), Relaxed);
-    let lan = m.get("lan");
-    if is_num(lan, 0.0) || is_num(lan, 1.0) {
-        peer.lan.store(if is_num(lan, 1.0) { LAN_ON } else { LAN_OFF }, Relaxed);
-    }
+    use crate::conn::{COMPACT, DELTAS, FPRED, OTHERS, PLAIN};
+    let compact = match (is_num(m.get("compact"), 1.0), is_num(m.get("delta"), 1.0), is_num(m.get("fpred"), 1.0)) {
+        (false, ..) => PLAIN,
+        (true, false, _) => COMPACT,
+        (true, true, false) => DELTAS,
+        (true, true, true) => FPRED,
+    };
+    let compact = if compact == FPRED && !fpred { DELTAS } else { compact };
+    let compact = if compact >= DELTAS && is_num(m.get("ldelta"), 1.0) { compact | OTHERS } else { compact };
+    peer.conn.compact.store(compact, Relaxed);
+    peer.lan.store(is_num(m.get("lan"), 1.0), Relaxed);
     if let Some(Value::String(name)) = m.get("name") {
         let _ = peer.name.set(crate::clean_name(name).into_boxed_str());
     }
@@ -559,13 +679,28 @@ mod tests {
     use super::*;
     use crate::LanOptions;
 
+    // a hello's "block": strings only, trimmed, printable ASCII, at most 24 characters each and BLOCK_MAX names
+    #[test]
+    fn a_hellos_block_is_names_as_the_game_shows_them() {
+        let m = |v: Value| block_names(v.as_object().unwrap());
+        assert_eq!(m(serde_json::json!({ "t": "hello" })), Vec::<String>::new());
+        assert_eq!(m(serde_json::json!({ "block": "bob" })), Vec::<String>::new());
+        let long = "x".repeat(40);
+        assert_eq!(
+            m(serde_json::json!({ "block": ["  Bob ", 7, "", "   ", "Zoë\u{0}!", long] })),
+            vec!["Bob".to_string(), "Zo!".to_string(), "x".repeat(24)]
+        );
+        let many: Vec<String> = (0..40).map(|i| format!("p{i}")).collect();
+        assert_eq!(m(serde_json::json!({ "block": many })).len(), BLOCK_MAX);
+    }
+
     /// Node sent the welcome (and a resume's whole list) before it went back to its event loop: no frame from another
     /// player could come first.  Here the other players' readers route on other cores: a newcomer they can find (the
     /// table, the list of all) must have its welcome queued already.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_welcome_is_queued_before_anyone_can_send_to_the_newcomer() {
         const N: usize = 300;
-        let sw = LanSwitch::new(LanOptions { max_peers: 4000, ..LanOptions::default() }, "", None, None, None, None);
+        let sw = LanSwitch::new(LanOptions { max_peers: 7000, ..LanOptions::default() }, "", None, None, None, None);
         // a sender on another core: it looks at each address the switch hands out next, as soon as it is taken
         let watcher = {
             let sw = sw.clone();
@@ -597,7 +732,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn what_full_costs() {
-        let sw = LanSwitch::new(LanOptions { max_peers: 4000, ..LanOptions::default() }, "", None, None, None, None);
+        let sw = LanSwitch::new(LanOptions { max_peers: 7000, ..LanOptions::default() }, "", None, None, None, None);
         let peers: Vec<_> = (0..1000).map(|i| crate::route::tests::peer(&sw, &format!("g{i}"))).collect();
         let t = std::time::Instant::now();
         let mut n = 0;

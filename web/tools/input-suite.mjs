@@ -32,6 +32,7 @@ const ENV = ['NFSU2_SAVEDIR=/save', 'NFSU2_READONLY_DATA=1', 'NOMOVIES=1', 'SNDS
 // name, script, extra env, chain (profile) or null, Mac reference run, timeout s
 const SCEN = [
   ['kb_focus_mouse', 'kb_focus_mouse', [], null, 'kbdrev-07-kb_focus_mouse', 300],
+  ['kb_focus_regain', 'kb_focus_regain', [], null, null, 300],
   ['kb_profile', 'kb_profile', [], null, 'int2-fin-kb/kb_profile', 300],
   ['kb_no_pad_controls', 'kb_no_pad_controls', [], null, null, 300],
   ['kb_pad_capture_escape', 'kb_pad_capture_escape', [], null, 'kbdrev-07-kb_pad_capture_escape', 300],
@@ -51,8 +52,12 @@ const SCEN = [
   ['pad_hotplug', 'pad_hotplug', ['NFSU2_PAD=hotplug'], null, 'pad-rvf-hotplug', 300],
   ['pad_hotplug_controls', 'pad_hotplug_controls', ['NFSU2_PAD=hotplug'], null, null, 600],
   ['pad_hotplug_race', 'pad_hotplug_race', ['NFSU2_PAD=hotplug'], null, null, 300],
+  // a steering wheel: the game's driving device, its layout and steering; a wheel taking over from a pad and back
+  ['pad_wheel_race', 'pad_wheel_race', [], null, null, 300],
+  ['pad_wheel_switch', 'pad_wheel_switch', [], null, null, 300],
   ['pad_bind_save', 'pad_bind_save', [], 'pad', 'pad-rvf-bind_save', 400],
   ['pad_bind_load', 'pad_bind_load', [], 'pad', 'pad-rvf-bind_load', 300],
+  ['pad_bind_pedals', 'pad_bind_pedals', ['NFSU2_PAD_LOG=1'], null, null, 400],
 ];
 const FAULT = /FAULT IN GUEST|GUEST MEMORY FAULT|HOST SEGV|TIME LIMIT REACHED|^\[trap\]|UNRESOLVED INDIRECT|\[expect\] FAIL|TRAP in thread|PAGEERROR|^TIMEOUT/;
 // the raw values only: printf spells a NaN's sign differently on wasi-libc ("-nan")

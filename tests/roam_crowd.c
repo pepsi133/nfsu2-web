@@ -11,7 +11,7 @@ __attribute__((import_module("crowd"), import_name("send"))) void js_send(uint32
 __attribute__((import_module("crowd"), import_name("event"))) void js_event(int ev, const char *t, int n);
 
 /* the C library this needs: roam_core.c calls memcmp, its name filter (names.h)
- * strcmp, strlen and memcpy, the compiler may call the others */
+ * strcmp, strncmp, strchr, strstr, strlen and memcpy, the compiler may call the others */
 void *memcpy(void *d, const void *s, unsigned long n){ unsigned char *o = d; const unsigned char *i = s; while (n--) *o++ = *i++; return d; }
 void *memmove(void *d, const void *s, unsigned long n){
     unsigned char *o = d; const unsigned char *i = s;
@@ -29,6 +29,24 @@ int strcmp(const char *a, const char *b){
     while (*a && *a == *b){ a++; b++; }
     return (unsigned char)*a - (unsigned char)*b;
 }
+int strncmp(const char *a, const char *b, unsigned long n){
+    for (; n && *a && *a == *b; n--){ a++; b++; }
+    return n ? (unsigned char)*a - (unsigned char)*b : 0;
+}
+char *strchr(const char *s, int c){
+    for (; ; s++){
+        if (*s == (char)c) return (char *)s;
+        if (!*s) return 0;
+    }
+}
+char *strstr(const char *h, const char *n){
+    for (; ; h++){
+        unsigned long i = 0;
+        while (n[i] && h[i] == n[i]) i++;
+        if (!n[i]) return (char *)h;
+        if (!*h) return 0;
+    }
+}
 
 static rc_session S;
 static uint8_t IO[4096];                     /* a datagram, or the name, car type and parts */
@@ -38,11 +56,13 @@ static void io_event(void *u, int ev, int peer, const char *t){ (void)u; (void)p
 /* the buffer the script writes a name or a received datagram into */
 __attribute__((export_name("crowd_io"))) uint8_t *crowd_io(void){ return IO; }
 
-/* name (in IO, 0-terminated), id, room hash, the hub's address, our port, the car type's name hash, states per SNAP */
-__attribute__((export_name("crowd_init"))) void crowd_init(uint32_t id, uint32_t room, uint32_t hub_ip, uint32_t port, uint32_t type_hash,
-                                                           uint32_t states, double now_us){
+/* name (in IO, 0-terminated), id, room hash, a crew's hash (0: none), the hub's address, our port, the car type's
+ * name hash, states per SNAP */
+__attribute__((export_name("crowd_init"))) void crowd_init(uint32_t id, uint32_t room, uint32_t crew, uint32_t hub_ip, uint32_t port,
+                                                           uint32_t type_hash, uint32_t states, double now_us){
     rc_config cf; memset(&cf, 0, sizeof cf);
     cf.self_id = id; cf.port = (uint16_t)port; cf.room = room; cf.platform = RC_PLAT_TOOL;
+    if (crew){ cf.crews[0] = crew; cf.n_crews = 1; }
     cf.max_players = RC_MAX_PLAYERS; cf.rate_hz = 20; cf.snap_states = (int)states; cf.hub_ip = hub_ip; cf.hub_port = (uint16_t)port;
     rc_name_clean(cf.name, (const char *)IO, RC_NAME_MAX);
     rc_io io = { 0, io_send, 0, io_event };
@@ -89,6 +109,16 @@ __attribute__((export_name("crowd_tick"))) void crowd_tick(double now_us, float 
  * car, only its timers run (crowd_wait) */
 __attribute__((export_name("crowd_status"))) void crowd_status(int st){ rc_set_status(&S, (uint8_t)st); }
 __attribute__((export_name("crowd_wait"))) void crowd_wait(double now_us){ rc_tick(&S, (int64_t)now_us); }
+/* this player hosts a race lobby (roam-crowd --lobbies): its advert to the
+ * hub, as a host's game sends one every second (roam_game.c mp_*); a host
+ * takes LOBBY messages, so its HELLOs say so from now on */
+__attribute__((export_name("crowd_lobby"))) int crowd_lobby(uint32_t lobby, uint32_t race, int x, int y, int n, int max){
+    rc_lobby l; memset(&l, 0, sizeof l);
+    S.conf.lobbies = 1;
+    l.op = RC_LOBBY_ADVERT; l.state = RC_LS_OPEN; l.max = (uint8_t)max; l.to = 0; l.lobby = lobby; l.race = race;
+    l.x = (int16_t)x; l.y = (int16_t)y; l.n = (uint8_t)n; l.ids[0] = S.conf.self_id;
+    return rc_send_lobby(&S, &l);
+}
 /* players established now */
 __attribute__((export_name("crowd_peers"))) int crowd_peers(void){ return rc_established(&S); }
 __attribute__((export_name("crowd_stop"))) void crowd_stop(void){ rc_shutdown(&S, 0); }

@@ -48,14 +48,42 @@ int      roam_bcast_targets(const roam_if *ifs, int n, uint32_t *out, int max);
 int      roam_plat_guard(int test_mode, uint32_t ip, int is_broadcast);
 typedef struct { uint64_t sent, sent_bytes, recv, recv_bytes, blocked, send_err, impair_drop, impair_dup; } roam_plat_stats;
 void     roam_plat_get_stats(roam_plat_stats *out);
-/* a message over the game ("<name><what>", as the joins and leaves): the
- * page shows it (web); elsewhere a log line.  With the session lock held */
+/* a message over the game ("<name><what>", as the joins and leaves; name 0:
+ * what alone, as the room's "Nobody else"): the page shows it (web);
+ * elsewhere a log line.  With the session lock held */
 void     roam_plat_notice(const char *name, const char *what);
 /* the race lobby's panel over the game (roam_game.c mp_panel): its state as
  * a JSON object, "{}" for none, sent when it changes.  1: the page shows it
  * (web); 0: this platform has no panel, the game's top line says it.  With
  * the session lock held */
 int      roam_plat_lobby(const char *json);
+/* solid cars as the player switched them while the game runs (the page's
+ * menu, web): 1 on, 0 off, -1 not switched (NFSU2_ROAM_COLLIDE holds) */
+int      roam_plat_solid(void);
+/* quick chat (roam_game.c say_*): whether this platform has it (the page's
+ * picker and lines: web; elsewhere the HELLO does not offer it), the phrase
+ * the player picked since the last call (-1: none), and a phrase said (by a
+ * friend, or by the player) as a JSON object for the page (1 sent, -1 the
+ * ring is full).  With the session lock held */
+int      roam_plat_quickchat(void);
+int      roam_plat_say_pick(void);
+int      roam_plat_said(const char *json);
+/* where the names of the players who said something lately are this frame:
+ * ids[i] at xys[3i], xys[3i + 1] (parts of the picture from its top left
+ * corner) with the name's scale xys[3i + 2]; n = 0: none.  The page's lines
+ * follow them in the same picture.  On the game thread, without the lock */
+void     roam_plat_say_marks(const uint32_t *ids, const float *xys, int n);
+/* the crews as the player changed them while the game runs (the page's menu,
+ * web): their rc_room_hash values in the player's order (0: none) into
+ * crews, their colours into rgb (0x00RRGGBB, 0: the place's default), and a
+ * number that changes with each change (0: not changed, NFSU2_ROAM_CREW and
+ * NFSU2_ROAM_CREW_RGB hold) */
+uint32_t roam_plat_crews(uint32_t crews[RC_CREW_MAX], uint32_t rgb[RC_CREW_MAX]);
+/* the room as the player changed it while the game runs (an invite link on the
+ * page, web): its name into name (UTF-8 ending in a 0 byte; "" for no room),
+ * and a number that changes with each change (0: not changed, NFSU2_ROAM_ROOM
+ * holds) */
+uint32_t roam_plat_room(char name[64]);
 const char *roam_ip_str(uint32_t ip, char *buf);   /* buf >= 16 */
 
 #endif

@@ -491,6 +491,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "nfsu2-bans"
+version = "0.1.0"
+dependencies = [
+ "hmac",
+ "nfsu2-util",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "nfsu2-claims"
+version = "0.1.0"
+dependencies = [
+ "nfsu2-names",
+ "nfsu2-util",
+ "parking_lot",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "nfsu2-headers"
 version = "0.1.0"
 dependencies = [
@@ -563,9 +588,11 @@ dependencies = [
  "hmac",
  "indexmap",
  "md-5",
+ "nfsu2-claims",
  "nfsu2-names",
  "nfsu2-util",
  "parking_lot",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
@@ -580,6 +607,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "crc32fast",
+ "nfsu2-claims",
  "nfsu2-util",
  "parking_lot",
  "serde_json",
@@ -594,6 +622,7 @@ dependencies = [
  "crc32fast",
  "futures-util",
  "libc",
+ "nfsu2-lan",
  "nfsu2-util",
  "parking_lot",
  "serde_json",
@@ -613,6 +642,8 @@ dependencies = [
  "hmac",
  "libc",
  "mimalloc",
+ "nfsu2-bans",
+ "nfsu2-claims",
  "nfsu2-headers",
  "nfsu2-http",
  "nfsu2-lan",
@@ -633,6 +664,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "unicode-normalization",
+ "webpki-roots",
  "x509-parser",
  "zstd",
 ]
@@ -644,6 +676,7 @@ dependencies = [
  "base64",
  "bytes",
  "crossbeam-utils",
+ "flate2",
  "getrandom 0.3.4",
  "libc",
  "parking_lot",
@@ -950,6 +983,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]
@@ -1293,6 +1327,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
 dependencies = [
  "wit-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

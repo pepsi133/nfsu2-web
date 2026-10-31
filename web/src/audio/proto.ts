@@ -4,7 +4,7 @@
 
 export const AUDIO_MAGIC = 0x4E415544;
 export const AUDIO_VERSION = 1;
-export const AUDIO_RING_FRAMES = 8192;
+export const AUDIO_RING_FRAMES = 16384;
 export const AUDIO_RATE = 44100;
 
 export const AR_MAGIC = 0;

@@ -48,6 +48,8 @@ void host_status_set_n(const int *slot, const double *value, int n){
     pthread_mutex_unlock(&g_mu);
 }
 
+HostStatusRadio *host_status_radio(void){ return &g_st.radio; }
+
 /* "frames_t" is the time "frames" was read, in ms on CLOCK_MONOTONIC (the
  * page's performance.timeOrigin + now(), the same clock).  The page divides
  * the change in frames by the change in frames_t: its own sampling times
@@ -70,7 +72,8 @@ static void *status_main(void *unused){
 
 /* "drive": what the page's touch controls (web/src/app/touch.ts) need of the
  * game, set at every Present (autotest.c): 1 while the player drives in a
- * race, 2 in free roam, 0 elsewhere, plus 4 with a manual gearbox.  Driving
+ * race, 2 in free roam, 0 elsewhere, plus 4 with a manual gearbox and 8
+ * during a cutscene (the touch controls' level horizon waits).  Driving
  * is GameFlow 6 with a race HUD (HUD_*.fng) the top package; the pause menu
  * (UI_pause.fng), the results, the world's loading screen and the Engage
  * dialog over the HUD are not, nor is a cutscene in free roam (NIS, as
@@ -107,6 +110,7 @@ static int drive_state(void){
     int roam = roam_exploring();
     int v = flow == 6u && hud && !engage && !(roam && nis) ? (roam ? 2 : 1) : 0;
     if (v && manual_gearbox(v == 1)) v |= 4;
+    if (v && nis) v |= 8;
     /* a line at each change, for a player's log */
     static unsigned l_flow = ~0u; static int l_hud = -1, l_nis = -1, l_engage = -1, l_v = -1;
     if (flow != l_flow || hud != l_hud || nis != l_nis || engage != l_engage || v != l_v){
@@ -115,16 +119,76 @@ static int drive_state(void){
     }
     return v;
 }
+/* "rate": the frame rate the game paces to now (framerate.c content_rate:
+ * the mode's rate, 30 in a cutscene, at most 120 in a network race; 0 =
+ * uncapped), so the page can tell whether the game keeps up with it
+ * (web/src/app/rendercheck.ts) */
+int hfr_rate_now(void);
+/* "pause": 1 while the game's pause menu (UI_Pause.fng) is the top package,
+ * not its options or a question over it, so the page can point to its own
+ * menu under the panel (web/src/app/pausehint.ts) */
+static int pause_state(void){
+    const char *top = autotest_top_fng();
+    return top && !strcasecmp(top, "UI_Pause.fng");
+}
+/* "roam_cars", "roam_friends": friends' cars the game holds and friends
+ * connected in free roam (roam_game.c), for the page's copy of the log
+ * (web/src/app/lastgame.ts): what a phone held when Safari stopped the page.
+ * The friends take the session lock, so every 30th frame. */
+int roam_game_cars(void); int roam_game_friends(void);
+static void roam_state(void){
+    static int slot[2] = { -2, -2 }, n;
+    static double last[2] = { -1, -1 };
+    if (slot[0] == -2){ slot[0] = host_status_slot("roam_cars"); slot[1] = host_status_slot("roam_friends"); }
+    double v[2] = { (double)roam_game_cars(), n++ % 30 ? last[1] : (double)roam_game_friends() };
+    if (v[0] != last[0] || v[1] != last[1]){ last[0] = v[0]; last[1] = v[1]; host_status_set_n(slot, v, 2); }
+}
+/* "engage", "roam_near": for the touch controls' free-roam buttons
+ * (web/src/app/touch.ts).  "engage" is 1 while Engage (Enter, the pad's
+ * D-pad Up) does something in free roam, so Start shows only then: the
+ * player's car on an event's or a shop's marker (player +0x9AC, what Engage
+ * would enter), the game's own outrun offer (the career's outrun state 2,
+ * set with the HUD's outrun icon by 0x500D20 and tested by 0x500D80), or one
+ * of ours (roam_game_engage: a friend's outrun, a multiplayer-only race spot,
+ * a lobby to join or to start).  "roam_near": friends' cars within a horn's
+ * reach (roam_game_near), so Horn and Quick chat show only then. */
+#define PL_MARKER    0x9acu
+#define G_OUTRUN_ST  0x00860a58u      /* Career4230 (0x85EF70) +0x1AE8 */
+int roam_game_engage(void); int roam_game_near(void);
+static void touch_state(int drive){
+    static int slot[2] = { -2, -2 };
+    static double last[2] = { -1, -1 };
+    if (slot[0] == -2){ slot[0] = host_status_slot("engage"); slot[1] = host_status_slot("roam_near"); }
+    int roam = (drive & 3) == 2;
+    uint32_t p = roam && mem_is_committed(G_PLAYER0 + 3u) ? MR32(G_PLAYER0) : 0u;
+    int marker = p && mem_is_committed(p + PL_MARKER + 3u) && MR32(p + PL_MARKER);
+    int outrun = roam && mem_is_committed(G_OUTRUN_ST + 3u) && MR32(G_OUTRUN_ST) == 2u;
+    double v[2] = { roam && (marker || outrun || roam_game_engage()), roam ? (double)roam_game_near() : 0 };
+    if (v[0] != last[0] || v[1] != last[1]){ last[0] = v[0]; last[1] = v[1]; host_status_set_n(slot, v, 2); }
+}
+/* "sms": the text message of ours (sms.c) the game has in its inbox this
+ * game, 0 none, so the page asks for it no more (web/src/app/playtime.ts) */
+int sms_delivered(void);
 void status_web_frame(void){
-    static int slot = -2, last = -1;
-    if (slot == -2) slot = host_status_slot("drive");
+    static int slot = -2, last = -1, rslot = -2, rlast = -1, pslot = -2, plast = -1, sslot = -2, slast = -1;
+    if (slot == -2){ slot = host_status_slot("drive"); rslot = host_status_slot("rate"); pslot = host_status_slot("pause"); sslot = host_status_slot("sms"); }
     int v = drive_state();
     if (v != last && slot >= 0){ last = v; host_status_set(slot, v); }
+    int r = hfr_rate_now();
+    if (r != rlast && rslot >= 0){ rlast = r; host_status_set(rslot, r); }
+    int p = pause_state();
+    if (p != plast && pslot >= 0){ plast = p; host_status_set(pslot, p); }
+    int m = sms_delivered();
+    if (m != slast && sslot >= 0){ slast = m; host_status_set(sslot, m); }
+    roam_state();
+    touch_state(v);
 }
 
 /* main_web.c, before the guest starts */
 void status_web_start(void){
     g_st.magic = HOST_STATUS_MAGIC;
+    g_st.radio.radio_magic = RADIO_MAGIC;
+    g_st.radio.radio_version = RADIO_VERSION;
     g_st.period_ms = 250;
     nfsu2_register(HOST_KIND_STATUS, &g_st, sizeof g_st);
     pthread_attr_t at; pthread_attr_init(&at);

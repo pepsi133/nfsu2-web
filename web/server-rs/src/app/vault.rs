@@ -11,8 +11,8 @@
 //! - `PUT /vault` with `If-None-Match: *` (a new keyphrase) or `If-Match: "<rev>"` (the version the page has): 201 or
 //!   200 with the new ETag and `x-vault-saved`; 412 when that does not hold, with the current ETag and
 //!   `x-vault-saved` (none: no such keyphrase); 428 with neither; 413 past 256 KB; 507 when the server's room for them
-//!   is full, or its disk nearly; 503 (Retry-After) when the new keyphrases of the day, all clients together, are
-//!   taken (crates/vault, Limits).
+//!   is full, or its disk nearly; 503 (Retry-After) when the bytes the saves may add a day, all clients together,
+//!   are taken: a new keyphrase, or a save that grows one past 32 KB (crates/vault, Limits).
 //! - `DELETE /vault`: the keyphrase and both its versions go (404: none).
 //!
 //! Per client (its budget key, and twice that per site as `Rate` does): 60 reads, then one a second; 60 writes, then
@@ -221,13 +221,14 @@ impl App {
                             "busy",
                             "",
                             &format!(
-                                "[vault] refused a new keyphrase: today's {} are taken (all clients together)",
-                                v.store.options().new_per_day
+                                "[vault] refused a save: the {} a day the saves may add are taken for now (all clients \
+                                 together)",
+                                super::run::size(v.store.options().per_day)
                             ),
                             1,
                         );
                         h.set("retry-after", "3600");
-                        (503, "The server takes no more new keyphrases for now")
+                        (503, "The server takes no more new saves for now")
                     }
                 };
                 let body = format!("{text}\n");
@@ -242,6 +243,8 @@ impl App {
                     return self.too_many(q, s).await;
                 }
                 if self.vault_io(v, move || store.delete(&id)).await? {
+                    // its claimed name is free (names.rs)
+                    self.release_names(&id);
                     self.plain(q, s, 200, "Deleted", &[], Cache::Store, true).await
                 } else {
                     self.not_found(q, s).await
@@ -381,7 +384,7 @@ mod tests {
         // HEAD: the headers alone
         let h = kit.request("HEAD", "/vault", &[BEARER], b"").await;
         assert_eq!((h.status, h.header("content-length"), h.body.len()), (200, Some("262144"), 0));
-        assert!(super::super::ROBOTS_TXT.ends_with("Disallow: /vault"));
+        assert!(super::super::ROBOTS_TXT.contains("Disallow: /vault\n"));
     }
 
     #[tokio::test]

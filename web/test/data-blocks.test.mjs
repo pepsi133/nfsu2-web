@@ -6,7 +6,8 @@
 // its compressors gets the rest as they are (never refused, never queued), and gets them back when it lets go; past
 // the 128 compressors of all clients, the next client gets its runs as they are until one is given back.  A
 // shared cache (Cloudflare's) may keep a run only when its address names this version of the file and it is as
-// small as it gets.
+// small as it gets.  One block to a client that takes br goes as the server keeps it once it does (compressed at
+// brotli's best: the manifest names these at /data-blocks/v2/), and until then a shared cache keeps it a while only.
 // Port: NFSU2_TEST_BLOCKS_PORT (8532).
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -39,10 +40,11 @@ for (const [p, b] of Object.entries(FILES)) { fs.mkdirSync(path.dirname(path.joi
 fs.writeFileSync(path.join(DATA, 'NOTES.TXT'), 'not the game');
 fs.writeFileSync(path.join(TMP, 'game.wasm'), Buffer.alloc(8));
 
-async function server() {
-  const st = path.join(TMP, 'state');
+/** the server; `compress`: the threads that keep blocks at brotli's best (none: the answers compressed as they are sent) */
+async function server({ compress = 0 } = {}) {
+  const st = path.join(TMP, `state${compress}`);
   const srv = spawn(...serverCommand(['--data', DATA, '--http-port', String(PORT), '--state', st, '--wasm', path.join(TMP, 'game.wasm')]),
-    { stdio: ['ignore', 'pipe', 'pipe'] });
+    { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, NFSU2_COMPRESS_THREADS: String(compress) } });
   await new Promise((res, rej) => {
     let out = '';
     const t = setTimeout(() => rej(new Error('server did not start: ' + out)), 15000);
@@ -68,21 +70,22 @@ function get(p, { ae = 'gzip, deflate, br, zstd', method = 'GET' } = {}) {
 const slice = (file, b, n) => FILES[file].subarray(b * M, Math.min(FILES[file].length, (b + n) * M));
 /** each file's mtime as the manifest names it (the m of a run's address) */
 const mtimes = async () => Object.fromEntries(JSON.parse((await get('/data-manifest', { ae: 'identity' })).body).files.filter(f => !f.d).map(f => [f.p, f.m]));
-const KEEP = 'public, max-age=31536000, immutable';
-/** what a shared cache is told: 'keep' (for good, both CDN headers) or 'no' (no-store) */
+const KEEP = 'public, max-age=31536000, immutable', WHILE = 'public, max-age=600';
+/** what a shared cache is told: 'keep' (for good, both CDN headers), 'while' (10 minutes) or 'no' (no-store) */
 const edge = r => r.headers['cdn-cache-control'] === KEEP && r.headers['cloudflare-cdn-cache-control'] === KEEP ? 'keep'
+  : r.headers['cdn-cache-control'] === WHILE && r.headers['cloudflare-cdn-cache-control'] === WHILE ? 'while'
   : r.headers['cdn-cache-control'] === 'no-store' && r.headers['cloudflare-cdn-cache-control'] === 'no-store' ? 'no' : JSON.stringify(r.headers);
 
 test('/data-blocks/: named by the manifest, exact in every encoding, as they are where they do not compress, bounds refused', { timeout: 60_000 }, async () => {
   const s = await server();
   try {
     const man = JSON.parse((await get('/data-manifest', { ae: 'identity' })).body);
-    assert.deepEqual(man.blocks, { url: '/data-blocks/', size: M, max: 8 });
+    assert.deepEqual(man.blocks, { url: '/data-blocks/v2/', size: M, max: 8 });
 
     // a run that compresses: every encoding the client may take, the exact bytes, smaller on the wire
     const encs = [...(zlib.zstdDecompressSync ? ['zstd'] : []), 'br', 'gzip'];
     for (const [ae, want] of [['gzip, deflate, br, zstd', encs[0]], ['gzip, br', 'br'], ['gzip', 'gzip'], ['identity', undefined]]) {
-      const r = await get('/data-blocks/TRACKS/L4RA.BUN?b=1&n=8', { ae });
+      const r = await get('/data-blocks/v2/TRACKS/L4RA.BUN?b=1&n=8', { ae });
       assert.equal(r.status, 200, ae);
       assert.equal(r.headers['content-encoding'], want, ae);
       assert.ok(r.body.equals(slice('TRACKS/L4RA.BUN', 1, 8)), `exact bytes with ${ae}`);
@@ -93,25 +96,25 @@ test('/data-blocks/: named by the manifest, exact in every encoding, as they are
       else assert.equal(+r.headers['content-length'], r.body.length);
     }
     // the last, short block; one block; a file that does not compress (random bytes, the movies' video)
-    assert.ok((await get('/data-blocks/TRACKS/L4RA.BUN?b=8&n=1')).body.equals(slice('TRACKS/L4RA.BUN', 8, 1)));
+    assert.ok((await get('/data-blocks/v2/TRACKS/L4RA.BUN?b=8&n=1')).body.equals(slice('TRACKS/L4RA.BUN', 8, 1)));
     for (const [f, b, n, enc] of [['SPEED2.EXE', 0, 4, undefined], ['MOVIES/INTRO.VP6', 1, 1, undefined], ['PFDATA/MIX.MUS', 0, 3, undefined],
       ['PFDATA/MIX.MUS', 1, 2, encs[0]]]) {
-      const r = await get(`/data-blocks/${f}?b=${b}&n=${n}`);
+      const r = await get(`/data-blocks/v2/${f}?b=${b}&n=${n}`);
       assert.equal(r.headers['content-encoding'], enc, `${f} from block ${b}`);
       assert.ok(r.body.equals(slice(f, b, n)), f);
     }
     // HEAD: the headers of the plain answer, no body
-    const h = await get('/data-blocks/TRACKS/L4RA.BUN?b=0&n=2', { method: 'HEAD' });
+    const h = await get('/data-blocks/v2/TRACKS/L4RA.BUN?b=0&n=2', { method: 'HEAD' });
     assert.equal(h.status, 200); assert.equal(+h.headers['content-length'], 2 * M); assert.equal(h.wire.length, 0);
 
     // refused: out of bounds, past the end, not a game file, not inside the folder
     const status = async p => (await get(p)).status;
     for (const p of ['SPEED2.EXE', 'SPEED2.EXE?b=0', 'SPEED2.EXE?b=0&n=0', 'SPEED2.EXE?b=0&n=9', 'SPEED2.EXE?b=-1&n=1', 'SPEED2.EXE?b=1e3&n=1',
-      'SPEED2.EXE?b=12345678&n=1', 'SPEED2.EXE?b=0&n=01x']) assert.equal(await status(`/data-blocks/${p}`), 400, p);
-    assert.equal(await status('/data-blocks/SPEED2.EXE?b=4&n=1'), 416);       // 3 MiB + 17: blocks 0..3
-    assert.equal(await status('/data-blocks/NOTES.TXT?b=0&n=1'), 404);
-    assert.equal(await status('/data-blocks/TRACKS?b=0&n=1'), 404);
-    assert.equal(await status('/data-blocks/TRACKS/.hidden?b=0&n=1'), 404);
+      'SPEED2.EXE?b=12345678&n=1', 'SPEED2.EXE?b=0&n=01x']) assert.equal(await status(`/data-blocks/v2/${p}`), 400, p);
+    assert.equal(await status('/data-blocks/v2/SPEED2.EXE?b=4&n=1'), 416);       // 3 MiB + 17: blocks 0..3
+    assert.equal(await status('/data-blocks/v2/NOTES.TXT?b=0&n=1'), 404);
+    assert.equal(await status('/data-blocks/v2/TRACKS?b=0&n=1'), 404);
+    assert.equal(await status('/data-blocks/v2/TRACKS/.hidden?b=0&n=1'), 404);
     // (TRACKS/../SPEED2.EXE is SPEED2.EXE: the URL is resolved before anything is looked up, as for /data/)
     assert.equal(await status('/data-blocks/..%2fstate/etag.key?b=0&n=1'), 400);
   } finally { await s.stop(); }
@@ -122,7 +125,7 @@ test('/data-blocks/: a shared cache may keep a run for good: this version of the
   try {
     const m = await mtimes();
     const run = (f, b, n, mt = m[f], ae, sz = FILES[f].length) =>
-      get(`/data-blocks/${f}?b=${b}&n=${n}${mt === null ? '' : `&m=${mt}`}${sz === null ? '' : `&s=${sz}`}`, ae ? { ae } : undefined);
+      get(`/data-blocks/v2/${f}?b=${b}&n=${n}${mt === null ? '' : `&m=${mt}`}${sz === null ? '' : `&s=${sz}`}`, ae ? { ae } : undefined);
     // compressed, or a run that does not compress: kept, and still exact
     for (const [f, b, n, ae] of [['TRACKS/L4RA.BUN', 1, 8], ['TRACKS/L4RA.BUN', 0, 1, 'gzip, br'], ['SPEED2.EXE', 0, 4], ['PFDATA/MIX.MUS', 0, 1],
       ['MOVIES/INTRO.VP6', 0, 2]]) {
@@ -137,8 +140,53 @@ test('/data-blocks/: a shared cache may keep a run for good: this version of the
     assert.equal(edge(await run('TRACKS/L4RA.BUN', 1, 1, m['TRACKS/L4RA.BUN'] - 1)), 'no');
     assert.equal(edge(await run('TRACKS/L4RA.BUN', 1, 1, m['TRACKS/L4RA.BUN'], undefined, FILES['TRACKS/L4RA.BUN'].length + 1)), 'no');
     assert.equal(edge(await run('TRACKS/L4RA.BUN', 1, 1, m['TRACKS/L4RA.BUN'], 'identity')), 'no');
-    // a page of before names no size: kept on the mtime
-    assert.equal(edge(await run('TRACKS/L4RA.BUN', 1, 1, m['TRACKS/L4RA.BUN'], undefined, null)), 'keep');
+    assert.equal(edge(await run('TRACKS/L4RA.BUN', 1, 1, m['TRACKS/L4RA.BUN'], undefined, null)), 'no');
+  } finally { await s.stop(); }
+});
+
+test("/data-blocks/v2/: one block at brotli's best once the server keeps it, for good; till then a shared cache keeps it a while", { timeout: 120_000 }, async () => {
+  const s = await server({ compress: 2 });
+  try {
+    const m = await mtimes();
+    const block = (f, b, ae = 'gzip, deflate, br, zstd') => get(`/data-blocks/v2/${f}?b=${b}&n=1&m=${m[f]}&s=${FILES[f].length}`, { ae });
+    // compressed as it is sent and kept a while, or kept already (the server keeps every block of the manifest, those
+    // the answers ask for first)
+    const first = await block('TRACKS/L4RA.BUN', 3);
+    assert.ok(first.body.equals(slice('TRACKS/L4RA.BUN', 3, 1)));
+    if (first.headers['content-encoding'] !== 'br' || first.headers['content-length'] === undefined) assert.equal(edge(first), 'while');
+    // every block that compresses (not L4RA's last: 5 bytes), kept: br, its length, kept for good, exact, smaller than
+    // gzip's
+    const wanted = [...Array(8).keys()].map(b => ['TRACKS/L4RA.BUN', b]).concat([['PFDATA/MIX.MUS', 1], ['PFDATA/MIX.MUS', 2]]);
+    for (const [f, b] of wanted) {
+      let r;
+      for (let i = 0; i < 400; i++) {
+        r = await block(f, b);
+        if (r.headers['content-encoding'] === 'br' && r.headers['content-length'] !== undefined) break;
+        await new Promise(res => setTimeout(res, 200));
+      }
+      assert.equal(r.headers['content-encoding'], 'br', `${f} block ${b} kept`);
+      assert.equal(+r.headers['content-length'], r.wire.length);
+      assert.equal(edge(r), 'keep', `${f} block ${b}`);
+      assert.ok(r.body.equals(slice(f, b, 1)), `${f} block ${b} exact`);
+      const gz = await block(f, b, 'gzip');
+      assert.ok(r.wire.length < gz.wire.length, `${f} block ${b}: ${r.wire.length} kept, ${gz.wire.length} gzip`);
+      assert.equal(edge(gz), 'keep', 'a client without br: compressed as it is sent, as before');
+    }
+    // noise as it is, for good once the server has found it does not compress; the old addresses the same
+    for (const [f, b] of [['MOVIES/INTRO.VP6', 1], ['PFDATA/MIX.MUS', 0], ['SPEED2.EXE', 2]]) {
+      let r;
+      for (let i = 0; i < 400; i++) {
+        r = await block(f, b);
+        if (edge(r) === 'keep') break;
+        assert.equal(edge(r), 'while', f);
+        await new Promise(res => setTimeout(res, 200));
+      }
+      assert.equal(r.headers['content-encoding'], undefined, f);
+      assert.equal(edge(r), 'keep', f);
+      assert.ok(r.body.equals(slice(f, b, 1)), f);
+    }
+    // the address from before /v2: none
+    assert.equal((await get(`/data-blocks/TRACKS/L4RA.BUN?b=4&n=1&m=${m['TRACKS/L4RA.BUN']}&s=${FILES['TRACKS/L4RA.BUN'].length}`)).status, 404);
   } finally { await s.stop(); }
 });
 
@@ -149,7 +197,7 @@ test('/data-blocks/: a client holding all its compressors gets the rest as they 
     // 8 compressed runs that are not read: each holds its compressor (about 2 MB compressed, more than the
     // socket takes), the 9th and 10th come as they are
     const open = () => new Promise((res, rej) => {
-      const q = http.request({ host: '127.0.0.1', port: PORT, path: '/data-blocks/TRACKS/L4RA.BUN?b=0&n=8', headers: { host: `localhost:${PORT}`, 'accept-encoding': 'zstd, br, gzip' } }, r => {
+      const q = http.request({ host: '127.0.0.1', port: PORT, path: '/data-blocks/v2/TRACKS/L4RA.BUN?b=0&n=8', headers: { host: `localhost:${PORT}`, 'accept-encoding': 'zstd, br, gzip' } }, r => {
         r.pause(); held.push(r); res(r.headers['content-encoding'] ?? 'none');
       });
       q.on('error', rej); q.end();
@@ -159,14 +207,14 @@ test('/data-blocks/: a client holding all its compressors gets the rest as they 
     assert.deepEqual(encs.slice(0, 8).map(e => e !== 'none'), Array(8).fill(true), encs.join(' '));
     assert.deepEqual(encs.slice(8), ['none', 'none'], encs.join(' '));
     // the uncompressed answers are still exact, and no shared cache keeps one (compressed, it is a quarter)
-    const plain = await get(`/data-blocks/TRACKS/L4RA.BUN?b=2&n=1&m=${(await mtimes())['TRACKS/L4RA.BUN']}&s=${FILES['TRACKS/L4RA.BUN'].length}`);
+    const plain = await get(`/data-blocks/v2/TRACKS/L4RA.BUN?b=2&n=1&m=${(await mtimes())['TRACKS/L4RA.BUN']}&s=${FILES['TRACKS/L4RA.BUN'].length}`);
     assert.equal(plain.headers['content-encoding'], undefined);
     assert.ok(plain.body.equals(slice('TRACKS/L4RA.BUN', 2, 1)));
     assert.equal(edge(plain), 'no');
     // letting go (the client goes away mid-answer) gives the compressors back
     for (const r of held.splice(0)) r.destroy();
     let enc;
-    for (let i = 0; i < 40 && !enc; i++) { await new Promise(r => setTimeout(r, 50)); enc = (await get('/data-blocks/TRACKS/L4RA.BUN?b=0&n=1')).headers['content-encoding']; }
+    for (let i = 0; i < 40 && !enc; i++) { await new Promise(r => setTimeout(r, 50)); enc = (await get('/data-blocks/v2/TRACKS/L4RA.BUN?b=0&n=1')).headers['content-encoding']; }
     assert.ok(enc, 'compressed again once the held answers are gone');
   } finally { for (const r of held) r.destroy(); await s.stop(); }
 });
@@ -177,7 +225,7 @@ test('/data-blocks/: past the 128 compressors of all clients, the next client ge
   try {
     // a client is an X-Forwarded-For address (this machine is a trusted proxy); its compressed runs are not read
     const open = c => new Promise((res, rej) => {
-      const q = http.request({ host: '127.0.0.1', port: PORT, path: '/data-blocks/TRACKS/L4RA.BUN?b=0&n=8',
+      const q = http.request({ host: '127.0.0.1', port: PORT, path: '/data-blocks/v2/TRACKS/L4RA.BUN?b=0&n=8',
         headers: { host: `localhost:${PORT}`, 'accept-encoding': 'zstd, br, gzip', 'x-forwarded-for': `192.0.2.${c}` } }, r => {
         r.pause(); held.push(r); res(r.headers['content-encoding'] ?? 'none');
       });

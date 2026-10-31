@@ -2,7 +2,7 @@
 //! the manifest and the module, the timers, the signals, and the start-up lines (the tests wait for "  access    :"
 //! and read others).
 
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,10 +11,11 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::time::{Instant, interval_at};
 
 use nfsu2_http::tls::TlsState;
-use nfsu2_http::{Limits, bind, serve};
+use nfsu2_http::{Limits, bind, serve, serve_unix};
 use nfsu2_lan::{LanOptions, LanSwitch};
 use nfsu2_online::{LobbyTrace, OnlineHost, OnlineOptions};
 use nfsu2_roam::{RoamHub, RoamOptions};
+use nfsu2_util::cpu::{QuotaBusy, WorkersBusy, process_cpu_seconds};
 use nfsu2_util::{Host, log};
 use nfsu2_vault::{Sweep, Vault, VaultOptions};
 
@@ -25,15 +26,21 @@ use crate::paths;
 
 /// what the players on the switch do, every 5 minutes while any are on (counts only)
 const BREAKDOWN_EVERY: Duration = Duration::from_secs(5 * 60);
+/// who is in free roam or Online, for the day's counts (days.rs): often enough to see a short visit
+const DAYS_SWEEP_EVERY: Duration = Duration::from_secs(30);
 /// SO_SNDBUF of a /lan connection (NFSU2_LAN_SNDBUF; 0: the kernel's own), which Linux doubles: what a player's path
 /// does not take waits in the switch's own queue then, where its rules see it (roam_queue), not in the kernel's,
 /// which Linux grows to 4 MB (nfsu2.xyz, 2026-10-22: up to 4 MB waiting there for one player, seconds of free roam)
 const LAN_SNDBUF: u64 = 32 << 10;
+/// the threads that compress the game data's blocks at brotli's best, once, at the lowest priority
+/// (NFSU2_COMPRESS_THREADS; kept.rs): a game folder with every language pack (5600 blocks, 3100 that compress) in
+/// about half an hour
+const COMPRESS_THREADS: u64 = 2;
 /// keyphrase saves: counted at the start, then swept (the unused removed) and counted again every day
 const VAULT_SWEEP_EVERY: Duration = Duration::from_secs(24 * 3600);
 
 /// "1.2 GB", "340.5 MB"
-fn size(bytes: u64) -> String {
+pub(super) fn size(bytes: u64) -> String {
     if bytes >= 1_000_000_000 { format!("{:.2} GB", bytes as f64 / 1e9) } else { format!("{:.1} MB", bytes as f64 / 1e6) }
 }
 
@@ -72,6 +79,27 @@ fn state_folder(o: &Options) -> String {
     }
 }
 
+/// --http-socket's listener: "@name" in the network namespace's abstract space (Linux), else a file, made anew (a
+/// socket's file stays after its process ends) and open to every user: the proxy may run as a user of its own
+/// (cloudflared's image: 65532), and anything on this machine reaches the HTTP port too.  For each message a page and
+/// the switch exchange, a Unix socket spares both ends TCP's work on 127.0.0.1 (nfsu2.xyz, 2026-10-30, 5,800 players:
+/// the kernel's network work was about 60 % of the CPU, much of it this hop's)
+fn bind_unix(at: &str) -> std::io::Result<tokio::net::UnixListener> {
+    #[cfg(target_os = "linux")]
+    if let Some(name) = at.strip_prefix('@') {
+        use std::os::linux::net::SocketAddrExt;
+        let l = std::os::unix::net::UnixListener::bind_addr(&std::os::unix::net::SocketAddr::from_abstract_name(name)?)?;
+        l.set_nonblocking(true)?;
+        return tokio::net::UnixListener::from_std(l);
+    }
+    if std::fs::symlink_metadata(at).is_ok_and(|m| m.file_type().is_socket()) {
+        std::fs::remove_file(at)?;
+    }
+    let l = tokio::net::UnixListener::bind(at)?;
+    std::fs::set_permissions(at, std::fs::Permissions::from_mode(0o666))?;
+    Ok(l)
+}
+
 /// the certificate file's time, for the check once a minute (0 when it cannot be read, as fs.watchFile has it)
 async fn cert_mtime(p: &str) -> f64 {
     tokio::fs::metadata(p).await.map(|m| etag::mtime_ms(&m)).unwrap_or(0.0)
@@ -92,6 +120,15 @@ async fn reload_cert(app: &Arc<App>, tls: &Arc<TlsState>) {
 
 pub async fn run(o: Options, cores: usize) {
     let real_state = state_folder(&o);
+    // the console kept in the state folder too, a file a day (nfsu2_util::logfile): it outlasts a deploy
+    let logs = paths::join(&o.state, "logs");
+    let logs_up = match nfsu2_util::logfile::to_files(Path::new(&logs)) {
+        Ok(()) => true,
+        Err(e) => {
+            log::error(&format!("{logs}: {e} (no log files: the console only)"));
+            false
+        }
+    };
     if !o.artifacts.is_empty()
         && let Err(e) = std::fs::create_dir_all(&o.artifacts)
     {
@@ -109,25 +146,41 @@ pub async fn run(o: Options, cores: usize) {
     let tap = trace.as_ref().map(|t| t.tap());
     // the lines a client causes in Online mode (logins, games, races, friends) count against that client's share of
     // the console, as its joins and refusals do (the Online audit's ONL-8)
+    // claimed names (nfsu2-claims): with keyphrase saves only (a name is claimed by a keyphrase)
+    let claims = (o.vault_gb > 0.0).then(|| Arc::new(nfsu2_claims::Claims::open(Path::new(&o.state), nfsu2_util::now_ms())));
+    // the operator's bans, and the control socket that makes them (control.rs); the hosts' [cheat] lines of races get
+    // a handle that `ban` takes for a week (control.rs Marker)
+    let bans = Arc::new(nfsu2_bans::Bans::open(Path::new(&o.state)).unwrap_or_else(|e| die(&format!("{}/bans.json: {e}", o.state))));
+    // how many come each day (days.rs): the day so far, from before a restart
+    let days = Arc::new(super::days::Days::open(&o.state, nfsu2_util::now_ms()));
+    let marker = super::control::Marker::new(bans.clone());
     let online = o.online.then(|| {
+        let m = marker.clone();
         OnlineHost::spawn(OnlineOptions {
             state_dir: Some(PathBuf::from(paths::join(&o.state, "online"))),
-            log: Arc::new(|line: &str, key: Option<&str>| match key {
-                None => log::line(line),
-                Some(k) => log::limited("online", "Online lines", k, line, 30),
+            log: Arc::new(move |line: &str, key: Option<&str>| {
+                let tagged = m.tag(line);
+                let line = tagged.as_deref().unwrap_or(line);
+                match key {
+                    None => log::line(line),
+                    Some(k) => log::limited("online", "Online lines", k, line, 30),
+                }
             }),
             tap: tap.clone(),
+            claims: claims.clone(),
         })
     });
     // (its lines: the cap on the players' links going down while the server is busy and back up, at most one every 5 s)
-    let roam = o.roam_hub.then(|| RoamHub::spawn(RoamOptions::default(), Arc::new(|line: &str| log::line(line))));
+    let m = marker.clone();
+    let roam_log = Arc::new(move |line: &str| log::line(m.tag(line).as_deref().unwrap_or(line)));
+    let roam = o.roam_hub.then(|| RoamHub::spawn_with(RoamOptions::default(), roam_log, claims.clone()));
     // keyphrase saves: a folder in the state folder (none with --vault-gb 0)
     let vault = (o.vault_gb > 0.0).then(|| {
         let dir = paths::join(&o.state, "vault");
         Arc::new(Vault::open(VaultOptions::sized(PathBuf::from(&dir), o.vault_gb)).unwrap_or_else(|e| die(&format!("{dir}: {e}"))))
     });
     let lan_sndbuf = env_num("NFSU2_LAN_SNDBUF", LAN_SNDBUF) as usize;
-    // the bundle clock follows the crowd (nfsu2-lan); NFSU2_BUNDLE_MS fixes its tick (0: none), for measurements
+    // the bundle clock's tick, 50 ms (nfsu2-lan); NFSU2_BUNDLE_MS another (0: none), for measurements
     let d = LanOptions::default();
     let fixed = std::env::var_os("NFSU2_BUNDLE_MS").is_some().then(|| env_num("NFSU2_BUNDLE_MS", d.bundle_ms));
     let lan_options = LanOptions {
@@ -136,6 +189,8 @@ pub async fn run(o: Options, cores: usize) {
         bundle_ms: fixed.unwrap_or(d.bundle_ms),
         bundle_max_ms: fixed.unwrap_or_else(|| env_num("NFSU2_BUNDLE_MAX_MS", d.bundle_max_ms)),
         bundle_budget: env_num("NFSU2_BUNDLE_BUDGET", d.bundle_budget),
+        bundle_jitter: env_num("NFSU2_BUNDLE_JITTER", (d.bundle_jitter * 100.0) as u64) as f64 / 100.0,
+        fpred: env_num("NFSU2_FPRED", 1) != 0,
         send_buffer_os: lan_sndbuf,
         ..d
     };
@@ -154,9 +209,36 @@ pub async fn run(o: Options, cores: usize) {
     if let Some(h) = &roam {
         h.attach_switch(lan.switch_send());
     }
+    marker.set_switch(lan.clone());
 
-    let app = Arc::new(App::new(o, real_state, etag_key, lan.clone(), online, roam.clone(), vault.clone(), (cores / 2).max(2), lan_sndbuf));
+    // Cloudflare's check for a claim (turnstile.rs: off without its two keys)
+    let turnstile = super::turnstile::Turnstile::from_env();
+    if let Some(c) = &claims {
+        log::line(&format!(
+            "[names] {} names claimed; Cloudflare's check {}",
+            c.count(nfsu2_util::now_ms()),
+            if turnstile.is_some() { "on" } else { "off (no NFSU2_TURNSTILE_SITE and NFSU2_TURNSTILE_SECRET)" }
+        ));
+    }
+    let names = claims.clone().map(|c| super::names::NamesRoute::new(c, turnstile));
+    let app = Arc::new(App::new(
+        o,
+        real_state,
+        etag_key,
+        lan.clone(),
+        online,
+        roam.clone(),
+        vault.clone(),
+        names,
+        bans,
+        days.clone(),
+        (cores / 2).max(2),
+        lan_sndbuf,
+        // the threads that keep the game data's blocks at brotli's best (kept.rs; 0: none)
+        env_num("NFSU2_COMPRESS_THREADS", COMPRESS_THREADS) as usize,
+    ));
     let o = &app.o;
+    let control = super::control::listen(app.clone());
 
     // the switch's players, every 5 minutes while any are on
     {
@@ -164,9 +246,18 @@ pub async fn run(o: Options, cores: usize) {
         tokio::spawn(async move {
             let mut shown = false;
             let mut thinned = 0;
+            let mut was = nfsu2_lan::Breakdown::default();
+            let (mut cpu_was, mut workers, mut quota) =
+                (process_cpu_seconds(), WorkersBusy::new(&tokio::runtime::Handle::current()), QuotaBusy::find());
             let mut every = interval_at(Instant::now() + BREAKDOWN_EVERY, BREAKDOWN_EVERY);
             loop {
                 every.tick().await;
+                // the CPU of the last 5 minutes: the server's, its workers' busy time, and the fullest quota's (the
+                // game's containers' together: nfsu2.slice)
+                let cpu = process_cpu_seconds();
+                let server = (cpu - cpu_was) / BREAKDOWN_EVERY.as_secs_f64();
+                let (busy, slice) = (workers.sample(), quota.as_mut().and_then(QuotaBusy::sample_use));
+                cpu_was = cpu;
                 let b = lan.breakdown().await;
                 if b.players == 0 && !shown {
                     continue;
@@ -175,12 +266,105 @@ pub async fn run(o: Options, cores: usize) {
                 // how many are behind on their connection (its queues past the server: the kernel's, cloudflared's,
                 // the tunnel's) and get fewer of the other cars' updates meanwhile (nfsu2-lan lag.rs)
                 log::line(&format!(
-                    "[players] {} on the switch: {} in Online mode, {} on the LAN or Online screens, {} in free roam, {} on an older page \
-                     (until its tab closes), {} leaving or starting; {} of all of them bundling (a page loaded since the server has \
-                     bundles); {} more than a second behind on their connection, {} getting fewer car updates ({} left out since the last count)",
-                    b.players, b.online, b.lan, b.roam, b.older, b.other, b.bundles, b.behind, b.thinning, b.thinned - thinned
+                    "[players] {} on the switch: {} in Online mode, {} on the LAN or Online screens, {} in free roam ({} of them not driving: \
+                     a race, a shop, the menus), {} leaving or starting; {} more than a second behind on their connection, {} getting \
+                     fewer car updates ({} left out since the last count)",
+                    b.players,
+                    b.online,
+                    b.lan,
+                    b.roam,
+                    b.away,
+                    b.other,
+                    b.behind,
+                    b.thinning,
+                    b.thinned - thinned
+                ));
+                // the line (nfsu2-lan queue.rs): pages waiting for a place, and how long the longest of those let in
+                // waited
+                if b.waiting > 0 || b.waited > 0 {
+                    log::line(&format!(
+                        "[players] {} waiting in line for a place; the longest wait of those let in since the line began {} min",
+                        b.waiting,
+                        b.waited.div_ceil(60)
+                    ));
+                }
+                // what free roam sent the pages in compact bundles since the last count: friends' car states (by their
+                // fields, nfsu2-lan fpred.rs, or as a byte delta) and the rest
+                let (sb, se, sf) = (b.snap_bytes - was.snap_bytes, b.snap_entries - was.snap_entries, b.fpred_entries - was.fpred_entries);
+                let (ob, oe) = (b.other_bytes - was.other_bytes, b.other_entries - was.other_entries);
+                if se + oe > 0 {
+                    log::line(&format!(
+                        "[players] to the pages in compact bundles since the last count: {:.1} MB in {se} car states ({:.1} bytes each, \
+                         {sf} of them by their fields), {:.1} MB in {oe} other datagrams",
+                        sb as f64 / 1e6,
+                        sb as f64 / se.max(1) as f64,
+                        ob as f64 / 1e6
+                    ));
+                }
+                // the same and the hosts' messages by kind (nfsu2-lan mix.rs): where the bytes to the pages went
+                if let Some(l) = nfsu2_lan::mix::line(&b.mix, &was.mix, BREAKDOWN_EVERY.as_secs_f64()) {
+                    log::line(&format!("[players] to the pages by kind since the last count: {l}"));
+                }
+                let slice = slice.map_or(String::new(), |q| {
+                    format!("; {} {:.2} of its {} cores ({:.0} %)", q.group, q.used, q.cores, q.share() * 100.0)
+                });
+                log::line(&format!(
+                    "[players] CPU in the last 5 minutes: the server {server:.2} cores, its switch's workers {:.0} % busy{slice}",
+                    busy * 100.0
                 ));
                 thinned = b.thinned;
+                was = b;
+            }
+        });
+    }
+    // the game data's answers, every 5 minutes while there were any (blocks.rs Sent)
+    {
+        let app = app.clone();
+        tokio::spawn(async move {
+            let mut every = interval_at(Instant::now() + BREAKDOWN_EVERY, BREAKDOWN_EVERY);
+            loop {
+                every.tick().await;
+                let sent = app.sent.take();
+                if !sent.is_empty() {
+                    log::line(&format!("[blocks] in the last 5 minutes: {sent}"));
+                }
+            }
+        });
+    }
+    // the day's counts (days.rs): who is in free roam or Online now, every SWEEP_EVERY; the day so far written and on
+    // the console when it changed
+    {
+        let (lan, days) = (lan.clone(), days.clone());
+        tokio::spawn(async move {
+            let mut every = interval_at(Instant::now() + DAYS_SWEEP_EVERY, DAYS_SWEEP_EVERY);
+            let mut shown = [0; 4];
+            let mut ticks = 0u64;
+            loop {
+                every.tick().await;
+                let now = nfsu2_util::now_ms();
+                for w in lan.who().await.iter().filter(|w| w.left.is_none()) {
+                    let what = match w.doing {
+                        "Online" => super::days::Seen::Online,
+                        "free roam" => super::days::Seen::Roam,
+                        _ => continue,
+                    };
+                    if let Some(id) = &w.browser {
+                        days.seen(id, what, now);
+                    }
+                }
+                ticks += 1;
+                if ticks % (BREAKDOWN_EVERY.as_secs() / DAYS_SWEEP_EVERY.as_secs()) != 0 {
+                    continue;
+                }
+                let (_, c) = days.today(now);
+                if c != shown {
+                    shown = c;
+                    log::line(&format!("[days] today so far (UTC): {}", super::days::counts_text(c)));
+                }
+                let d = days.clone();
+                if let Ok(Err(e)) = tokio::task::spawn_blocking(move || d.save()).await {
+                    log::error(&format!("days.json: {e}"));
+                }
             }
         });
     }
@@ -194,6 +378,16 @@ pub async fn run(o: Options, cores: usize) {
                 app.lan_opens.prune();
                 if let Some(v) = &app.vault {
                     v.prune();
+                }
+                // the claimed names: the ended ones go, names.json written when anything changed
+                if let Some(n) = &app.names {
+                    n.prune();
+                    let now = nfsu2_util::now_ms();
+                    n.claims.prune(now);
+                    let c = n.claims.clone();
+                    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || c.save(now)).await {
+                        log::error(&format!("names.json: {e}"));
+                    }
                 }
             }
         });
@@ -254,6 +448,11 @@ pub async fn run(o: Options, cores: usize) {
         let (listener, _) = bind("127.0.0.1", o.http_port, None).await.unwrap_or_else(|m| die(&format!("cannot listen: {m}")));
         servers.push(serve(listener, None, limits.clone(), app.clone()));
     }
+    if !o.http_socket.is_empty() {
+        let listener = bind_unix(&o.http_socket).unwrap_or_else(|e| die(&format!("cannot listen on {}: {e}", o.http_socket)));
+        // as from 127.0.0.1: the proxy on this machine it is for is trusted there, and reports the player's address
+        servers.push(serve_unix(listener, ([127, 0, 0, 1], 0).into(), limits.clone(), app.clone()));
+    }
     if let Err(e) = app.refresh_manifest().await {
         die(&format!("the game folder {}: {e}", o.data));
     }
@@ -265,9 +464,11 @@ pub async fn run(o: Options, cores: usize) {
         });
     }
 
-    // SIGTERM, SIGINT: the switch saves its addresses, the hosts stop, then the process ends
+    // SIGTERM, SIGINT: the switch saves its addresses, the hosts stop, the claimed names and the day so far are written, the control
+    // socket's file goes, then the process ends
+    let control_up = control.is_some();
     {
-        let (lan, trace) = (lan.clone(), trace.clone());
+        let (lan, trace, claims, days) = (lan.clone(), trace.clone(), claims.clone(), days.clone());
         let mut term = signal(SignalKind::terminate()).unwrap_or_else(|e| die(&format!("SIGTERM: {e}")));
         let mut int = signal(SignalKind::interrupt()).unwrap_or_else(|e| die(&format!("SIGINT: {e}")));
         tokio::spawn(async move {
@@ -279,6 +480,17 @@ pub async fn run(o: Options, cores: usize) {
                 lan.stop();
                 if let Some(t) = &trace {
                     t.close();
+                }
+                if let Some(c) = &claims
+                    && let Err(e) = c.save(nfsu2_util::now_ms())
+                {
+                    log::error(&format!("names.json: {e}"));
+                }
+                if let Err(e) = days.save() {
+                    log::error(&format!("days.json: {e}"));
+                }
+                if let Some(c) = &control {
+                    c.remove();
                 }
                 for s in &servers {
                     s.abort();
@@ -311,6 +523,12 @@ pub async fn run(o: Options, cores: usize) {
             if o.tls == Tls::Proxy { "  (the proxy forwards here)" } else { "" }
         ),
     ];
+    if !o.http_socket.is_empty() {
+        lines.push(format!(
+            "  socket    : HTTP on {} too, as from 127.0.0.1 (cloudflared's origin unix:{}: no TCP on this machine)",
+            o.http_socket, o.http_socket
+        ));
+    }
     match o.tls {
         Tls::None => lines
             .push("  other PCs : none: they need HTTPS, from --tls-cert/--tls-key or a proxy or tunnel in front (docs/web/VPS.md)".into()),
@@ -345,6 +563,18 @@ pub async fn run(o: Options, cores: usize) {
             "no hub (--roam-hub off): players find each other by broadcast, groups of 33"
         }
     ));
+    if o.roam_hub {
+        // the quota the hub's busy cap reads besides the workers (nfsu2_util::cpu::QuotaBusy)
+        let quotas = QuotaBusy::find().map(|q| q.quotas()).unwrap_or_default();
+        lines.push(match quotas.iter().min_by(|a, b| a.1.total_cmp(&b.1)) {
+            Some((group, cores)) => {
+                format!("  CPU quota : {cores} cores for {group}; over 85 % of them in use, free roam gives fewer friends")
+            }
+            None => {
+                "  CPU quota : none seen (a container sees its slice's with cgroup: host); free roam's busy cap reads the workers".into()
+            }
+        });
+    }
     lines.push(format!(
         "  online    : {}",
         if o.online {
@@ -362,17 +592,38 @@ pub async fn run(o: Options, cores: usize) {
             Some(v) => {
                 let vo = v.store.options();
                 format!(
-                    "keyphrase saves (/vault) in {}, up to {} (new keyphrases until {}, {} a day at most); one unused for \
-                     two years goes",
+                    "keyphrase saves (/vault) in {}, up to {} (new keyphrases until {}, growing {} a day at most); one \
+                     unused for two years goes",
                     vo.dir.display(),
                     size(vo.max_bytes),
                     size(vo.new_until),
-                    vo.new_per_day
+                    size(vo.per_day)
                 )
             }
             None => "no keyphrase saves (--vault-gb 0)".into(),
         }
     ));
+    lines.push(format!(
+        "  blocks    : {}",
+        app.kept.as_ref().map_or_else(|| "compressed as they are sent (NFSU2_COMPRESS_THREADS=0)".into(), |k| k.summary())
+    ));
+    let bans = app.bans.list(nfsu2_util::now_ms()).len();
+    lines.push(if control_up {
+        format!(
+            "  bans      : {bans}; nfsu2-server ctl who, kick, ban, unban, bans (through {})",
+            paths::join(&o.state, super::control::SOCKET)
+        )
+    } else {
+        format!("  bans      : {bans}; no kick or ban (the control socket could not be made: above)")
+    });
+    lines.push(if logs_up {
+        format!(
+            "  logs      : the console in {logs} too, a file a day (UTC), gzipped once it ended, the last {} days",
+            nfsu2_util::logfile::DAYS_KEPT
+        )
+    } else {
+        "  logs      : the console only (the log files could not be made: above)".into()
+    });
     if !o.online_trace.is_empty() {
         lines.push(format!("  trace     : lobby messages (secrets redacted) into {}", o.online_trace));
     }

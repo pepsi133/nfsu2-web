@@ -4,15 +4,17 @@
 // module and every exit terminates all of its workers.
 
 import { startProcess, type GameProcess } from '../host/process';
+import { N } from './i18n';
 import { HostKind } from '../host/abi';
 import {
-  attachAudio, attachInput, attachNet, attachRenderer,
+  attachAudio, attachInput, attachNet, attachRenderer, OtherBuild,
   type AudioSubsystem, type InputSubsystem, type NetSubsystem, type RendererSubsystem, type Subsystem,
 } from './subsystems';
 import { StatusReader } from './status';
 import { DATA_BASE, MANIFEST_URL } from '../host/datacache';
 import type { GameInfo } from './loader';
 import type { PadPage } from '../input/gamepad';
+import type { NetQueue, NetRemoved } from '../net';
 
 export interface SessionOptions {
   module: WebAssembly.Module;
@@ -29,8 +31,23 @@ export interface SessionOptions {
   notice?(text: string, who?: string): void;
   /** free roam: the race lobby's panel, its state as JSON from the game ("{}": none) */
   lobby?(json: string): void;
+  /** free roam: quick chat, a phrase said (by a friend or the player), as JSON from the game */
+  say?(json: string): void;
+  /** every frame drawn: quick chat's places over the cars in it (contract.ts RendererOptions.onMarks) */
+  marks?(n: number, m: Float32Array, ids: Uint32Array): void;
   /** the server's LAN took the game back after the link was lost (a server restart, as for a deploy) */
   netBack?(): void;
+  /** the server is full: the game's place in line for one (null: not in line) */
+  netQueue?(q: NetQueue | null): void;
+  /** this browser's own id on the server's LAN, and the one its other store held when that was another (page-id.ts) */
+  netId?: string;
+  netWas?: string[];
+  /** the token of the keyphrase this page plays with (claim.ts: whose claimed names it may play under) */
+  netClaim?: string;
+  /** free roam: the names of the players this one blocks (settings.ini roam_block) */
+  netBlock?: string[];
+  /** the server's operator removed the player from playing with others (a kick or a ban) */
+  netRemoved?(r: NetRemoved): void;
   /** the game finished writing a file of the save overlay (path relative to /save) */
   onSaved?(path: string): void;
   /** tests: where frame dumps go, and their scale */
@@ -39,8 +56,12 @@ export interface SessionOptions {
   /** the page's own use of the controller: its menu (Home) and dialogs */
   padPage?: PadPage;
   log(line: string): void;
-  /** a subsystem the game cannot do without (the renderer) failed to attach */
-  onFatal(what: string): void;
+  /** a subsystem the game cannot do without (the renderer) failed to attach, or stopped working;
+   *  what: English (the log; the page translates it); code: its fixed name, the same in every language */
+  onFatal(what: string, code?: string): void;
+  /** the renderer is of another build than the game module (gpu/index.ts OtherBuild): this page is not the one that
+   *  goes with it (without this, onFatal as for any renderer that did not start); why: English, the log's */
+  onOtherBuild?(why: string): void;
 }
 
 export class GameSession {
@@ -86,12 +107,22 @@ export class GameSession {
       }
     };
     // not awaited one by one: a subsystem waiting for its registration must not hold up the others
-    void attach('renderer', () => attachRenderer(s.proc, o.canvas, {
-      ...common, width: o.canvas.width, height: o.canvas.height, displayHz: o.displayHz, artifacts: o.artifacts, dumpScale: o.dumpScale,
-    })).then(r => {
+    let other = '';
+    void attach('renderer', async () => {
+      try {
+        return await attachRenderer(s.proc, o.canvas, {
+          ...common, width: o.canvas.width, height: o.canvas.height, displayHz: o.displayHz, artifacts: o.artifacts, dumpScale: o.dumpScale,
+          // a frozen picture otherwise: the game stops and the page says why
+          onLost: () => { if (!s.detached) o.onFatal(N('the graphics stopped working'), 'GPU-LOST'); },
+          onMarks: o.marks,
+        });
+      } catch (e) { if (e instanceof OtherBuild) other = e.message; throw e; }
+    }).then(r => {
       s.renderer = r;
       // without a picture there is no game to play: say so instead of a black screen
-      if (!r && !s.detached) o.onFatal('the graphics (WebGPU renderer) could not start');
+      if (r || s.detached) return;
+      if (other && o.onOtherBuild) o.onOtherBuild(other);
+      else o.onFatal(N('the graphics could not start'), 'GPU-RENDERER');
     });
     void attach('audio', () => attachAudio(s.proc, { ...common, context: o.audio })).then(a => {
       s.audio = a;
@@ -102,7 +133,9 @@ export class GameSession {
       ...common, stage: o.stage, toggleFullscreen: o.toggleFullscreen, padPage: o.padPage, viewRect: () => s.viewRect(),
     })).then(i => { s.input = i; });
     if (o.netName !== null)
-      void attach('network', () => attachNet(s.proc, { ...common, name: o.netName!, notice: o.notice, lobby: o.lobby, back: o.netBack })).then(n => { s.net = n; });
+      void attach('network', () => attachNet(s.proc, {
+        ...common, name: o.netName!, id: o.netId, was: o.netWas, claim: o.netClaim, block: o.netBlock, notice: o.notice, lobby: o.lobby, say: o.say, back: o.netBack, queue: o.netQueue, removed: o.netRemoved,
+      })).then(n => { s.net = n; });
     return s;
   }
 
@@ -125,6 +158,8 @@ export class GameSession {
   canQuit(): boolean { const i = this.input; return !!i?.requestQuit && !this.detached && (i.canQuit?.() ?? true); }
   /** false: the request cannot reach the game (the page can only stop it) */
   requestQuit(): boolean { return this.canQuit() && this.input!.requestQuit!() !== false; }
+  /** Download log: asks the game for its stall report (InputSubsystem.logReport); false: it cannot be asked */
+  logReport(): boolean { const i = this.input; return !this.detached && !!i?.logReport && i.logReport() !== false; }
 
   /** true once the game exited or was stopped (every subsystem detached) */
   get ended() { return this.detached; }

@@ -3,7 +3,11 @@
 The game's server, in Rust: it serves the page, the game module and the game's own files, and connects the players
 (the virtual LAN switch, the free-roam hub and the game's Online mode).  Its options are in `src/options.rs`, and the
 crates' docs say why each rule is what it is, with the audits they name.  The state folder keeps `etag.key`,
-`lan-addresses.json`, `online/stats.json` and `online/buddies.json`.
+`lan-addresses.json`, `online/stats.json`, `online/buddies.json`, `online/races.json` (the races going on, from a stop
+to the next start), `days.json` and `days.csv` (how many came each day: src/app/days.rs), `vault/`, the claimed
+names (`names.json`: nfsu2-claims) and the operator's bans (`bans.json`, `bans.key`: nfsu2-bans), and has the control
+socket, `control.sock`, which `nfsu2-server ctl` talks to (who is on, kick, ban: src/app/control.rs, docs/web/VPS.md
+"Kick and ban").
 
 It replaced the Node.js server (`web/server/*.mjs`, removed after 6076514) with the same options and environment
 (`NFSU2_*`), the same console lines and the same state files, byte for byte, so a VPS switched with one line
@@ -24,9 +28,12 @@ ports; give each its own `--state`.  Knobs for measurements, from the environmen
 | | |
 |---|---|
 | `NFSU2_THREADS` | the runtime's workers (default half the cores, 2 to 8: more did the same work for more CPU; past about 3000 players in free roam more keep them at 32 friends, "Measured" below) |
-| `NFSU2_BUNDLE_MS` | a fixed tick for the bundle clock (default: it follows the crowd, below; 0: no clock, each datagram wakes its writer at once) |
-| `NFSU2_BUNDLE_MAX_MS`, `NFSU2_BUNDLE_BUDGET` | the adaptive tick's longest (25 ms) and its aim (125,000 bundles a second in all) |
+| `NFSU2_BUNDLE_MS` | the bundle clock's tick (default 50 ms, below; 0: no clock, each datagram wakes its writer at once) |
+| `NFSU2_FPRED` | 0: friends' car states go to the pages as byte deltas even when a page asks for them by their fields (nfsu2-lan fpred.rs), for measurements |
+| `NFSU2_BUNDLE_JITTER` | each tick is the tick give or take this many percent of it, at random (default 40; nfsu2-lan conn.rs `Clock` says why) |
+| `NFSU2_BUNDLE_MAX_MS`, `NFSU2_BUNDLE_BUDGET` | longer than `NFSU2_BUNDLE_MS`: the tick follows the crowd up to it, aiming at the budget's bundles a second in all (125,000) |
 | `NFSU2_LAN_SNDBUF` | SO_SNDBUF of /lan connections (default 32 KiB, which Linux doubles; 0: the kernel's own, which grows to 4 MB) |
+| `NFSU2_COMPRESS_THREADS` | the threads that compress the game data's blocks once at brotli's best into the state folder's `blocks/` (src/app/kept.rs; default 2, at the lowest priority, waiting while the CPU quota the server shares is 70 % used; 0: none, every block compressed as it is sent) |
 | `NFSU2_REPO` | where the defaults are (web/dist, out/web/nfsu2.wasm, the state in out/web/server): the repo it was built from |
 
 ## The container image
@@ -73,6 +80,14 @@ On WSL run it inside a network namespace of its own (`unshare -rn`): with mirror
 Hyper-V's virtual NIC and netfilter, which cost more than the server (the VPS's tunnel reaches the server over a plain
 loopback).  `--server-cpus`/`--gen-cpus` keep the server and the load on cores of their own, as two machines would.
 
+`web/tools/mix-load.mjs` is nfsu2.xyz near its limit, on any machine (ps, not /proc): players driving, idle ones (free
+roam on, in a race or the menus), Online clients (online-load.mjs) and more pages than places, so that a line forms,
+with players leaving and coming back all the while (`--churn`), some dropping their link while they wait
+(`--drop-wait`), and `--blip 150:0.4` as when a tunnel connection goes: 40 % of them at once, back as the page comes
+back.  nfsu2-roamload's bots take compact bundles and deltas as the page does (`--plain`, `--compact` to compare) and
+check every snapshot they get byte for byte against what its sender sent (its state is a function of the sender's
+number and its clock), and the line's order, waits and tickets.
+
 ## Measured against the Node server (2026-10-21, 91e270c, Ryzen 9 5900X, WSL, the server on 6 cores, the load on the other 6)
 
 | 2000 players in free roam | Node | Rust |
@@ -98,10 +113,27 @@ loopback).  `--server-cpus`/`--gen-cpus` keep the server and the load on cores o
 What a crowd costs is its messages, not its bytes: three quarters of the server's CPU is the kernel's TCP for each
 WebSocket message (and the tunnel in front, cloudflared, pays for each again).  The bundle clock's tick decided it
 (2000 players, 32 friends each): 4 ms sent 374,000 messages a second for 8.5 cores and did not keep up; 16 ms,
-132,000 messages for 4.2 cores, everything.  So the tick follows the crowd: 4 ms up to 500 players taking bundles,
-then as long as it takes to send about 125,000 bundles a second in all, 25 ms at most (free roam draws friends' cars
-100 ms in the past).  LAN play's datagrams (Online and LAN races) never wait for the tick: the game draws the other
+132,000 messages for 4.2 cores, everything.  So the tick followed the crowd: 4 ms up to 500 players taking bundles,
+then as long as it took to send about 125,000 bundles a second in all, 25 ms at most.  Since 2026-10-24 it is 50 ms
+for any crowd: at most 20 bundles a second to a page, as many as each friend sends snapshots (free roam draws friends'
+cars 100 ms behind the soonest their snapshots came).  LAN play's datagrams (Online and LAN races) never wait for the tick: the game draws the other
 racers from each update as it comes, and a wait of up to 25 ms at random made them wobble.  And the worker count: 2.9 cores on 4 workers, 3.8 on 8, 4.3 on 12, the same latency up to 8.
+
+A player in free roam who is not driving (a race, a shop, the menus, loading: its own HELLOs and SNAPs say so) draws no
+other car, yet kept its 32 links' pings, pongs, HELLOs and car states coming: 70 % of a driving player's messages, and
+on nfsu2.xyz (2026-10-30, 5,800 players) about 2,900 of the 5,060 in free roam were such players.  What its friends
+send it waits for a slow clock (half a second, nfsu2-lan `away.rs`), it gets one in 16 of their car states, and its page
+holds its own as long (web/src/net `TX_HOLD_AWAY_MS`); the hub's messages and LAN play's go as for anyone, and its
+first HELLO or SNAP that says it drives again ends it.  40 real-core bots, 20 of them in a race for 30 s: a racer's
+messages 21.3 in / 11.6 out a second before, 5.8 / 2.0 after; the drivers' as before (21 / 19), car states between
+drivers too.
+
+`--http-socket @nfsu2-http` (NFSU2_HTTP_SOCKET; compose.tunnel.yml sets it) serves HTTP on a Unix socket as well, for
+cloudflared's origin `unix:@nfsu2-http`: a name in the network namespace the two share (Linux; else a file's path),
+each connection as from 127.0.0.1.  It spares each message TCP's work on 127.0.0.1 at both ends (a sixth of that hop's
+kernel time with bots in Linux, more where conntrack and AppArmor see every packet, as on nfsu2.xyz).  Cloudflare's
+dashboard does not take that origin (its Service URL field wants a scheme and `//`, 2026-10-30): only a tunnel run
+from a config file of its own does.
 
 4000 players (2026-10-21, the server on CPUs 0-11, nfsu2-roamload on 12-23, 3999 bots and the probe, spread over
 3 km; other sessions' loads on the machine the same day put 2000 players on 6 workers at the busy cap's edge, 5.0
@@ -122,19 +154,48 @@ falls to 8 friends and stays there; 12 workers held all 32.  A longer bundle tic
 nothing measurable.  Three quarters of the CPU is the kernel's TCP (`perf`: 47 % in sendto, of it 21 % the loopback
 delivering to the receiver, 11 % recvfrom).
 
+5000 places, mixed as nfsu2.xyz is (2026-10-23, `mix-load.mjs` on one 12-core M-series Mac, server and bots on the same
+cores, the server on 8 workers; 1750 driving, 2750 idle, 500 Online clients and 600 pages more than places, each player
+about 15 minutes, half of them leaving by a dropped link):
+
+| 5 minutes at 5000 places | |
+|---|---|
+| players on the switch, waiting in line | 4839 (4960 at most), 759 (789) |
+| server CPU, memory | 1.9 cores (2.1), 405 MB |
+| snapshots checked byte for byte through deltas, bad | 330 million, 0 |
+| a snapshot's delay p50 / p99 / max, lost | 13 / 42 / 160 ms, 0.1 % (to players who had just left) |
+| let in from the line, let in after one who came later, a ticket's page back at its place | 1579, 0, 440 of 440 |
+| the wait a page was told, against the wait | 1.4 to 1.7 times (the 5-minute pace over the line's first minutes) |
+| Online: logins, p50 / p95 login, races | 42,081, 5 / 26 ms, 10,394 |
+
+The same 1750 driving (2.5 min, every snapshot checked): bytes a driving player gets a second, plain bundles 72,900,
+compact 55,500, compact with deltas 33,300 (40 % under compact, the page's before), at 2.3-2.4 cores each.  The server
+of before (2933f54) against this one, 1750 driving, 1750 idle and 300 Online at 4000 places, compact bundles: 1.93
+against 1.82 cores, 372 against 307 MB, delay p50 / p99 16 / 40 against 14 / 35 ms, an idle player 634 against 47
+bytes a second (the peer list only for LAN play), 21 against 0 refused.  A tunnel's blip (40 % of 4700 at once) at
+5000 with a line: all 1932 back at their addresses, p50 0.6 s and p90 1.4-1.9 s (the bots try again as the page does;
+the Mac's backlog of 128 dropped the rest of the burst's handshakes).  Under 4500 of that load (17 min, 286 million
+snapshots, 0 bad, 127,000 Online logins), real games: roam-pair (a friend's car 15 ms behind, 0.10 m from where it
+is), lan-pair and online-pair pass.  3000 driving at once was more than the bots could take on the same Mac (they fell
+behind, the switch dropped their snapshots; the server stayed at 1.5 cores): 4000 driving is the table above.
+
 ## How the work is shared out
 
 - **HTTP** (nfsu2-http): the server's own HTTP/1.1 and TLS (rustls), a task per connection on a tokio runtime of
   several workers.  Not hyper: the audits' rules need answers of the server's own to requests a library refuses by
   itself, the pipelining cut, a keep-alive time per connection, and the connection budget before any TLS.
 - **The switch** (nfsu2-lan): each connection's reader routes the frames it reads itself, on whatever worker it runs.
-  Who is on the switch changes under one lock; frames find their receivers without it (a table of the 4000
+  Who is on the switch changes under one lock; frames find their receivers without it (a table of the 6000
   addresses, a copy-on-write list of everyone).  Each receiver's writer takes everything queued into one write, and
   makes bundles of a page's datagrams on the bundle clock.  Counters every frame touches are sharded.
 - **Compact bundles** (nfsu2-lan `compact.rs`, kind 33): to a page whose hello says "compact":1 the datagrams go
   without what the page puts back exactly (its own address, free roam's port, a free-roam datagram's magic,
   version, length and CRC, which the switch checks first): the same bytes reach the game, a snapshot costs 84 bytes
-  on the wire instead of 110.  The port was the limit on nfsu2.xyz (486 Mbit/s of 1000 at 2960 players).
+  on the wire instead of 110.  The port was the limit on nfsu2.xyz (486 Mbit/s of 1000 at 2960 players).  When the
+  hello says "delta":1 too, a snapshot goes as what changed since its friend's last one (a bitmap and the new
+  bytes; the page keeps the same last bodies, and TCP loses nothing): about 40 % fewer bytes for a moving car and
+  75 % for a standing one (estimated from the snapshot's fields, not measured on the live server), 50 ns an entry
+  for the writer on an M-series Mac (`compact::tests::what_an_entry_costs`).
 - **A player behind on its path** (nfsu2-lan `lag.rs`): a WebSocket ping every second times each player's round trip,
   queues past the server included (the kernel's, cloudflared's, the tunnel's).  While its data waits there, the
   player gets only a share of free roam's snapshots (a half for each late round trip, a sixteenth at once past
@@ -144,7 +205,8 @@ delivering to the receiver, 11 % recvfrom).
   left out.
 - **The Online host and the free-roam hub** (nfsu2-online, nfsu2-roam): single-threaded, each on a thread of its
   own; the switch posts them their frames in order.  Past 4096 frames waiting at the Online host, a reader that feeds
-  it waits (TCP backpressure); the hub's busy cap reads the runtime's workers' busy time.
+  it waits (TCP backpressure); the hub's busy cap reads the runtime's workers' busy time, or the share of a CPU quota
+  the server shares (nfsu2.slice: cloudflared's CPU too) where that is higher.
 - **Compression** of the game data's runs on a pool of its own at a lower priority, so a burst of downloads never
   queues in front of the switch (Cloudflare serves the runs on nfsu2.xyz: this is the origin's cold start).
 
@@ -161,8 +223,9 @@ delivering to the receiver, 11 % recvfrom).
 | nfsu2-roam | the free-roam hub |
 | nfsu2-online | the game's Online mode |
 | nfsu2-vault | keyphrase saves (`/vault`): each player's saves as the page sealed them, one file per keyphrase, the copy of an earlier day, the caps, the sweep of the unused |
+| nfsu2-claims | claimed names (`/names`): which keyphrase may play under a name, for 180 days after it last played; one name a keyphrase, a change a week; read by the Online lobby, EA Messenger and the free-roam hub |
 | nfsu2-server (src/) | the routes, the rules, the wiring, the start-up |
-| nfsu2-roamload | up to 4000 simulated free-roam players (as web/tools/roam-crowd.mjs, lighter) |
+| nfsu2-roamload | thousands of simulated players: driving or idle, in line, leaving and coming back (as web/tools/roam-crowd.mjs, lighter) |
 
 Each crate has its own tests (`build.sh --test`: 330 on 2026-10-21).  Where the Node server's answers had to be
 matched exactly, they were checked against its JS while both existed, and the tests keep them as expected values
@@ -186,18 +249,24 @@ players.
 
 ## Where it differs from the Node server
 
-- 4000 players (`--max-peers` 1 to 4000; the image's `NFSU2_MAX_PEERS=4000`), Node's 2000: the switch's network is
-  10.77.0.0/20 (the welcome's mask 255.255.240.0; addresses round its sixteen /24s), the free-roam hub takes 4096
-  players, Online mode 2000 lobby sessions, 600 games and 8000 streams.  The game module's peer bits (mailbox v4)
-  cover a /21: for a player on 10.77.8-15.x the game asks that host itself (`runtime/web/net_lan.c`): a LAN race's
+- 7000 players (`--max-peers` 1 to 7000; the image's `NFSU2_MAX_PEERS=7000`), Node's 2000: the switch's network is
+  10.77.0.0/19 (the welcome's mask 255.255.224.0; addresses round twenty-eight of its /24s, 10.77.0-27.x), the free-roam
+  hub takes 7168 players, Online mode 3500 lobby sessions, 1050 games and 14000 streams.  The game module's peer bits
+  (mailbox v4) cover a /21: for a player on 10.77.8-27.x the game asks that host itself (`runtime/web/net_lan.c`): a LAN race's
   connect to one who has just left sends its SYN and ends after the same 3 s with WSAETIMEDOUT instead of
   WSAEHOSTUNREACH.  Nothing else differs: the page and the module need no change (`crates/lan/tests/page.mjs`).
+- A full switch keeps a line (nfsu2-lan `queue.rs`) for the pages that say they can wait (/lan?queue): Node closed
+  every newcomer with "LAN full", and the page asked again every 5 s, so whoever asked first after a place freed up
+  got it.  A page of before still gets "LAN full".
+- The peer list goes only to the pages with LAN play open (the others get the server's own hosts): Node sent every
+  join and leave to every page.
 - Compressed bytes (gzip and br) differ from Node's zlib; the decoded content is the same.
 - Bundles are made on the bundle clock (above), not per turn of an event loop; between different kinds of message
   only the order differs.
 - The Online host's sends are charged to a sender's budgets on the host's thread, a moment after the frame was routed
   (the Node server did it at once).
-- The hub's busy cap reads the workers' busy time; `[roam] the server's thread was N % busy` keeps its words.
+- The hub's busy cap reads the workers' busy time, or a CPU quota's share (nfsu2_util::cpu::QuotaBusy) where that is
+  higher; `[roam] the server's thread was N % busy` keeps its words.
 - A ping every second besides the keepalive's (lag.rs), and a pong to any of the switch's pings queued since the
   keepalive's last tick says the client is there; `[players]` has a clause more.
 - JSON a client sends: a lone surrogate escape reads as U+FFFD; a number beyond the doubles or nesting deeper than

@@ -125,11 +125,38 @@ impl App {
         }
         let (r, w) = stream.split();
         let share = Arc::new((share, hold));
+        // the operator's bans (control.rs): by the address's keyed hash now, by its page's ids and its keyphrase at its
+        // hello
+        let ident = (!key_.is_empty()).then(|| self.bans.addr(&key_));
+        let refuse = ident.as_ref().and_then(|a| self.bans.by_addr(a, nfsu2_util::now_ms())).map(|b| {
+            log::limited(
+                "ban",
+                "turned away",
+                &key_,
+                &format!("[ban] turned away a client of ban #{} \"{}\" (its address)", b.id, b.name),
+                2,
+            );
+            bytes::Bytes::from(b.message())
+        });
+        let (bans, a, k0, days) = (self.bans.clone(), ident.clone(), key_.clone(), self.days.clone());
+        let on_hello: nfsu2_lan::OnHello = Box::new(move |h| {
+            // a game on the switch: it played today (days.rs), by its page's own id
+            if let Some(id) = h.ids.first() {
+                days.seen(id, super::days::Seen::Play, nfsu2_util::now_ms());
+            }
+            let seen = nfsu2_bans::Seen { pages: &h.ids, owner: h.owner, addr: a.as_deref() };
+            let b = bans.by_hello(&seen, nfsu2_util::now_ms())?;
+            let line = format!("[ban] turned away a client of ban #{} \"{}\" (its page or keyphrase)", b.id, b.name);
+            log::limited("ban", "turned away", &k0, &line, 2);
+            Some(bytes::Bytes::from(b.message()))
+        });
         // a reconnecting page says ?resume and sends its old address with the token in its first message (nfsu2-lan);
         // the group and site ids stand for the client's address without naming it (the shared limits)
         let (k1, k2) = (key_.clone(), key_.clone());
         let opts = AttachOpts {
             resume: u.has_param("resume"),
+            // a page that can wait in line when every place is taken (nfsu2-lan queue.rs)
+            queue: u.has_param("queue"),
             group: Some(self.group_id(&key_)),
             site: (!site.is_empty()).then(|| self.group_id(&format!("site {site}"))),
             on_join: Some(Box::new(move |vip, resumed, n| {
@@ -140,6 +167,11 @@ impl App {
                 let line = format!("[lan] {} \"{}\" left ({n} on the switch)", vip_str(vip), js::printable(name, 32));
                 log::limited("lan", "joins and leaves", &k2, &line, 20);
             })),
+            ident,
+            refuse,
+            on_hello: Some(on_hello),
+            // the keyphrase the page plays with, for the claimed names (names.rs): its owner, never the token
+            on_claim: self.names.as_ref().map(|_| Box::new(nfsu2_claims::owner_of_token) as nfsu2_lan::OnClaim),
         };
         self.lan.attach(Held { inner: r, _share: share.clone() }, Held { inner: w, _share: share }, pre, opts);
     }

@@ -13,17 +13,19 @@
 //     gamepad button is not such a gesture (Chrome gives pads no user
 //     activation): it resumes the context only once the page already had a
 //     click or key press, e.g. the Play click.
-//   - Latency: the ring holds 512-1024 frames (12-23 ms, raised by the pump
-//     after underruns) on top of the context's own output latency.
+//   - Latency: the ring holds 512-1024 frames (12-23 ms; the pump raises it
+//     after underruns and lowers it again after 20 s without one) on top of
+//     the context's own output latency; with a context that renders in big
+//     bursts (some phones: ~30 quanta every 90 ms) one burst and a slice.
 //   - Hidden page: the output fades to silence (the game itself parks and
 //     mutes when it loses focus); optionally the context is suspended.
 //   - autotest "audioreset": the pump bumps AR_RESET and the context is rebuilt.
 import type { GameProcess } from '../host/process';
 import { HostKind } from '../host/abi';
 import {
-  AR_CTX, AR_CTX_CLOSED, AR_CTX_RUNNING, AR_CTX_SUSPENDED, AR_HDR_WORDS, AR_LOUD, AR_MAGIC, AR_MIXED, AR_MODE, AR_MUTED,
-  AR_NOSOUND, AR_PAGE_RATE, AR_PEAK, AR_QUANTA, AR_R, AR_RESET, AR_RMS, AR_TARGET, AR_UNDERRUNS, AR_VERSION, AR_W,
-  AR_WALL_MS, AUDIO_MAGIC, AUDIO_RATE, AUDIO_VERSION,
+  AR_CTX, AR_CTX_CLOSED, AR_CTX_RUNNING, AR_CTX_SUSPENDED, AR_FRAMES, AR_HDR_WORDS, AR_LOUD, AR_MAGIC, AR_MIXED, AR_MODE, AR_MUTED,
+  AR_NOSOUND, AR_OFF_PCM, AR_PAGE_RATE, AR_PEAK, AR_QUANTA, AR_R, AR_RESET, AR_RMS, AR_TARGET, AR_UNDERRUNS,
+  AR_VERSION, AR_W, AR_WALL_MS, AUDIO_MAGIC, AUDIO_RATE, AUDIO_RING_FRAMES, AUDIO_VERSION,
 } from './proto';
 
 export interface AudioOptions {
@@ -116,7 +118,14 @@ export async function attachAudio(proc: GameProcess, opts: AudioOptions = {}): P
     given = null;
     ctx = c;
     // endOutput() removes it again: nothing of this game may stay on a context that outlives it
-    c.onstatechange = () => { ctxWord(); log(`[audio] context ${c.state}`); };
+    // with how long the state before lasted (an iPhone interrupts the sound for a call, Siri, the lock screen)
+    let was = c.state as string, since = performance.now();
+    c.onstatechange = () => {
+      ctxWord();
+      const now = performance.now();
+      log(`[audio] context ${c.state}${was !== c.state ? ` (${was} for ${((now - since) / 1000).toFixed(1)} s)` : ''}`);
+      was = c.state; since = now;
+    };
     try { await c.audioWorklet.addModule(new URL('/audio/worklet.js', import.meta.url)); }
     catch (e) {
       // a context closed meanwhile (sound off, a rebuild) aborts the load
@@ -182,8 +191,10 @@ export async function attachAudio(proc: GameProcess, opts: AudioOptions = {}): P
   proc.registered(HostKind.Audio).then(reg => {
     if (closed) return;
     const view = new Int32Array(proc.memory.buffer, reg.ptr, AR_HDR_WORDS);
-    if (view[AR_MAGIC] !== AUDIO_MAGIC || view[AR_VERSION] !== AUDIO_VERSION) {
-      log(`[audio] ring at 0x${reg.ptr.toString(16)} has magic 0x${(view[AR_MAGIC] >>> 0).toString(16)} version ${view[AR_VERSION]}: not ours, no sound`);
+    if (view[AR_MAGIC] !== AUDIO_MAGIC || view[AR_VERSION] !== AUDIO_VERSION || view[AR_FRAMES] !== AUDIO_RING_FRAMES ||
+        AR_OFF_PCM + AUDIO_RING_FRAMES * 8 > reg.size) {
+      log(`[audio] ring at 0x${reg.ptr.toString(16)} has magic 0x${(view[AR_MAGIC] >>> 0).toString(16)} version ${view[AR_VERSION]}, ` +
+          `${view[AR_FRAMES]} frames in ${reg.size} bytes: not ours, no sound`);
       return;
     }
     h = view; ring = reg; resetSeen = Atomics.load(h, AR_RESET);

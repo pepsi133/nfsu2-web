@@ -27,8 +27,27 @@ pub fn fnv1a(s: &str) -> u32 {
     if h == 0 { 1 } else { h }
 }
 
+/// roam_core.c's rc_room_hash of an ASCII name, a Room's or a crew's (the page's players.ts roomHash is the same; both also fold
+/// capitals past A to Z and Unicode's blanks, which these tests' names never have): FNV-1a of the name's
+/// UTF-8 without its blanks (space, \t to \r), A to Z made small; 0 for a name of blanks only, never 0 for another
+/// (`fnv1a` is the same for a name of small letters without blanks)
+pub fn room_hash(s: &str) -> u32 {
+    let (mut h, mut kept) = (0x811C_9DC5u32, 0);
+    for b in s.bytes().filter(|&b| b != b' ' && !(b'\t'..=b'\r').contains(&b)) {
+        h ^= b.to_ascii_lowercase() as u32;
+        h = h.wrapping_mul(0x0100_0193);
+        kept += 1;
+    }
+    if kept == 0 { 0 } else { h.max(1) }
+}
+
 /// a datagram: the header, the payload, the CRC
 pub fn dgram(kind: u8, sender: u32, payload: &[u8]) -> Vec<u8> {
+    dgram_flags(kind, sender, 0, payload)
+}
+
+/// a datagram with these header flags
+pub fn dgram_flags(kind: u8, sender: u32, flags: u16, payload: &[u8]) -> Vec<u8> {
     let len = 16 + payload.len() + 4;
     let mut b = vec![0u8; len];
     b[..4].copy_from_slice(b"N2FR");
@@ -37,11 +56,15 @@ pub fn dgram(kind: u8, sender: u32, payload: &[u8]) -> Vec<u8> {
     b[6..8].copy_from_slice(&(len as u16).to_le_bytes());
     b[8..12].copy_from_slice(&sender.to_le_bytes());
     b[12..14].copy_from_slice(&7u16.to_le_bytes());
+    b[14..16].copy_from_slice(&flags.to_le_bytes());
     b[16..16 + payload.len()].copy_from_slice(payload);
     let crc = crc32fast::hash(&b[..len - 4]);
     b[len - 4..].copy_from_slice(&crc.to_le_bytes());
     b
 }
+
+/// the HELLO flag of a player that reads crews (roam_core.h RC_HF_CREW)
+pub const HF_CREW: u16 = 0x0200;
 
 pub struct HelloOpts<'a> {
     pub room: u32,
@@ -50,11 +73,14 @@ pub struct HelloOpts<'a> {
     pub seen: &'a [u32],
     pub cfg_rev: u16,
     pub core: u16,
+    /// its crews: with them the HELLO has the crew flag and ends with them (a count, the hashes); None, a HELLO of
+    /// before
+    pub crews: Option<&'a [u32]>,
 }
 
 impl Default for HelloOpts<'_> {
     fn default() -> Self {
-        HelloOpts { room: 0, status: 2, name: b"p", seen: &[], cfg_rev: 3, core: 1 }
+        HelloOpts { room: 0, status: 2, name: b"p", seen: &[], cfg_rev: 3, core: 9, crews: None }
     }
 }
 
@@ -74,7 +100,12 @@ pub fn hello_with(sender: u32, o: &HelloOpts) -> Vec<u8> {
         let at = 14 + nl + 4 * i;
         p[at..at + 4].copy_from_slice(&s.to_le_bytes());
     }
-    dgram(1, sender, &p)
+    let Some(crews) = o.crews else { return dgram(1, sender, &p) };
+    p.push(crews.len() as u8);
+    for c in crews {
+        p.extend_from_slice(&c.to_le_bytes());
+    }
+    dgram_flags(1, sender, HF_CREW, &p)
 }
 
 pub fn hello(sender: u32) -> Vec<u8> {
@@ -115,26 +146,37 @@ pub fn snap_moving(sender: u32, pos: [f64; 3], v: [f64; 3], heading: f64, status
     d
 }
 
-/// the world map's question (MAPREQ)
-pub fn mapreq(sender: u32, req: u16) -> Vec<u8> {
-    dgram(10, sender, &req.to_le_bytes())
+/// the world map's question (MAPREQ): for max players at most, what changed since its answer base (0: none)
+pub fn mapreq_base(sender: u32, req: u16, max: u16, base: u16) -> Vec<u8> {
+    dgram(10, sender, &[req.to_le_bytes(), max.to_le_bytes(), base.to_le_bytes()].concat())
 }
 
-/// a MAP datagram: (req, part, nparts, total, [(x, y, heading)])
-pub type Map = (u16, u8, u8, u16, Vec<(i16, i16, u8)>);
+/// a MAPD entry: the player's key, and where it is placed (x, y, heading, vx, vy), or None: gone
+pub type MapdEntry = (u16, Option<(i16, i16, u8, i8, i8)>);
+/// a MAPD datagram: (req, base, part, nparts, total, entries)
+pub type Mapd = (u16, u16, u8, u8, u16, Vec<MapdEntry>);
 
-/// the MAP datagram in a frame of the hub's
-pub fn map_of(f: &[u8]) -> Option<Map> {
+/// the MAPD datagram in a frame of the hub's
+pub fn mapd_of(f: &[u8]) -> Option<Mapd> {
     let d = &f[16..];
-    if d[5] != 11 {
+    if d[5] != 17 {
         return None;
     }
-    let n = d[22] as usize;
-    let e = (0..n).map(|i| {
-        let o = 23 + 5 * i;
-        (i16::from_le_bytes([d[o], d[o + 1]]), i16::from_le_bytes([d[o + 2], d[o + 3]]), d[o + 4])
-    });
-    Some((u16::from_le_bytes([d[16], d[17]]), d[18], d[19], u16::from_le_bytes([d[20], d[21]]), e.collect()))
+    let (mut o, mut e) = (25, Vec::new());
+    for _ in 0..d[24] {
+        let key = u16::from_le_bytes([d[o], d[o + 1]]);
+        if key & 0x8000 != 0 {
+            e.push((key & 0x7fff, None));
+            o += 2;
+        } else {
+            let i = |k: usize| i16::from_le_bytes([d[o + k], d[o + k + 1]]);
+            e.push((key, Some((i(2), i(4), d[o + 6], d[o + 7] as i8, d[o + 8] as i8))));
+            o += 9;
+        }
+    }
+    assert_eq!(o + 4, d.len(), "MAPD entries fill the datagram");
+    let u = |k: usize| u16::from_le_bytes([d[k], d[k + 1]]);
+    Some((u(16), u(18), d[20], d[21], u(22), e))
 }
 
 pub fn bye(sender: u32) -> Vec<u8> {
@@ -170,6 +212,20 @@ pub fn peers_of(f: &[u8]) -> Vec<PeerEntry> {
             }
         })
         .collect()
+}
+
+/// the crew marks a PEERS list in a frame of the hub's ends in (roam_core.h RC_HF_CREW on a PEERS): the receiver's
+/// crews and a mark an entry (bit c: in its crew c too); None for a list without them
+pub fn crew_marks(f: &[u8]) -> Option<(Vec<u32>, Vec<u8>)> {
+    let d = &f[16..];
+    if u16::from_le_bytes([d[14], d[15]]) & HF_CREW == 0 {
+        return None;
+    }
+    let n = d[16] as usize;
+    let o = 17 + 10 * n;
+    let k = d[o] as usize;
+    let mine = (0..k).map(|c| u32::from_le_bytes(d[o + 1 + 4 * c..o + 5 + 4 * c].try_into().unwrap())).collect();
+    Some((mine, d[o + 1 + 4 * k..o + 1 + 4 * k + n].to_vec()))
 }
 
 /// the PEERS lists out of the hub's frames to the browsers, by `vip:port`
@@ -225,9 +281,11 @@ impl Kit {
     }
 }
 
-/// the links of a room: every pair weighed (a room of at most exactRoom players), or the grid's nearest (a larger one)
+/// the links of a room: every pair weighed (a room of at most exactRoom players), or the grid's nearest (a larger one);
+/// without view points (the tests' cars point along x: theirs are roam_ahead.rs's), so by the distances (and speeds)
 pub fn ways() -> [(&'static str, RoamOptions); 2] {
-    [("every pair", RoamOptions::default()), ("the grid", RoamOptions { exact_room: 1, ..RoamOptions::default() })]
+    let o = RoamOptions { view_m: 1e-9, ..RoamOptions::default() };
+    [("every pair", o.clone()), ("the grid", RoamOptions { exact_room: 1, ..o })]
 }
 
 /// browser i's address: 10.77.0.(10 + i)

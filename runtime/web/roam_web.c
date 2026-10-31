@@ -61,6 +61,7 @@
 #include "roam_plat.h"
 #include "host_abi.h"
 #include "net_proto.h"
+#include "gpu_proto.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -259,10 +260,11 @@ static int told_once(uint32_t id){
     g_told[g_ntold++ % TOLD_IDS] = id;
     return 1;
 }
+/* (name 0: what alone, no friend's name first: the page shows it as its own lines are) */
 static void notice(const char *name, const char *what){
     if (roam_game_racing()) return;
-    char t[96];
-    int n = snprintf(t, sizeof t, "%s\x1f%s", name && *name ? name : "A player", what);
+    char t[192];
+    int n = name ? snprintf(t, sizeof t, "%s\x1f%s", *name ? name : "A player", what) : snprintf(t, sizeof t, "%s", what);
     if (n > (int)sizeof t - 1) n = (int)sizeof t - 1;
     if (MB && n > 0) tx_push(NET_KIND_NOTICE, 0, 0, (const uint8_t *)t, n);
 }
@@ -273,6 +275,61 @@ int roam_plat_lobby(const char *json){
     if (!MB) return -1;
     if (n <= 0 || n > (int)NET_MAX_PAYLOAD) return 1;
     return tx_push(NET_KIND_LOBBY, 0, 0, (const uint8_t *)json, n) ? 1 : -1;
+}
+/* solid cars as the page's menu switched them (net_proto.h solid) */
+int roam_plat_solid(void){
+    uint32_t v = MB ? ld(&MB->solid) : 0;
+    return v == 1 ? 0 : v == 2 ? 1 : -1;
+}
+/* quick chat: the page picks (net_proto.h say: the phrase, under a count that changes with each pick), the game
+ * tells it what was said (NET_KIND_SAY) and, every frame, where the names of those who spoke are (the renderer's
+ * frame, gpu_web.c gw_marks) */
+void gw_marks(const GwMark *m, int n);
+static uint32_t g_say_seen;
+int roam_plat_quickchat(void){ return 1; }
+int roam_plat_say_pick(void){
+    uint32_t v = MB ? ld(&MB->say) : 0;
+    if (v == g_say_seen) return -1;
+    g_say_seen = v;
+    return (int)(v & 0xffu);
+}
+int roam_plat_said(const char *json){
+    int n = (int)strlen(json);
+    if (!MB) return -1;
+    if (n <= 0 || n > (int)NET_MAX_PAYLOAD) return 1;
+    return tx_push(NET_KIND_SAY, 0, 0, (const uint8_t *)json, n) ? 1 : -1;
+}
+void roam_plat_say_marks(const uint32_t *ids, const float *xys, int n){
+    GwMark m[GW_MARKS_MAX];
+    if (n > GW_MARKS_MAX) n = GW_MARKS_MAX;
+    for (int i = 0; i < n; i++){ m[i].id = ids[i]; m[i].x = xys[3 * i]; m[i].y = xys[3 * i + 1]; m[i].s = xys[3 * i + 2]; }
+    gw_marks(m, n);
+}
+/* the crews as the page's menu changed them (net_proto.h crews): read again
+ * while the page writes them (the crews and colours first, then the number) */
+uint32_t roam_plat_crews(uint32_t crews[RC_CREW_MAX], uint32_t rgb[RC_CREW_MAX]){
+    for (int tries = 0; MB && tries < 4; tries++){
+        uint32_t g = ld(&MB->crews_gen);
+        if (!g) return 0;
+        for (int i = 0; i < RC_CREW_MAX; i++){ crews[i] = i < 4 ? ld(&MB->crews[i]) : 0; rgb[i] = i < 4 ? ld(&MB->crews_rgb[i]) & 0xffffffu : 0; }
+        if (ld(&MB->crews_gen) == g) return g;
+    }
+    return 0;
+}
+/* the room as the page changed it (net_proto.h room_name): read again while the page writes it (the name first, then
+ * the number) */
+uint32_t roam_plat_room(char name[64]){
+    for (int tries = 0; MB && tries < 4; tries++){
+        uint32_t g = ld(&MB->room_gen);
+        if (!g) return 0;
+        for (int i = 0; i < 16; i++){
+            uint32_t w = ld(&MB->room_name[i]);
+            for (int k = 0; k < 4; k++) name[4 * i + k] = (char)(w >> 8 * k);
+        }
+        name[63] = 0;
+        if (ld(&MB->room_gen) == g) return g;
+    }
+    return 0;
 }
 static uint8_t place(const rc_peer *p){ return p->status == RC_ST_PAUSED ? RC_ST_ROAM : p->status; }
 /* we are in free roam and the friend's car was within NEAR_M of ours (on the

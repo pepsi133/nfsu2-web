@@ -7,9 +7,10 @@
 // never while the page cannot see the input (the game's own driver plays an input script).
 
 import type { InputSubsystem, NetSubsystem } from './contract';
+import { t } from './i18n';
 
 export interface AwayLimits { inputMs: number; hiddenMs: number; warnMs: number }
-export const AWAY_LIMITS: AwayLimits = { inputMs: 20 * 60_000, hiddenMs: 10 * 60_000, warnMs: 60_000 };
+export const AWAY_LIMITS: AwayLimits = { inputMs: 12 * 60_000, hiddenMs: 8 * 60_000, warnMs: 2 * 60_000 };
 
 const TICK_MS = 1000;
 const span = (ms: number) => ms >= 60_000 ? `${Math.round(ms / 60_000)} min` : `${Math.round(ms / 1000)} s`;
@@ -55,8 +56,7 @@ export class AwayCheck {
       net.away(true);
       this.log(`[app] away: ${hidden ? `the tab was in the background for ${span(now - this.hiddenSince!)}` : `no input for ${span(now - last)}`}, ` +
                'so the place on the server goes back');
-      this.show('You were away, so you stopped playing with others and freed your place on the server. ' +
-                'Move the mouse or press a key or button to come back.');
+      this.show(t('You were away, so you left multiplayer and freed your place on the server. Press any key or button to rejoin.'));
       return;
     }
     if (this.warnedAt === null && now - last >= L.inputMs) {
@@ -64,8 +64,8 @@ export class AwayCheck {
       this.log(`[app] away: no input for ${span(now - last)}: the place on the server goes back in ${span(L.warnMs)} unless there is some`);
     }
     if (this.warnedAt !== null)
-      this.show(`Still there? In ${Math.max(1, Math.ceil((L.warnMs - (now - this.warnedAt)) / 1000))} s you stop playing with others ` +
-                'and free your place on the server. Move the mouse or press a key or button to stay.');
+      this.show(t('Still there? You leave multiplayer in {n} s. Press any key or button to stay.',
+        { n: Math.max(1, Math.ceil((L.warnMs - (now - this.warnedAt)) / 1000)) }));
   }
 
   stop() {

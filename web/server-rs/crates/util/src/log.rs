@@ -2,7 +2,8 @@
 //! requests and upgrades, joins and leaves, the access log, Online lines), at most `per` a minute of one topic for
 //! one client, then one line that says how many were left out.  So one client can no longer fill the journal, push
 //! the VPS's other logs out or make journald drop real players' lines (the audit's DEP-4).  The client is only the
-//! key of the count: no line names its address.
+//! key of the count: no line names its address.  Every line shown also goes into the log files, once they are set
+//! (`logfile::to_files`).
 
 use std::io::Write;
 use std::sync::OnceLock;
@@ -19,10 +20,12 @@ pub fn line(s: &str) {
     write_line(&mut console(), s);
 }
 
+/// a line to the console, then the log files (under the console's lock: both in the same order)
 fn write_line(o: &mut impl Write, s: &str) {
     let _ = o.write_all(s.as_bytes());
     let _ = o.write_all(b"\n");
     let _ = o.flush();
+    crate::logfile::write(s);
 }
 
 /// stdout, locked: one writer at a time (in this crate's own tests, a buffer they read back)
@@ -33,13 +36,16 @@ fn console() -> std::io::StdoutLock<'static> {
 #[cfg(test)]
 use tests::console;
 
-/// one line to stderr (console.error)
+/// one line to stderr (console.error), then the log files (after stderr's lock: `logfile::write` may write to stderr)
 pub fn error(s: &str) {
-    let out = std::io::stderr();
-    let mut o = out.lock();
-    let _ = o.write_all(s.as_bytes());
-    let _ = o.write_all(b"\n");
-    let _ = o.flush();
+    {
+        let out = std::io::stderr();
+        let mut o = out.lock();
+        let _ = o.write_all(s.as_bytes());
+        let _ = o.write_all(b"\n");
+        let _ = o.flush();
+    }
+    crate::logfile::write(s);
 }
 
 struct Quiet {

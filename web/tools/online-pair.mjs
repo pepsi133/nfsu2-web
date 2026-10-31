@@ -14,6 +14,10 @@
 //        [--horn]    in the race each instance holds N (its horn, runtime/racehorn.c) for a second, one after the
 //                    other: instance n 3 + 4 (n - 1) s after the start; the others' logs say "[horn] <name>'s horn"
 //        [--quit-mid N:MS]   instance N's game quits MS after its race started (the others race on)
+//        [--racewin N:MS]   instance N's game ends its race MS after it started, the way not driven (racewin: as a
+//                    cheat that finishes the race at once does; the server's [cheat] lines see it)
+//        [--speedhack N:K]  instance N's game threads see performance.now and Date.now run K times as fast (each
+//                    game-worker.js as it loads), as a speed hack in the browser makes them (roam-pair's --speedhack)
 //        [--wait-room MS] [--join-wait MS]   host: time in the room before Start Race (default 70000); joiners:
 //                    time in the lobby before Refresh and Join Game (default 40000)
 //        [--ea-login]  through the game's EA Login screens (no player name: the instances' fresh saves have no
@@ -46,6 +50,7 @@
 // menu (UI_OLMain/UI_OLMAIN), the game room and the results screen, and logs no
 // fault / timeout / trap / unresolved call / "[net] BLOCKED" / page error.
 import { chromium } from 'playwright';
+import { chromeExe, pickBrowser } from './browser.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -76,6 +81,8 @@ const HORN = argv.includes('--horn');
 const EA_LOGIN = argv.includes('--ea-login') || argv.includes('--canary');
 // --quit-mid N:MS: instance N quits its game MS after its race started (the others race on)
 const QUIT_MID = opt('quit-mid', '') ? opt('quit-mid', '').split(':').map(Number) : [0, 0];
+const RACEWIN = opt('racewin', '') ? opt('racewin', '').split(':').map(Number) : [0, 0];
+const SPEEDHACK = opt('speedhack', '') ? opt('speedhack', '').split(':').map(Number) : [0, 1];
 // --hide N[:FROM[:TO]]: instance N's tab in the background from its script's "log FROM" to "log TO"
 const HIDE = opt('hide', '') ? (([n, from, to]) => ({ n: +n, from: from || (+n === 1 ? 'race-start' : 'ready'), to: to || 'results' }))(opt('hide', '').split(':')) : null;
 fs.mkdirSync(OUT, { recursive: true });
@@ -183,9 +190,11 @@ function raceFlow(w, host, race, raceMs, inst) {
     w(`+200  dump track${x}`);
     w('+0    tap RETURN');
     w('+0    waitfng UI_QRModeOptions.fng 900');
-    // Laps as they come (2, runtime/netrace.c); --ranked: Game Type (three rows down) Unranked -> Ranked, once (the
-    // screen keeps the last game's options)
-    if (RANKED && race === 1) { w('+200  tap DOWN'); w('+40   tap DOWN'); w('+40   tap DOWN'); w('+40   tap RIGHT'); }
+    // Laps as they come (2, runtime/netrace.c); --ranked: Game Type (three rows down, drift two: it has no Track
+    // Direction) Unranked -> Ranked, once (the screen keeps the last game's options)
+    if (RANKED && race === 1) {
+      w('+200  tap DOWN'); w('+40   tap DOWN'); if (MODE !== 'drift') w('+40   tap DOWN'); w('+40   tap RIGHT');
+    }
     w(`+200  dump options${x}`);
     w('+0    tap RETURN');
     w(`+300  dump enter_room${x}`);
@@ -199,12 +208,15 @@ function raceFlow(w, host, race, raceMs, inst) {
   } else {
     w(`+${race > 1 ? JOIN_WAIT + 15000 : JOIN_WAIT}ms dump lobby${x}`);
     if (RANKED && race === 1) {
-      // the Filter asks for ranked games (the lobby lists them first): Filter (the 4th button), Game Type (two rows
-      // down) -> Ranked; leaving the Filter searches again, with the focus back on Create Game
+      // the Filter asks for ranked games of the race's mode (the lobby lists them first): Filter (the 4th button),
+      // Game Mode (Create Game's order), Game Type (two rows down) -> Ranked; leaving the Filter searches again, with
+      // the focus back on Create Game
       w('+0    log filter-ranked');
       w('+0    tap RIGHT'); w('+40   tap RIGHT'); w('+40   tap RIGHT');
       w('+60   tap RETURN');
-      w('+300  tap DOWN'); w('+40   tap DOWN'); w('+40   tap RIGHT');
+      w('+300  log filter-mode');
+      for (let k = 0; k < (MODES[MODE] ?? 0); k++) w('+40   tap RIGHT');
+      w('+40   tap DOWN'); w('+40   tap DOWN'); w('+40   tap RIGHT');
       w(`+60   dump filter${x}`);
       w('+0    tap RETURN');
       w(`+3000ms dump filtered${x}`);
@@ -248,6 +260,7 @@ function raceFlow(w, host, race, raceMs, inst) {
     w('+0    autopilot on 6000'); w('+0    wzero'); w('+0    log race-start');
   }
   if (HORN && race === 1) { w(`+${3000 + 4000 * (inst - 1)}ms log horn`); w('+0    down N'); w('+1000ms up N'); }
+  if (RACEWIN[0] === inst) { w(`+${RACEWIN[1]}ms log racewin`); w('+0    racewin'); }
   if (QUIT_MID[0] === inst) {
     // this player's process ends in the middle of the race (sockets closed, nothing more sent)
     w(`+${QUIT_MID[1]}ms dump quit_mid`);
@@ -262,7 +275,14 @@ function raceFlow(w, host, race, raceMs, inst) {
   w('+0    untrace');
   w(`+180  dump results${x}`);
   w(`+3000ms dump results_2${x}`);
-  w('+300  tap RETURN');                     // Continue: the game logs in again, reports the result, the lobby
+  if (RANKED) {
+    // the ranked table: the server's $rfn, once two reports agree, sets the race handler's "final" byte (SPEED2.EXE
+    // 0x58e05d); the screen reported on its own when it opened
+    w('+0    waitexpr b:0x0086a6c0 == 1 6000');
+    w(`+0    log results-table${x}`);
+    w(`+60   dump results_table${x}`);
+  }
+  w('+300  tap RETURN');                     // Continue (unranked: the game logs in again, reports), the lobby
   w('+0    waitfng PC_OL_Lobby.fng 1800');
   w(`+3000ms dump after_results${x}`);
   return true;
@@ -326,8 +346,10 @@ if (HIDE) {
   // made visible; a page of the default context without it goes to the background like a player's tab
   const prof = path.join(OUT, 'chrome-profile');
   fs.rmSync(prof, { recursive: true, force: true });
-  const exe = process.env.CHROME_PATH || (process.platform === 'darwin'
-    ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : '/opt/google/chrome/chrome');
+  // CHROME_PATH, else Google Chrome, else Playwright's full Chromium (npx playwright install chromium: --headless=new
+  // is the full browser's, not the headless shell's)
+  const exe = process.env.CHROME_PATH || (pickBrowser().channel ? chromeExe() : chromium.executablePath());
+  if (!exe || !fs.existsSync(exe)) throw new Error(`--hide: no browser at ${exe || 'Google Chrome\'s place'} (CHROME_PATH names one)`);
   chrome = spawn(exe, [...(argv.includes('--headed') ? [] : ['--headless=new']), '--remote-debugging-port=0', `--user-data-dir=${prof}`,
     '--no-first-run', '--no-default-browser-check', '--use-mock-keychain', '--password-store=basic', ...CHROME_ARGS, 'about:blank'],
   { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -338,7 +360,7 @@ if (HIDE) {
     chrome.on('exit', code => { clearTimeout(t); rej(new Error(`Chrome exited (${code}): ${err}`)); });
   });
   browser = await chromium.connectOverCDP(ws, { noDefaults: true });
-} else browser = await chromium.launch({ channel: 'chrome', headless: !argv.includes('--headed'), args: CHROME_ARGS });
+} else browser = await chromium.launch({ ...pickBrowser(), headless: !argv.includes('--headed'), args: CHROME_ARGS });
 const t0 = Date.now();
 const inst = [];
 async function start(i) {
@@ -346,6 +368,12 @@ async function start(i) {
   const hide = HIDE?.n === i + 1 ? HIDE : null;
   const ctx = hide ? browser.contexts()[0] : await browser.newContext();
   const page = await ctx.newPage();
+  // a speed hack: the game threads' clocks K times as fast from their start (roam-pair.mjs)
+  if (SPEEDHACK[0] === i + 1) await page.context().route(r => r.pathname.endsWith('/host/game-worker.js'), async (route) => {
+    const res = await route.fetch(), k = SPEEDHACK[1];
+    const hook = `{ const p = performance, real = p.now.bind(p), rd = Date.now, d0 = rd(); p.now = () => real() * ${k}; Date.now = () => d0 + (rd() - d0) * ${k}; }\n`;
+    await route.fulfill({ response: res, body: hook + await res.text() });
+  });
   await page.route(`**${scriptPath(i)}`, r => r.fulfill({ status: 200, contentType: 'text/plain; charset=utf-8', body: scripts[i] }));
   const plog = fs.createWriteStream(path.join(dir, 'page.log'));
   const lines = [];

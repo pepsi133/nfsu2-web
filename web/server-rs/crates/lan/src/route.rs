@@ -11,6 +11,7 @@ use std::sync::atomic::{
 use bytes::{BufMut, Bytes, BytesMut};
 use nfsu2_util::{FrameCtx, mono_ms};
 
+use crate::away;
 use crate::compact;
 use crate::conn::{Conn, Out};
 use crate::lag::{self, SHARE_FULL};
@@ -86,16 +87,20 @@ impl LanSwitch {
     pub(crate) fn route(&self, peer: &Arc<Peer>, data: &Bytes, dsts: impl Iterator<Item = u32> + Clone) -> bool {
         let n = data.len();
         let lan_only = (KIND_LAN_UDP..=KIND_LAN_ICMP).contains(&data[0]);
-        let reaches = |p: &Arc<Peer>| !Arc::ptr_eq(p, peer) && p.open() && (!lan_only || p.lan() != Some(false));
+        let reaches = |p: &Arc<Peer>| !Arc::ptr_eq(p, peer) && p.open() && (!lan_only || p.lan());
         // what the switch sends for each: a broadcast costs its size for every player on its list but the sender (all
         // of them, or for LAN play's kinds those with LAN play open), so the switch never sends more for a client
         // than its budgets allow (the audit's F2: one 4 MB/s sender made it send 15 x that), and never walks the
         // list for a broadcast that was not paid for (the crate doc's How the work is shared out)
         let list = dsts.clone().any(|d| d == BROADCAST).then(|| if lan_only { self.lan_all.load() } else { self.all.load() });
-        let on_list = !lan_only || peer.lan() != Some(false);
+        let on_list = !lan_only || peer.lan();
         let reached = list.as_ref().map_or(0, |l| l.len().saturating_sub(usize::from(on_list)));
         let costs = dsts.clone().map(|d| if d == BROADCAST { reached.max(1) } else { 1 });
         let (paid, all_paid) = self.charge(peer, mono_ms(), n as f64, costs);
+        // free roam: whether the sender drives, from its own HELLO or SNAP (away.rs)
+        if let Some(st) = away::status(data) {
+            peer.away.store(away::away(st), Relaxed);
+        }
         if paid > 0 {
             self.stats.frames.add(paid as u64);
             self.stats.bytes.add((n * paid) as u64);
@@ -214,6 +219,7 @@ impl LanSwitch {
             site: peer.site.as_ref().map(|s| s.id.clone()),
             cause: cause.map(|c| c as Arc<dyn nfsu2_util::Charge>),
             slot: None,
+            owner: peer.conn.owner.get().cloned(),
         }
     }
 
@@ -239,11 +245,15 @@ impl LanSwitch {
         if data[0] == KIND_STREAM {
             return self.send_stream(from, p, data, dst);
         }
-        // a player behind on its path gets only its share of free roam's snapshots (lag.rs)
+        // a player behind on its path gets only its share of free roam's snapshots (lag.rs), one not driving its own
+        // (away.rs)
         if data[0] == KIND_UDP {
             let share = p.share.load(Relaxed);
             if share < SHARE_FULL && lag::is_snap(data) && !lag::pick(share) {
                 self.stats.thinned.inc();
+                return false;
+            }
+            if p.away.load(Relaxed) && self.slow.is_some() && lag::is_snap(data) && !lag::pick(away::SHARE) {
                 return false;
             }
         }
@@ -267,7 +277,15 @@ impl LanSwitch {
             self.stats.dropped.inc();
             return false;
         }
-        let clock = if (KIND_LAN_UDP..=KIND_LAN_ICMP).contains(&data[0]) { None } else { self.clock.as_deref() };
+        let clock = if (KIND_LAN_UDP..=KIND_LAN_ICMP).contains(&data[0]) {
+            None
+        } else if p.away.load(Relaxed) && data[1] == compact::ROAM_OK && Some(src) != self.roam_vip && self.slow.is_some() {
+            // free roam from another player to one who is not driving: the slow clock's tick, or sooner with whatever
+            // else goes to it (away.rs)
+            self.slow.as_deref()
+        } else {
+            self.clock.as_deref()
+        };
         p.conn.push_dgram(data.clone(), src, dst, clock);
         true
     }
@@ -408,9 +426,19 @@ pub(crate) mod tests {
     use crate::{AttachCtx, LanOptions};
 
     /// a peer on the switch without a socket: its connection's queue only fills
-    pub(crate) fn peer(sw: &Arc<LanSwitch>, group: &str) -> (Arc<Conn>, AttachCtx, Arc<Peer>) {
+    pub(crate) fn peer(sw: &Arc<LanSwitch>, group: &str) -> (Arc<Conn>, Arc<AttachCtx>, Arc<Peer>) {
         let conn = Arc::new(Conn::new(sw.conn_ids.fetch_add(1, Relaxed)));
-        let ctx = AttachCtx { resume: false, group: sw.join_group(false, Some(group)), site: None, on_join: None, on_leave: None };
+        let ctx = Arc::new(AttachCtx {
+            resume: false,
+            queue: false,
+            group: sw.join_group(false, Some(group)),
+            site: None,
+            on_join: None,
+            on_leave: None,
+            ident: None,
+            on_hello: None,
+            on_claim: None,
+        });
         let p = sw.admit(&conn, &ctx, None).expect("admitted");
         (conn, ctx, p)
     }
@@ -484,8 +512,8 @@ pub(crate) mod tests {
     /// under a millisecond).
     #[tokio::test]
     async fn a_broadcast_refused_walks_no_peer() {
-        let sw = LanSwitch::new(LanOptions { max_peers: 4000, ..LanOptions::default() }, "", None, None, None, None);
-        let peers: Vec<_> = (0..4000).map(|i| peer(&sw, &format!("g{i}"))).collect();
+        let sw = LanSwitch::new(LanOptions { max_peers: 7000, ..LanOptions::default() }, "", None, None, None, None);
+        let peers: Vec<_> = (0..7000).map(|i| peer(&sw, &format!("g{i}"))).collect();
         let p = &peers[0].2;
         for b in [&mut *p.buckets.lock(), &mut *p.group.buckets.lock()] {
             b.frames.v = 0.0;
@@ -497,13 +525,13 @@ pub(crate) mod tests {
             assert!(!sw.route(p, &f, std::iter::repeat_n(BROADCAST, 255)));
         }
         let ms = t.elapsed().as_secs_f64() * 1000.0;
-        assert!(ms < 500.0, "2000 refused messages of 255 broadcasts at 4000 players took {ms:.0} ms");
+        assert!(ms < 500.0, "2000 refused messages of 255 broadcasts at 7000 players took {ms:.0} ms");
         assert!(peers.iter().all(|(c, ..)| c.out.q.lock().len() <= 1), "nothing sent (a welcome at most)");
         sw.stop();
     }
 
-    /// LAN play's broadcasts go to the list of those with LAN play open: a page that said nothing (a page of before,
-    /// or no hello yet) is on it, one that shut LAN play is not, and one that left or was replaced is gone from it
+    /// LAN play's broadcasts go to the list of those with LAN play open: a page that said nothing (no hello yet, or
+    /// none of LAN play in it) and one that shut LAN play are not on it, and one that left or was replaced is gone
     #[tokio::test]
     async fn the_list_of_lan_play_follows_hellos_lan_messages_and_closes() {
         let sw = LanSwitch::new(LanOptions::default(), "", None, None, None, None);
@@ -514,13 +542,17 @@ pub(crate) mod tests {
             v.sort();
             v
         };
-        assert_eq!(on(&sw), [a.vip, b.vip], "no hello yet: every broadcast");
+        assert_eq!(on(&sw), [0u32; 0], "no hello yet: none of them");
         let hello = |lan: u8| match crate::text::parse_json(format!(r#"{{"t":"hello","name":"x","lan":{lan}}}"#).as_bytes()) {
             Some(serde_json::Value::Object(m)) => m,
             _ => unreachable!(),
         };
-        sw.hello(&a, &hello(0));
-        assert_eq!(on(&sw), [b.vip]);
+        sw.hello(&a, &hello(1));
+        assert_eq!(on(&sw), [a.vip]);
+        sw.hello(&b, &hello(0));
+        assert_eq!(on(&sw), [a.vip]);
+        sw.set_lan(&b, true);
+        assert_eq!(on(&sw), [a.vip, b.vip]);
         sw.set_lan(&a, true);
         sw.set_lan(&b, false);
         assert_eq!(on(&sw), [a.vip]);

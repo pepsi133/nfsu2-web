@@ -155,7 +155,12 @@ void app_local_network_notice(void){
  * "Team#1" stays Team#1), the rule the free-roam options follow in the
  * runtime and in the Windows plugin's .ini.
  * K_PATH: a folder (absolute, ~/..., or a name), printable, under 1024
- * bytes.  K_TEXT: printable text (UTF-8 allowed), 1 to 63 bytes.  K_WXH:
+ * bytes.  K_TEXT: printable text (UTF-8 allowed), 1 to 63 bytes.  K_ROOM:
+ * K_TEXT that does not read as a slur (names.h, as K_NAME).  K_CREWS:
+ * crew names joined by commas, printable (UTF-8 allowed), under 1024 bytes,
+ * each name at most 24 characters without the blanks round it (the page's
+ * crews.ts; the game takes the first 4).  K_RGBS: at most 4 colours joined
+ * by commas, each 6 hex digits (no '#') or empty, blanks round them.  K_WXH:
  * <w>x<h>, each 320..16384.  K_FIXES: default|all|none or a comma list of
  * the frame-rate fixes, "-name" removes one.  K_IFNAME: a network interface
  * name (letters and digits, at most 15).  K_IPV4: a.b.c.d.  K_MAC:
@@ -164,7 +169,7 @@ void app_local_network_notice(void){
  * pack's parts.  K_DUMP: on/off or a folder (as K_PATH).  Every key of the
  * table has a kind that checks its value: K_RAW is not used. */
 enum { K_RAW, K_BOOL, K_BOOL_INV, K_ENUM, K_NUM, K_ID, K_TOKEN, K_INT, K_NAME, K_PEERS,
-       K_PATH, K_TEXT, K_WXH, K_FIXES, K_IFNAME, K_IPV4, K_MAC, K_HOST, K_PARTS, K_DUMP };
+       K_PATH, K_TEXT, K_ROOM, K_CREWS, K_RGBS, K_WXH, K_FIXES, K_IFNAME, K_IPV4, K_MAC, K_HOST, K_PARTS, K_DUMP };
 #define K_IC 0x100
 static const struct { const char *key, *env; int kind; const char *vals; } g_keys[] = {
     /* app */
@@ -195,7 +200,7 @@ static const struct { const char *key, *env; int kind; const char *vals; } g_key
     { "metal_hud",                "MTL_HUD_ENABLED",            K_BOOL     },
     /* frame rate */
     { "fps",                      "NFSU2_FPS",                  K_ENUM,
-      "auto|60|120|240|uncapped|off|native|vanilla|game|max" },
+      "auto|30|60|120|240|uncapped|off|native|vanilla|game|max" },
     { "hfr_fixes",                "NFSU2_HFR_FIX",              K_FIXES    },
     { "nos_trail_length",         "NFSU2_NOS_TRAIL_LEN",        K_NUM      },
     /* game controller */
@@ -216,7 +221,9 @@ static const struct { const char *key, *env; int kind; const char *vals; } g_key
     { "roam_port",                "NFSU2_ROAM_PORT",            K_INT   | K_IC, "1024..65535" },
     { "roam_peers",               "NFSU2_ROAM_PEERS",           K_PEERS | K_IC },
     { "roam_discovery",           "NFSU2_ROAM_DISCOVERY",       K_BOOL  | K_IC },
-    { "roam_room",                "NFSU2_ROAM_ROOM",            K_TEXT  | K_IC },
+    { "roam_room",                "NFSU2_ROAM_ROOM",            K_ROOM  | K_IC },
+    { "roam_crew",                "NFSU2_ROAM_CREW",            K_CREWS | K_IC },
+    { "roam_crew_colours",        "NFSU2_ROAM_CREW_RGB",        K_RGBS  | K_IC },
     { "roam_max_players",         "NFSU2_ROAM_MAX_PLAYERS",     K_INT   | K_IC, "2..33" },
     { "roam_max_cars",            "NFSU2_ROAM_MAX_CARS",        K_INT   | K_IC, "0..32" },
     { "roam_collide",             "NFSU2_ROAM_COLLIDE",         K_BOOL  | K_IC },
@@ -355,13 +362,15 @@ static const char *const k_template =
 "# ---- Frame rate --------------------------------------------------------\n"
 "\n"
 "# auto = follow the display's refresh rate (60, 120 or 240; 144/165 Hz give\n"
-"# 120); 60, 120 or 240 = fixed; uncapped = no pacing (benchmark only);\n"
+"# 120); 30, 60, 120 or 240 = fixed (30: steady frames where 60 does not\n"
+"# hold, as on a slow phone); uncapped = no pacing (benchmark only);\n"
 "# off = the game's own 1/120 s limiter, the timing before the frame-rate\n"
 "# work.  Cutscenes stay at 30 fps in every mode.  [NFSU2_FPS]\n"
 "#fps = auto\n"
 "# Fixes for subsystems that count frames: default (all above 60 fps, none\n"
-"# at 60), all, none, or a list of ticks,timer,particles,trail,audio,rtf,rain\n"
-"# (a leading '-' removes one, e.g. default,-audio).  [NFSU2_HFR_FIX]\n"
+"# at 60, ticks,particles,rain,spinners at 30), all, none, or a list of\n"
+"# ticks,timer,particles,trail,audio,rtf,rain,spinners (a leading '-' removes\n"
+"# one, e.g. default,-audio).  [NFSU2_HFR_FIX]\n"
 "#hfr_fixes = default\n"
 "# Length factor of the NOS / streak trail.  [NFSU2_NOS_TRAIL_LEN]\n"
 "#nos_trail_length = 1.0\n"
@@ -418,8 +427,16 @@ static const char *const k_template =
 "# routers, VPNs): a.b.c.d or a.b.c.d:port, separated by commas; one friend is\n"
 "# enough, the others are passed on.  [NFSU2_ROAM_PEERS]\n"
 "#roam_peers =\n"
-"# Only players with the same room name see each other.  [NFSU2_ROAM_ROOM]\n"
+"# Empty: everyone.  With a name, only the players who set the same name\n"
+"# (capitals and spaces do not count).  [NFSU2_ROAM_ROOM]\n"
 "#roam_room =\n"
+"# Your crews, up to 4, joined by commas (Blue Room, Night Owls): players who\n"
+"# share one see each other's names and map arrows in its colour, at any\n"
+"# distance, with everyone else still there.  [NFSU2_ROAM_CREW]\n"
+"#roam_crew =\n"
+"# Each crew's colour, in the order of roam_crew: 6 hex digits, no #.  Empty:\n"
+"# cyan, magenta, violet, red.  [NFSU2_ROAM_CREW_RGB]\n"
+"#roam_crew_colours =\n"
 "# UDP port, the same on every machine (1024 to 65535).  [NFSU2_ROAM_PORT]\n"
 "#roam_port = 47210\n"
 "# Look for friends with a network broadcast every 2 s.  [NFSU2_ROAM_DISCOVERY]\n"
@@ -440,7 +457,8 @@ static const char *const k_template =
 "#roam_delay = 100\n"
 "#roam_extrap = 250\n"
 "# The free-roam car memory pool in KB, raised for friends' cars (the game's\n"
-"# own is 11000; it is never lowered).  [NFSU2_ROAM_CARPOOL_KB]\n"
+"# own is 11000; a value at or below it is ignored, as it would leave no room\n"
+"# for them).  [NFSU2_ROAM_CARPOOL_KB]\n"
 "#roam_carpool_kb = 48000\n"
 "\n"
 "# ---- LAN play ----------------------------------------------------------\n"
@@ -598,12 +616,31 @@ static int list_ok(const char *v, const char *const *words, int minus){   /* com
 static int value_ok(int kind, const char *v){
     switch (kind){
     case K_PATH: return printable_ok(v, 1023);
-    case K_TEXT: return printable_ok(v, 63);
+    case K_TEXT: case K_ROOM: return printable_ok(v, 63);
+    case K_CREWS: { if (!printable_ok(v, 1023)) return 0;
+                    for (const char *p = v; *p; p += *p == ','){
+                        const char *e = p; while (*e && *e != ',') e++;
+                        while (p < e && strchr(" \t\n\v\f\r", *p)) p++;
+                        while (e > p && strchr(" \t\n\v\f\r", e[-1])) e--;
+                        int chars = 0;
+                        for (; p < e; p++) chars += ((unsigned char)*p & 0xc0) != 0x80;    /* (UTF-8: a character's first byte) */
+                        if (chars > 24) return 0;
+                        while (*p && *p != ',') p++;
+                    }
+                    return 1; }
+    case K_RGBS: { int n = 0;
+                   for (const char *p = v; ; p++){
+                       while (*p == ' ' || *p == '\t') p++;
+                       int d = 0; while (isxdigit((unsigned char)*p)) { p++; d++; }
+                       while (*p == ' ' || *p == '\t') p++;
+                       if ((d != 0 && d != 6) || (*p && *p != ',') || ++n > 4) return 0;
+                       if (!*p) return 1;
+                   } }
     case K_WXH: { char *e; long w = strtol(v, &e, 10); if (e == v || (*e != 'x' && *e != 'X')) return 0;
                   const char *h0 = e + 1; long h = strtol(h0, &e, 10);
                   return e != h0 && !*e && w >= 320 && w <= 16384 && h >= 320 && h <= 16384; }
     case K_FIXES: { static const char *const w[] = { "default", "all", "none", "ticks", "timer", "particles",
-                                                     "trail", "audio", "rtf", "rain", 0 };
+                                                     "trail", "audio", "rtf", "rain", "spinners", 0 };
                     return list_ok(v, w, 1); }
     case K_IFNAME: { size_t n = strlen(v); if (!n || n > 15) return 0;
                      for (const char *p = v; *p; p++) if (!isalnum((unsigned char)*p)) return 0;
@@ -630,7 +667,9 @@ static int value_ok(int kind, const char *v){
 static const char *kind_text(int kind){
     switch (kind){
     case K_PATH: return "a folder (printable, under 1024 bytes)";
-    case K_TEXT: return "text of 1 to 63 bytes without control characters";
+    case K_TEXT: case K_ROOM: return "text of 1 to 63 bytes without control characters";
+    case K_CREWS: return "crew names (at most 24 characters each) joined by commas";
+    case K_RGBS: return "at most 4 colours of 6 hex digits (no #) joined by commas";
     case K_WXH: return "<width>x<height> (320 to 16384 each)";
     case K_FIXES: return "default, all, none or a list of ticks, timer, particles, trail, audio, rtf, rain (-name removes one)";
     case K_IFNAME: return "a network interface name (letters and digits, e.g. en0)";
@@ -694,6 +733,8 @@ static void apply_setting(const char *key, const char *val, int line){
     } else if (kind >= K_PATH){
         if (!value_ok(kind, val)){
             set_note("settings.ini:%d: %s = \"%s\" is not %s, ignored\n", line, key, val, kind_text(kind)); return; }
+        if (kind == K_ROOM && name_blocked(val)){
+            set_note("settings.ini:%d: %s = \"%s\" is not a room name (it reads as a slur), ignored\n", line, key, val); return; }
         if (kind == K_DUMP && (truthy(val) || falsy(val))) out = truthy(val) ? "on" : "off";
     } else if (kind == K_ID || kind == K_TOKEN){
         size_t n = strlen(val); int ok = kind == K_ID ? n < 32 : n < 300;

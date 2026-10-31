@@ -1,7 +1,8 @@
 //! The whole server as a process (cargo's CARGO_BIN_EXE_nfsu2-server), with a made-up game folder as
 //! web/test/module.test.mjs makes one: its start-up lines, /players counting a /lan client and an Online login, what
 //! the console says of them, and SIGTERM (exit code 0, the addresses saved); its state folder over restarts; other
-//! options; the lobby trace; players who leave nothing behind; a page's first messages and its replaced connection.
+//! options; the lobby trace; players who leave nothing behind; a page's first messages and its replaced connection;
+//! kicks and bans through `nfsu2-server ctl`, and the control socket's file.
 //!   cargo test --test binary
 
 mod common;
@@ -96,6 +97,19 @@ impl Server {
         }
     }
 
+    /// /players until it counts `roam` in free roam (as of the hub's last tick: twice a second; 2 s at most)
+    async fn roam_until(&self, roam: u64) -> String {
+        let t0 = Instant::now();
+        loop {
+            let p = self.players().await;
+            let v: Value = serde_json::from_str(&p).unwrap();
+            if v["roam"] == roam || t0.elapsed() > Duration::from_secs(2) {
+                return p;
+            }
+            sleep(20).await;
+        }
+    }
+
     /// SIGTERM, and its exit code
     async fn stop(&mut self) -> Option<i32> {
         // (kill(1): no unsafe outside nfsu2-util)
@@ -126,7 +140,8 @@ impl Drop for Server {
 struct Run {
     /// the start-up lines, from "NFSU2 web server" to "  access    :"
     startup: Vec<String>,
-    /// /players: at the start, with a /lan client on, once it logged in to Online mode, once it left
+    /// /players: at the start, with a /lan client on, once it logged in to Online mode, once it left; then with a
+    /// room (?room=5) and with one that is none (?room=x)
     players: Vec<String>,
     /// what the console said after the start-up lines (sorted: the switch and the Online host print from threads of
     /// their own)
@@ -149,6 +164,8 @@ async fn scenario(cmd: Command, port: u16, state: &Path) -> Run {
     players.push(srv.players().await);
     a.close().await;
     players.push(srv.players_until(0).await);
+    players.push(srv.get("/players?room=5").await.1);
+    players.push(srv.get("/players?room=x").await.1);
     // the lines the console printed by now (the lobby session's end comes a moment after the switch's)
     sleep(300).await;
     let exit = srv.stop().await;
@@ -176,7 +193,9 @@ fn untimed(l: String) -> String {
 /// a run with its own paths, port and times taken out
 fn normal(mut r: Run, port: u16, state: &Path) -> Run {
     let st = state.to_string_lossy().to_string();
-    let fix = |l: &String| untimed(l.replace(&st, "<state>").replace(&format!(":{port}/"), ":<port>/"));
+    // (the server names some folders by their real path: on macOS the temp folder is under a link, /var to /private/var)
+    let real = std::fs::canonicalize(state).map_or_else(|_| st.clone(), |p| p.to_string_lossy().to_string());
+    let fix = |l: &String| untimed(l.replace(&real, "<state>").replace(&st, "<state>").replace(&format!(":{port}/"), ":<port>/"));
     r.startup = r.startup.iter().map(fix).collect();
     r.console = r.console.iter().map(fix).collect();
     r
@@ -208,15 +227,19 @@ async fn the_binary_starts_counts_its_players_and_stops() {
     assert_eq!(rust.startup[0], "NFSU2 web server");
     assert!(rust.startup[1].starts_with(&format!("  game data : {data_s} (")), "{}", rust.startup[1]);
     assert_eq!(rust.startup[2], format!("  game.wasm : {}", wasm.to_string_lossy()));
-    assert_eq!(rust.startup[3], "  this host : http://localhost:<port>/");
+    // (run.rs names the machine: "this Mac" on macOS)
+    let here = if cfg!(target_os = "macos") { "this Mac" } else { "this host" };
+    assert_eq!(rust.startup[3], format!("  {here:<10}: http://localhost:<port>/"));
     assert!(rust.startup.iter().any(|l| l.starts_with("  free roam : the hub at 10.77.0.253 on the switch")));
     assert!(rust.startup.iter().any(|l| l.starts_with("  online    : the game's Online mode at 10.77.0.1")
         && l.ends_with("race results per persona in <state>/online)")));
     let p: Vec<Value> = rust.players.iter().map(|p| serde_json::from_str(p).unwrap()).collect();
-    assert_eq!(rust.players[0], r#"{"players":0,"online":0,"roam":0,"full":false,"roamBusy":false}"#);
+    assert_eq!(rust.players[0], r#"{"players":0,"online":0,"roam":0,"full":false,"queue":0,"roamBusy":false}"#);
     assert_eq!((p[1]["players"].as_u64(), p[1]["online"].as_u64()), (Some(1), Some(0)), "a /lan client: {}", rust.players[1]);
     assert_eq!((p[2]["players"].as_u64(), p[2]["online"].as_u64()), (Some(1), Some(1)), "an Online login: {}", rust.players[2]);
-    assert_eq!(rust.players[3], r#"{"players":0,"online":0,"roam":0,"full":false,"roamBusy":false}"#);
+    assert_eq!(rust.players[3], r#"{"players":0,"online":0,"roam":0,"full":false,"queue":0,"roamBusy":false}"#);
+    assert_eq!(rust.players[4], r#"{"players":0,"online":0,"roam":0,"full":false,"queue":0,"roamBusy":false,"room":0}"#);
+    assert_eq!(rust.players[5], rust.players[3], "no room for one that is not a number");
     assert!(rust.console.iter().any(|l| l == "[lan] 10.77.0.2 joined (1 on the switch)"), "{:?}", rust.console);
     assert!(rust.console.iter().any(|l| l == "[lan] 10.77.0.2 \"Ann\" left (0 on the switch)"), "{:?}", rust.console);
     assert!(rust.console.iter().any(|l| l.contains("logged in as \"Ann\"")), "{:?}", rust.console);
@@ -227,7 +250,7 @@ async fn the_binary_starts_counts_its_players_and_stops() {
     assert!(rust.modes.1 == 0 || rust.modes.1 == 0o700, "the online folder is private");
     // keyphrase saves: their folder (private too), counted at the start
     assert!(
-        rust.startup.contains(&"  saves     : keyphrase saves (/vault) in <state>/vault, up to 50.00 GB (new keyphrases until 45.00 GB, 2838 a day at most); one unused for two years goes".to_string()),
+        rust.startup.contains(&"  saves     : keyphrase saves (/vault) in <state>/vault, up to 50.00 GB (new keyphrases until 45.00 GB, growing 1.50 GB a day at most); one unused for two years goes".to_string()),
         "{:?}",
         rust.startup
     );
@@ -237,6 +260,34 @@ async fn the_binary_starts_counts_its_players_and_stops() {
         Some(0o700),
         "the keyphrases' folder is private"
     );
+    // the kept blocks: their folder, private too
+    assert!(
+        rust.startup.contains(&"  blocks    : kept at brotli's best in <state>/blocks, 2 threads (NFSU2_COMPRESS_THREADS)".to_string()),
+        "{:?}",
+        rust.startup
+    );
+    assert_eq!(
+        std::fs::metadata(state.join("blocks")).map(|m| m.permissions().mode() & 0o777).ok(),
+        Some(0o700),
+        "the kept blocks' folder is private"
+    );
+    // the log files: the console in today's file too, each line after its time; private
+    assert!(
+        rust.startup.contains(&"  logs      : the console in <state>/logs too, a file a day (UTC), gzipped once it ended, the last 30 days".to_string()),
+        "{:?}",
+        rust.startup
+    );
+    let today = &nfsu2_util::js::iso_string(nfsu2_util::now_ms())[..10];
+    let file = state.join("logs").join(format!("{today}.log"));
+    let kept = std::fs::read_to_string(&file).unwrap_or_default();
+    let line_of = |want: &str| kept.lines().find(|l| l.get(25..) == Some(want)).map(|l| l[..24].to_string());
+    let at = line_of("NFSU2 web server").expect("the start in the log file");
+    assert!(at.starts_with(today) && at.ends_with('Z') && at.as_bytes()[10] == b'T', "{at}");
+    assert!(line_of("[lan] 10.77.0.2 \"Ann\" left (0 on the switch)").is_some(), "{kept}");
+    assert!(kept.lines().count() >= rust.console.len() + rust.startup.len(), "every console line: {kept}");
+    for (p, mode) in [(state.join("logs"), 0o700), (file, 0o600)] {
+        assert_eq!(std::fs::metadata(&p).map(|m| m.permissions().mode() & 0o777).ok(), Some(mode), "{}", p.display());
+    }
 }
 
 /// a header of an answer's head (its name in any case)
@@ -341,8 +392,8 @@ async fn the_binary_with_online_and_the_hub_off_and_one_place() {
     println!("{rust:#?}");
     assert!(rust.startup.contains(&"  online    : off (--online off)".to_string()), "{:?}", rust.startup);
     assert!(rust.startup.contains(&"  switch    : at most 1 players".to_string()));
-    assert_eq!(rust.players[0], r#"{"players":0,"online":null,"roam":null,"full":false,"roamBusy":false}"#);
-    assert_eq!(rust.players[1], r#"{"players":1,"online":null,"roam":null,"full":true,"roamBusy":false}"#);
+    assert_eq!(rust.players[0], r#"{"players":0,"online":null,"roam":null,"full":false,"queue":0,"roamBusy":false}"#);
+    assert_eq!(rust.players[1], r#"{"players":1,"online":null,"roam":null,"full":true,"queue":0,"roamBusy":false}"#);
     assert_eq!(rust.players[2], rust.players[1]);
     assert_eq!(rust.refused.1, Some((1013, "LAN full".to_string())));
     assert_eq!(rust.answers, 0, "no host at 10.77.0.1 or 10.77.0.253");
@@ -407,7 +458,8 @@ async fn players_who_leave_leave_nothing_behind() {
     let tmp = tempfile::tempdir().unwrap();
     let (data, wasm) = game_folder(tmp.path());
     let (port, state) = (free_port(), tmp.path().join("state"));
-    let mut srv = Server::spawn(command(&data, &wasm, port, &state, &[]), port);
+    // (each one that leaves without the page's own close keeps its place a minute: room for the four rounds' 160)
+    let mut srv = Server::spawn(command(&data, &wasm, port, &state, &["--max-peers", "1000"]), port);
     srv.ready().await;
     let pid = srv.child.id();
     let host = format!("localhost:{port}");
@@ -424,14 +476,15 @@ async fn players_who_leave_leave_nothing_behind() {
             b.binary(to_hub(&roam_hello(1000 + i as u32)));
             b.binary(to_hub(&roam_snap(1000 + i as u32, [i as f32 * 10.0, 0.0, 0.0])));
         }
-        let during = srv.players().await;
-        assert_eq!(during, r#"{"players":40,"online":40,"roam":0,"full":false,"roamBusy":false}"#);
+        // (all 40 in free roam once the hub's tick has counted their HELLOs: until then fewer, or none)
+        let during = srv.roam_until(40).await;
+        assert_eq!(during, r#"{"players":40,"online":40,"roam":40,"full":false,"queue":0,"roamBusy":false}"#);
         let used = proc_use(pid);
         for b in &bs {
             b.close().await;
         }
         drop(bs);
-        assert_eq!(srv.players_until(0).await, r#"{"players":0,"online":0,"roam":0,"full":false,"roamBusy":false}"#);
+        assert_eq!(srv.players_until(0).await, r#"{"players":0,"online":0,"roam":0,"full":false,"queue":0,"roamBusy":false}"#);
         // (the sockets close as their tasks end: until the count holds, or the first round's again, 3 s at most)
         let t0 = Instant::now();
         let mut after = proc_use(pid);
@@ -452,6 +505,74 @@ async fn players_who_leave_leave_nothing_behind() {
     assert!(last.2 < first.2 + (16 << 20), "about the same memory: {seen:?}");
     assert_eq!(srv.stop().await, Some(0));
     assert!(!srv.lines().iter().any(|l| l.contains("panicked")), "{:?}", srv.lines());
+}
+
+/// a HELLO of a player that reads crews (roam_core.h RC_HF_CREW, core version 7) in `room`, in free roam, named "p",
+/// naming no ids it hears, then its crews
+fn roam_hello_crews(sender: u32, room: u32, crews: &[u32]) -> Vec<u8> {
+    let mut p = vec![0u8; 12];
+    p[0..2].copy_from_slice(&7u16.to_le_bytes());
+    p[2] = 1;
+    p[3] = 2;
+    p[4..6].copy_from_slice(&47210u16.to_le_bytes());
+    p[6..8].copy_from_slice(&3u16.to_le_bytes());
+    p[8..12].copy_from_slice(&room.to_le_bytes());
+    p.extend_from_slice(&[1, b'p', 0, crews.len() as u8]);
+    for c in crews {
+        p.extend_from_slice(&c.to_le_bytes());
+    }
+    let mut d = dgram(1, sender, &p);
+    d[14..16].copy_from_slice(&0x0200u16.to_le_bytes());
+    let n = d.len();
+    let crc = crc32(&d[..n - 4]);
+    d[n - 4..].copy_from_slice(&crc.to_le_bytes());
+    d
+}
+
+// /players?crews=: how many drive in free roam in each crew asked, in any room, in the order asked, as of the hub's
+// last tick; with ?room= too; what is not a number, or 0, left out, 4 at most; none left, no crews
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn players_counts_free_roams_crews() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (data, wasm) = game_folder(tmp.path());
+    let (port, state) = (free_port(), tmp.path().join("state"));
+    let mut srv = Server::spawn(command(&data, &wasm, port, &state, &[]), port);
+    srv.ready().await;
+    let host = format!("localhost:{port}");
+    let (a, b) = (Browser::open_at(&host, port, "", None).await, Browser::open_at(&host, port, "", None).await);
+    a.hello("Ann");
+    b.hello("Bob");
+    a.binary(to_hub(&roam_hello_crews(501, 5, &[7, 8])));
+    b.binary(to_hub(&roam_hello_crews(502, 0, &[8])));
+    // /players with this query once the hub's tick counts `roam` in free roam
+    let until = |q: &'static str, roam: u32| {
+        let srv = &srv;
+        async move {
+            let t0 = Instant::now();
+            loop {
+                let p = srv.get(q).await.1;
+                if p.contains(&format!("\"roam\":{roam},")) || t0.elapsed() > Duration::from_secs(5) {
+                    return p;
+                }
+                sleep(50).await;
+            }
+        }
+    };
+    let head = r#"{"players":2,"online":0,"roam":2,"full":false,"queue":0,"roamBusy":false"#;
+    assert_eq!(until("/players?room=5&crews=8,x,7,0,9,10,11", 2).await, format!(r#"{head},"room":1,"crews":[2,1,0,0]}}"#));
+    assert_eq!(srv.get("/players?crews=7").await.1, format!(r#"{head},"crews":[1]}}"#));
+    assert_eq!(srv.get("/players?crews=8%2C7&room=5").await.1, format!(r#"{head},"room":1,"crews":[2,1]}}"#), "as URLSearchParams asks");
+    // (a + in a query is a space, as URLSearchParams reads it)
+    assert_eq!(srv.get("/players?crews=4294967296,-8,8.0,+8,08").await.1, format!(r#"{head},"crews":[2]}}"#), "decimal u32s only: 08 is 8");
+    assert_eq!(srv.get("/players?crews=x,0,").await.1, format!("{head}}}"), "none asked: no crews");
+    assert_eq!(srv.get("/players?crews").await.1, format!("{head}}}"));
+    b.close().await;
+    assert_eq!(
+        until("/players?crews=8,7", 1).await,
+        r#"{"players":1,"online":0,"roam":1,"full":false,"queue":0,"roamBusy":false,"crews":[1,1]}"#,
+        "Bob left"
+    );
+    assert_eq!(srv.stop().await, Some(0));
 }
 
 /// a client frame (masked with a zero mask: the payload as it is)
@@ -537,7 +658,7 @@ async fn messages_in_the_same_write_as_the_handshake_are_not_lost() {
     let (port, state) = (free_port(), tmp.path().join("state"));
     let mut srv = Server::spawn(command(&data, &wasm, port, &state, &[]), port);
     srv.ready().await;
-    let hello = client_frame(1, br#"{"t":"hello","name":"Early","deltas":1}"#);
+    let hello = client_frame(1, br#"{"t":"hello","name":"Early","lan":1}"#);
     let got = pipelined(port, "", &hello, r#""name":"Early""#).await;
     let welcome: Value = serde_json::from_str(got.iter().find(|m| m.contains("welcome")).expect("a welcome")).unwrap();
     assert!(got.iter().any(|m| m.contains(r#""t":"peers""#) && m.contains(r#""name":"Early""#)), "the hello named it: {got:?}");
@@ -604,7 +725,281 @@ async fn a_page_that_replaces_its_connection_keeps_its_online_session() {
     assert!(rust.same_vip, "the address came back");
     assert_eq!(rust.old_closed, Some((1006, String::new())), "the old connection ended, no close frame (terminate)");
     assert_eq!(rust.answer, Some(("move".to_string(), String::new())), "the lobby answers over the new connection");
-    assert_eq!(rust.players, r#"{"players":1,"online":1,"roam":0,"full":false,"roamBusy":false}"#);
+    assert_eq!(rust.players, r#"{"players":1,"online":1,"roam":0,"full":false,"queue":0,"roamBusy":false}"#);
     assert!(rust.console.contains(&"[lan] 10.77.0.2 is back (1 on the switch)".to_string()), "{:?}", rust.console);
     assert!(!rust.console.iter().any(|l| l.contains("the browser left")), "{:?}", rust.console);
+}
+
+/// `nfsu2-server ctl --state <state> <words>`: its exit code, and what it printed (stdout, else stderr)
+fn ctl(state: &Path, words: &[&str]) -> (i32, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_nfsu2-server")).arg("ctl").arg("--state").arg(state).args(words).output().unwrap();
+    let text = String::from_utf8_lossy(if out.status.success() { &out.stdout } else { &out.stderr }).trim_end().to_string();
+    (out.status.code().unwrap_or(-1), text)
+}
+
+// A page that goes by "player" on the switch while its game shows another name over its car (an edited page): the
+// console says so with its address, `who` finds it by either name and shows both, and `ban` takes it by the game's
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn who_finds_a_player_by_the_name_over_its_car() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (data, wasm) = game_folder(tmp.path());
+    let (port, state) = (free_port(), tmp.path().join("state"));
+    let mut srv = Server::spawn(command(&data, &wasm, port, &state, &["--online", "off"]), port);
+    srv.ready().await;
+    let host = format!("localhost:{port}");
+    let a = Browser::open_from(&host, port, "", None, None, Some("192.0.2.1")).await;
+    let b = Browser::open_from(&host, port, "", None, None, Some("192.0.2.2")).await;
+    a.text(&serde_json::json!({ "t": "hello", "name": "player", "id": "page-a" }).to_string());
+    b.hello("Bob");
+    a.binary(to_hub(&roam_hello_named(501, b"Mallory")));
+    b.binary(to_hub(&roam_hello_named(502, b"bob")));
+    let a_vip = nfsu2_util::vip_str(a.vip);
+    let t0 = Instant::now();
+    let mut who = ctl(&state, &["who", "llor"]);
+    while !who.1.starts_with("1 on the switch") && t0.elapsed() < Duration::from_secs(3) {
+        sleep(50).await;
+        who = ctl(&state, &["who", "llor"]);
+    }
+    assert_eq!(who.0, 0, "{}", who.1);
+    let head = format!("1 on the switch called *llor*\n{a_vip:<13}\"player\"                 free roam, ");
+    assert!(who.1.starts_with(&head) && who.1.ends_with(" min; its game shows \"Mallory\""), "{}", who.1);
+    let all = ctl(&state, &["who"]).1;
+    assert!(all.contains("\"Bob\"") && !all.contains("its game shows \"bob\""), "Bob's page and game have one name: {all}");
+    let line = format!("[roam] {a_vip} \"player\": its game shows \"Mallory\" over its car");
+    assert!(srv.lines().iter().any(|l| l.ends_with(&line)), "{:?}", srv.lines());
+    let ban = ctl(&state, &["ban", "mallory", "perm"]);
+    assert_eq!(ban.0, 0, "{}", ban.1);
+    assert!(ban.1.starts_with("ban #1: \"Mallory\" for good, by its page and its address\n"), "{}", ban.1);
+    assert!(ban.1.ends_with(&format!("removed {a_vip} \"player\"")), "{}", ban.1);
+    assert_eq!(a.until_ms(3000, |g| g.closed.clone()).await, (4003, "banned".into()));
+    assert!(b.is_open(), "Bob plays on");
+    assert_eq!(srv.stop().await, Some(0));
+}
+
+/// a page from `xff` (its address, as a proxy on this machine names it) that says hello with page id `id`: what it
+/// got by the time the switch closed it (or 2 s), and how
+async fn turned_away(host: &str, port: u16, xff: &str, id: &str) -> (Vec<Value>, Option<(u16, String)>) {
+    turned_away_hello(host, port, xff, serde_json::json!({ "t": "hello", "name": "Ann", "id": id })).await
+}
+
+/// the same, with this hello
+async fn turned_away_hello(host: &str, port: u16, xff: &str, hello: Value) -> (Vec<Value>, Option<(u16, String)>) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
+    let s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut q = format!("ws://{host}/lan").into_client_request().unwrap();
+    q.headers_mut().insert("x-forwarded-for", xff.parse().unwrap());
+    let (ws, _) = tokio_tungstenite::client_async(q, s).await.expect("the handshake");
+    let (mut sink, mut stream) = ws.split();
+    let _ = sink.send(Message::text(hello.to_string())).await;
+    let (mut ctl, mut closed) = (Vec::new(), None);
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(Ok(m)) = stream.next().await {
+            match m {
+                Message::Text(t) => ctl.push(serde_json::from_str(t.as_str()).unwrap()),
+                Message::Close(f) => closed = Some(f.map(|f| (u16::from(f.code), f.reason.to_string())).unwrap_or((1005, String::new()))),
+                _ => {}
+            }
+        }
+    })
+    .await;
+    (ctl, closed)
+}
+
+/// the kinds of control messages it got, in order
+fn kinds(ctl: &[Value]) -> Vec<String> {
+    ctl.iter().map(|m| m["t"].as_str().unwrap_or("").to_string()).collect()
+}
+
+// The operator's commands (app/control.rs) on the running binary: who, a kick (the player is told, and may come
+// back), a ban (told, with its keyphrase on its other device; turned away by its address, by its page id at another
+// address, which then is banned too, by its keyphrase in a new browser, which then is taken in, and by an earlier
+// page id its page found; what was taken in brings in nothing more; the other player is left be), bans, unban, a ban
+// by a [cheat] line's handle; the state folder keeps no address, no page id and no keyphrase
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kicks_and_bans_through_the_control_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (data, wasm) = game_folder(tmp.path());
+    let (port, state) = (free_port(), tmp.path().join("state"));
+    // a [cheat] line's mark from before this start (the server's Marker makes them from the hosts' lines)
+    std::fs::create_dir_all(&state).unwrap();
+    let marks = nfsu2_bans::Bans::open(&state).unwrap();
+    assert_eq!(marks.mark("Racer", marks.keys(None, Some("page-racer"), None), nfsu2_util::now_ms()).unwrap().handle, "c1");
+    drop(marks);
+    let mut srv = Server::spawn(command(&data, &wasm, port, &state, &["--online", "off", "--roam-hub", "off"]), port);
+    srv.ready().await;
+    let host = format!("localhost:{port}");
+    let sock = state.join("control.sock").to_string_lossy().to_string();
+    assert!(
+        srv.lines().contains(&format!("  bans      : 0; nfsu2-server ctl who, kick, ban, unban, bans (through {sock})")),
+        "{:?}",
+        srv.lines()
+    );
+    let hello = |name: &str, id: &str| serde_json::json!({ "t": "hello", "name": name, "id": id }).to_string();
+    // Ann's keyphrase's token (the page sends it as "claim": 43 characters)
+    let ann_key = format!("{:-<43}", "ann-keyphrase");
+    let ann_hello = |id: &str| serde_json::json!({ "t": "hello", "name": "Ann", "id": id, "claim": ann_key });
+    let ann = Browser::open_from(&host, port, "", None, None, Some("192.0.2.1")).await;
+    ann.text(&ann_hello("page-ann").to_string());
+    let bob = Browser::open_from(&host, port, "", None, None, Some("192.0.2.2")).await;
+    bob.text(&hello("Bob", "page-bob"));
+    let (ann_vip, bob_vip) = (nfsu2_util::vip_str(ann.vip), nfsu2_util::vip_str(bob.vip));
+    let t0 = Instant::now();
+    let mut who = ctl(&state, &["who"]);
+    while !who.1.contains("\"Bob\"") && t0.elapsed() < Duration::from_secs(3) {
+        sleep(50).await;
+        who = ctl(&state, &["who"]);
+    }
+    assert_eq!(who.0, 0, "{}", who.1);
+    assert!(who.1.starts_with("2 on the switch\n"), "{}", who.1);
+    assert!(who.1.contains(&format!("{ann_vip:<13}\"Ann\"")), "{}", who.1);
+
+    // a kick: the message, the close; the player may come back
+    let kick = ctl(&state, &["kick", "ann", "Stop", "ramming"]);
+    assert_eq!(kick, (0, format!("kicked {ann_vip} \"Ann\"")));
+    assert_eq!(ann.until_ms(3000, |g| g.closed.clone()).await, (4001, "kicked".into()));
+    assert_eq!(ann.got().ctl.iter().find(|m| m["t"] == "kick").map(|m| m["msg"].clone()), Some(Value::from("Stop ramming")));
+    let ann = Browser::open_from(&host, port, "", None, None, Some("192.0.2.1")).await;
+    ann.text(&ann_hello("page-ann").to_string());
+    sleep(200).await;
+    assert!(ann.is_open(), "a kick is no ban");
+    // and on her phone, with the same keyphrase: one player called Ann
+    let phone = Browser::open_from(&host, port, "", None, None, Some("192.0.2.5")).await;
+    phone.text(&ann_hello("page-ann-phone").to_string());
+    sleep(200).await;
+
+    // a ban: the same, and turned away
+    let (ann_vip, phone_vip) = (nfsu2_util::vip_str(ann.vip), nfsu2_util::vip_str(phone.vip));
+    let ban = ctl(&state, &["ban", "Ann", "3d", "Ramming,", "3", "days"]);
+    assert_eq!(ban.0, 0, "{}", ban.1);
+    assert!(ban.1.starts_with("ban #1: \"Ann\" for 3 d (until "), "{}", ban.1);
+    assert!(ban.1.contains("by its 2 pages, its keyphrase and its 2 addresses\nremoved "), "{}", ban.1);
+    assert!(ban.1.contains(&format!("{ann_vip} \"Ann\"")) && ban.1.contains(&format!("{phone_vip} \"Ann\"")), "{}", ban.1);
+    assert_eq!(ann.until_ms(3000, |g| g.closed.clone()).await, (4003, "banned".into()));
+    assert_eq!(phone.until_ms(3000, |g| g.closed.clone()).await, (4003, "banned".into()));
+    let told = ann.got().ctl.iter().find(|m| m["t"] == "ban").cloned().expect("the ban's message");
+    assert_eq!(told["msg"], "Ramming, 3 days");
+    let until = told["until"].as_i64().unwrap() - nfsu2_util::now_ms();
+    assert!((3 * 86_400_000 - 10_000..=3 * 86_400_000).contains(&until), "{told}");
+    // by its address (another page): before it gets a place
+    let (got, closed) = turned_away(&host, port, "192.0.2.1", "page-other").await;
+    assert_eq!((kinds(&got), closed), (vec!["ban".to_string()], Some((4003, "banned".to_string()))));
+    // by its page at another address: at its hello, and that address is banned with it
+    let (got, closed) = turned_away(&host, port, "192.0.2.9", "page-ann").await;
+    assert_eq!((kinds(&got).last().cloned(), closed), (Some("ban".to_string()), Some((4003, "banned".to_string()))));
+    let (got, _) = turned_away(&host, port, "192.0.2.9", "page-new").await;
+    assert_eq!(kinds(&got), vec!["ban".to_string()], "the address the banned page came from");
+    // the phone's page, which the ban was made with too
+    let (got, _) = turned_away(&host, port, "192.0.2.10", "page-ann-phone").await;
+    assert_eq!(kinds(&got).last().cloned(), Some("ban".to_string()), "the phone's page");
+    // by its keyphrase in a new browser at another address: that page is taken in (for a month), and that address
+    let fresh = |id: &str, was: &[&str], key: bool| {
+        let mut h = serde_json::json!({ "t": "hello", "name": "Anna", "id": id, "was": was });
+        if key {
+            h["claim"] = ann_key.clone().into();
+        }
+        h
+    };
+    let banned = Some((4003, "banned".to_string()));
+    for (xff, hello, why) in [
+        ("192.0.2.20", fresh("page-fresh", &[], true), "its keyphrase in a new browser"),
+        ("192.0.2.30", fresh("page-fresh", &[], false), "that browser, without the keyphrase"),
+        ("192.0.2.40", fresh("page-cleared", &["page-ann"], false), "an earlier page id its page found"),
+        ("192.0.2.50", fresh("page-cleared", &[], false), "the page id that came with it"),
+    ] {
+        let (got, closed) = turned_away_hello(&host, port, xff, hello).await;
+        assert_eq!((kinds(&got).last().cloned(), &closed), (Some("ban".to_string()), &banned), "{why}");
+    }
+    // what was taken in brings in nothing more (a browser she used is maybe someone else's): not its addresses then,
+    // nor another player
+    for (xff, hello) in [("192.0.2.30", fresh("page-dan", &[], false)), ("192.0.2.60", fresh("page-cara", &["page-other"], false))] {
+        let (got, closed) = turned_away_hello(&host, port, xff, hello).await;
+        assert!(!kinds(&got).contains(&"ban".to_string()) && closed.is_none(), "{xff}: {got:?} {closed:?}");
+    }
+    sleep(100).await;
+    assert!(bob.is_open(), "Bob is left be");
+    assert!(ctl(&state, &["who", "bob"]).1.starts_with("1 on the switch called *bob*\n"));
+
+    let bans = ctl(&state, &["bans"]);
+    assert_eq!(bans.0, 0);
+    assert!(bans.1.starts_with("#1   \"Ann\""), "{}", bans.1);
+    // pages: hers and her phone's, then the fresh one and the cleared one; addresses: .1 .5 .9 .10 .20 .40
+    assert!(bans.1.ends_with(": \"Ramming, 3 days\"; by 4 pages (2 found later), 1 keyphrase, 6 addresses"), "{}", bans.1);
+    let file = std::fs::read_to_string(state.join("bans.json")).unwrap();
+    for secret in ["192.0.2", "page-", "ann-keyphrase"] {
+        assert!(!file.contains(secret), "{secret}: {file}");
+    }
+
+    // what cannot be done
+    assert_eq!(ctl(&state, &["kick", "Nobody"]), (1, "nobody called \"Nobody\" on the switch or in the last hour (who lists them)".into()));
+    assert_eq!(ctl(&state, &["kick", "Ann"]).0, 1, "Ann left");
+    assert!(ctl(&state, &["ban", "Bob", "3 days"]).1.contains("how long"));
+    assert_eq!(ctl(&state, &["unban", "#7"]), (1, "no ban #7 (bans lists them)".into()));
+    assert_eq!(ctl(&tmp.path().join("elsewhere"), &["who"]).0, 1);
+
+    // lifted: back in
+    assert_eq!(ctl(&state, &["unban", "ann"]), (0, "lifted #1 \"Ann\"".into()));
+    let ann = Browser::open_from(&host, port, "", None, None, Some("192.0.2.1")).await;
+    ann.text(&hello("Ann", "page-ann"));
+    sleep(200).await;
+    assert!(ann.is_open());
+    assert_eq!(ctl(&state, &["bans"]), (0, "no bans".into()));
+    assert_eq!(bob_vip, nfsu2_util::vip_str(bob.vip));
+
+    // by a [cheat] line's handle: the player it marked, on the switch now under another name
+    let racer = Browser::open_from(&host, port, "", None, None, Some("192.0.2.77")).await;
+    racer.text(&hello("Speedy", "page-racer"));
+    sleep(200).await;
+    let racer_vip = nfsu2_util::vip_str(racer.vip);
+    let ban = ctl(&state, &["ban", "c1", "1d", "Cheating"]);
+    assert!(ban.1.starts_with("ban #2: \"Racer\" (c1) for 1 d (until "), "{}", ban.1);
+    assert!(ban.1.ends_with(&format!("by its page\nremoved {racer_vip} \"Speedy\"")), "{}", ban.1);
+    assert_eq!(racer.until_ms(3000, |g| g.closed.clone()).await, (4003, "banned".into()));
+    assert!(bob.is_open());
+    assert_eq!(ctl(&state, &["ban", "c9", "1d"]), (1, "nobody called \"c9\" on the switch or in the last hour (who lists them)".into()));
+
+    assert_eq!(srv.stop().await, Some(0));
+    let lines = srv.lines();
+    assert!(lines.iter().any(|l| l.starts_with("[ban] kicked 10.77.") && l.ends_with("\"Ann\": \"Stop ramming\"")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.starts_with("[ban] #1 \"Ann\" for 3 d (until ")), "{lines:?}");
+    assert!(lines.iter().any(|l| l == "[ban] turned away a client of ban #1 \"Ann\" (its address)"), "{lines:?}");
+    assert!(lines.iter().any(|l| l == "[ban] turned away a client of ban #1 \"Ann\" (its page or keyphrase)"), "{lines:?}");
+    assert!(lines.iter().any(|l| l == "[ban] lifted #1 \"Ann\""), "{lines:?}");
+    assert!(lines.iter().any(|l| l.starts_with("[ban] #2 \"Racer\" (c1) for 1 d (until ")), "{lines:?}");
+    assert!(!lines.iter().any(|l| l.contains("192.0.2")), "no client address in the log: {lines:?}");
+}
+
+// The control socket's file (app/control.rs): a stale one, as a server that died without its stop leaves it, is
+// replaced at the start; a SIGTERM takes it away.  Of two servers on one state folder (the next one started before
+// the one before stops), the later one's socket stays when the earlier one stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_control_socket_goes_with_its_server() {
+    use std::os::unix::fs::FileTypeExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (data, wasm) = game_folder(tmp.path());
+    let state = tmp.path().join("state");
+    let sock = state.join("control.sock");
+    let socket_there = || std::fs::symlink_metadata(&sock).is_ok_and(|m| m.file_type().is_socket());
+    // a socket nobody listens on any more
+    std::fs::create_dir_all(&state).unwrap();
+    drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+    assert!(socket_there());
+    let port = free_port();
+    let mut srv = Server::spawn(command(&data, &wasm, port, &state, &[]), port);
+    srv.ready().await;
+    assert_eq!(ctl(&state, &["bans"]), (0, "no bans".into()), "the stale socket replaced: {:?}", srv.lines());
+    assert_eq!(srv.stop().await, Some(0));
+    assert!(std::fs::symlink_metadata(&sock).is_err(), "SIGTERM: no control.sock left behind");
+    assert_eq!(ctl(&state, &["bans"]).0, 1, "nobody there");
+
+    let (pa, pb) = (free_port(), free_port());
+    let mut a = Server::spawn(command(&data, &wasm, pa, &state, &[]), pa);
+    a.ready().await;
+    let mut b = Server::spawn(command(&data, &wasm, pb, &state, &[]), pb);
+    b.ready().await;
+    assert_eq!(a.stop().await, Some(0));
+    assert!(socket_there(), "the later server's socket stays");
+    assert_eq!(ctl(&state, &["bans"]), (0, "no bans".into()), "and answers");
+    assert_eq!(b.stop().await, Some(0));
+    assert!(std::fs::symlink_metadata(&sock).is_err(), "gone with the later server");
 }

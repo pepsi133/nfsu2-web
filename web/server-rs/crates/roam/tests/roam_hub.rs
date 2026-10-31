@@ -1,9 +1,8 @@
 //! Free roam's hub: which players it links, what it reads and sends.
 //! 1. the wire: what runtime/roam_core.c sends the hub (HELLO, SNAP, BYE, encoded by the C core built for wasm,
 //!    web/test/roam_hubwire.c) is what the hub reads, and the hub's PEERS lists decode in the C core;
-//! 2. the links: nearest first, both ends of a link list each other, at most 32 per player (7 for a core of version
-//!    1), rooms apart, stale positions out, links kept at the edge, BYE and departures forgotten, the limits per
-//!    address;
+//! 2. the links: nearest first, both ends of a link list each other, at most the degree (32) per player, rooms apart,
+//!    stale positions out, links kept at the edge, BYE and departures forgotten, the limits per address;
 //! 3. the hub on its thread, without the switch: frames posted reach the hub, its lists go out through the switch's
 //!    send, a departure is forgotten (the hub on the switch itself is the server's tests/roam_switch.rs).
 
@@ -87,12 +86,20 @@ fn the_wire_what_roam_core_sends_the_hub_reads_and_its_peers_lists_decode_in_roa
         String::from_utf8_lossy(&o.stdout).trim().to_string()
     };
     let (h, s, b) = (unhex(&run(&["hello"])), unhex(&run(&["snap"])), unhex(&run(&["bye"])));
+    // the C core's version (roam_core.h RC_CORE_VER), which its HELLO says
+    let hdr = std::fs::read_to_string(repo().join("runtime/roam_core.h")).expect("roam_core.h");
+    let core: u16 = hdr
+        .lines()
+        .find_map(|l| l.strip_prefix("#define RC_CORE_VER"))
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|v| v.parse().ok())
+        .expect("RC_CORE_VER");
     assert_eq!(
         decode_roam(&h),
-        Some(RoamMsg::Hello { sender: 0x1234ABCD, core: 5, status: 2, room: fnv1a("blue"), name: "Ann K.".into() })
+        Some(RoamMsg::Hello { sender: 0x1234ABCD, core, status: 2, room: fnv1a("blue"), name: "Ann K.".into(), crews: vec![] })
     );
     assert_eq!(
-        hello_with(0x1234ABCD, &HelloOpts { room: fnv1a("blue"), name: b"Ann K.", seen: &[0x11, 0x22], core: 5, ..Default::default() }),
+        hello_with(0x1234ABCD, &HelloOpts { room: fnv1a("blue"), name: b"Ann K.", seen: &[0x11, 0x22], core, ..Default::default() }),
         h,
         "this test's HELLO = the C core's, byte for byte"
     );
@@ -112,6 +119,113 @@ fn the_wire_what_roam_core_sends_the_hub_reads_and_its_peers_lists_decode_in_roa
     );
     assert_eq!(run(&["peers", &hex(&peers)]), format!("ok 2 10.77.0.5:47210:3 10.77.0.6:47300:{}", 0xDEADBEEFu32));
     assert_eq!(run(&["peers", &hex(&encode_peers(0xB0B, 10, &[]))]), "ok 0", "an empty list (the hub is there)");
+}
+
+/// web/test/roam_hubwire.c with roam_core.c, built for wasm into `file` (each test its own: they run at once), and
+/// the way to run it under node, its output trimmed; None without a wasi-sdk in deps/ or node (the test is skipped)
+fn hubwire(file: &str) -> Option<impl Fn(&[&str]) -> String> {
+    let wasi = std::fs::read_dir(repo().join("deps")).ok().and_then(|d| {
+        let mut v: Vec<PathBuf> =
+            d.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("wasi-sdk-")).map(|e| e.path()).collect();
+        v.sort();
+        v.pop()
+    });
+    let Some(wasi) = wasi.filter(|_| have_node()) else {
+        eprintln!("no wasi-sdk in deps/, or no node: skipped");
+        return None;
+    };
+    let w = Path::new(env!("CARGO_TARGET_TMPDIR")).join(file);
+    let out = Command::new(wasi.join("bin/clang"))
+        .current_dir(repo())
+        .args(["--target=wasm32-wasip1-threads", "-pthread", "-O2", "-ffp-contract=off", "-Iruntime", "-o"])
+        .arg(&w)
+        .args(["web/test/roam_hubwire.c", "runtime/roam_core.c"])
+        .arg("-Wl,--import-memory,--export-memory,--shared-memory,--initial-memory=67108864,--max-memory=268435456")
+        .output()
+        .expect("clang");
+    assert!(out.status.success(), "clang: {}", String::from_utf8_lossy(&out.stderr));
+    Some(move |args: &[&str]| {
+        let o = Command::new("node").arg(repo().join("web/test/wasi-run.mjs")).arg(&w).args(args).output().expect("node");
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    })
+}
+
+// the wire: a session's HELLO to the hub as roam_core makes it (rc_tick's, fill_hello: the ids of the two players the
+// hub listed, who said hello, then its two crews from its config) names its crews; they are the room hashes the page
+// makes (players.ts roomHash, players.test.mjs's 0x160fba32 for "Blue Room") and this test's; the hub links that
+// player in a crowd with a crew-mate 2 km off (a HELLO made here) first, and not one of another crew
+#[test]
+fn the_wire_a_sessions_hello_to_the_hub_names_its_crews() {
+    let Some(run) = hubwire("roam_hubwire_crew.wasm") else { return };
+    let h = unhex(&run(&["hellocrew"]));
+    let (blue, owls) = (room_hash("Blue Room"), room_hash("Night Owls"));
+    // capitals and blanks do not count, a name of blanks is none
+    assert_eq!([blue, room_hash("blueroom"), room_hash(" Blue Room\t"), room_hash("BLUE ROOM")], [0x160F_BA32; 4]);
+    assert_eq!((room_hash("night owls"), fnv1a("nightowls")), (owls, owls));
+    assert_eq!((room_hash(""), room_hash(" \t\r\n")), (0, 0));
+    // the crew flag, the ids it hears (the hub's list), then its crews
+    assert!(h.len() > 30 && u16::from_le_bytes([h[14], h[15]]) & HF_CREW != 0, "the crew flag: {}", hex(&h));
+    let nl = h[28] as usize;
+    let at = |o: usize| u32::from_le_bytes(h[o..o + 4].try_into().unwrap());
+    let ids: Vec<u32> = (0..h[29 + nl] as usize).map(|k| at(30 + nl + 4 * k)).collect();
+    assert_eq!(ids, [0x11, 0x22], "the ids it hears: {}", hex(&h));
+    match decode_roam(&h) {
+        Some(RoamMsg::Hello { sender, status, crews, .. }) => assert_eq!((sender, status, crews), (0x1234ABCD, 2, vec![blue, owls])),
+        other => panic!("not its HELLO: {other:?} ({})", hex(&h)),
+    }
+    // that player (V(0)) in a crowd of 60 within 15 m, and V(61) 2 km off in "Night Owls" or in "Red"
+    for (crew, want) in [(owls, true), (room_hash("Red"), false)] {
+        let mut k = Kit::new(RoamOptions { view_m: 1e-9, ..RoamOptions::default() });
+        k.from(V(0), &h);
+        k.from(V(0), &snap(0x1234ABCD, [0.25, 0.25, 0.0]));
+        for i in 1..=60u32 {
+            k.from(V(i), &hello_with(100 + i, &HelloOpts { core: 6, ..Default::default() }));
+            k.from(V(i), &snap(100 + i, [((i - 1) % 8) as f64 * 3.0 - 9.25, ((i - 1) / 8) as f64 * 3.0 - 9.25, 0.0]));
+        }
+        k.from(V(61), &hello_with(161, &HelloOpts { core: 6, crews: Some(&[crew]), ..Default::default() }));
+        k.from(V(61), &snap(161, [2000.25, 0.25, 0.0]));
+        k.hub.tick();
+        let l = Lists(k.lists());
+        l.both_ends();
+        assert_eq!((l.has(0, 61), l.of(0).len()), (want, 32), "crew {crew:#x}: the crew-mate linked, the links full");
+        assert_eq!(k.info("crewLinks"), if want { 1.0 } else { 0.0 });
+        assert_eq!(k.hub.in_crews(&[blue, owls]), [1, 1 + want as usize]);
+    }
+}
+
+// the hub's crew marks as the C core takes them: a session's own HELLO and four players near it, in its "Night Owls", in "Red", in its "Blue Room", in none; the list the hub makes for it,
+// given to a session in those two crews, colours each player as the hub marked it (rc_peer_crew), and names no crew but
+// the session's own
+#[test]
+fn the_wire_the_hubs_crew_marks_colour_a_sessions_peers() {
+    let Some(run) = hubwire("roam_hubwire_marks.wasm") else { return };
+    let h = unhex(&run(&["hellocrew"]));
+    let (blue, owls, red) = (room_hash("Blue Room"), room_hash("Night Owls"), room_hash("Red"));
+    let mut k = Kit::new(RoamOptions { view_m: 1e-9, ..RoamOptions::default() });
+    k.from(V(0), &h);
+    k.from(V(0), &snap(0x1234ABCD, [0.25, 0.25, 0.0]));
+    let who: [Option<&[u32]>; 4] = [Some(&[owls]), Some(&[red]), Some(&[red, blue]), None];
+    for (i, crews) in who.iter().enumerate() {
+        let i = i as u32 + 1;
+        k.from(V(i), &hello_with(100 + i, &HelloOpts { crews: *crews, ..Default::default() }));
+        k.from(V(i), &snap(100 + i, [i as f64 * 10.0 + 0.25, 0.25, 0.0]));
+    }
+    k.hub.tick();
+    let f = k.sent.lock().iter().find(|(vip, _)| *vip == V(0)).map(|(_, f)| f.clone()).expect("the session's list");
+    assert_eq!(crew_marks(&f).map(|m| m.0), Some(vec![blue, owls]), "its own crews, and no other: {}", hex(&f[16..]));
+    let want = |e: &PeerEntry| match (0..4).find(|&i| V(i + 1) == e.vip) {
+        Some(0) => 1,
+        Some(2) => 0,
+        _ => -1,
+    };
+    let list = peers_of(&f);
+    assert_eq!(list.len(), 4);
+    let expect: Vec<String> = list
+        .iter()
+        .map(|e| format!("{}.{}.{}.{}:{}:{}", e.vip >> 24, e.vip >> 16 & 255, e.vip >> 8 & 255, e.vip & 255, e.port, want(e)))
+        .collect();
+    assert_eq!(run(&["hubcrew", &hex(&f[16..])]), format!("ok {}", expect.join(" ")), "the session's crews by the hub's marks");
+    assert!(!f.windows(4).any(|b| b == red.to_le_bytes()), "no crew of another player's on its list");
 }
 
 /// the lists by player i (10.77.0.(10 + i), port 47210)
@@ -137,12 +251,12 @@ impl Lists {
     }
 }
 
-// links of players of core version 1 (every pair | the grid): the nearest, both ends, at most 7 a player, only in
-// free roam lately, rooms apart
+// links at a degree of 7 (every pair | the grid): the nearest, both ends, at most 7 a player, only in free roam
+// lately, rooms apart
 #[test]
-fn links_of_players_of_core_version_1_the_nearest_both_ends_at_most_7_only_in_free_roam_lately_rooms_apart() {
+fn links_the_nearest_both_ends_at_most_the_degree_only_in_free_roam_lately_rooms_apart() {
     for (how, o) in ways() {
-        let mut k = Kit::new(o);
+        let mut k = Kit::new(RoamOptions { degree: 7, ..o });
         // 20 players on a line 10 m apart, one far away, two in another room, one with no position yet
         for i in 0..20 {
             k.from(V(i), &hello(100 + i));
@@ -201,32 +315,30 @@ fn links_of_players_of_core_version_1_the_nearest_both_ends_at_most_7_only_in_fr
     }
 }
 
-// links of players of core version 2 (every pair | the grid): at most 32 a player, 7 for one of version 1 among them
+// links at the default degree (every pair | the grid): at most 32 a player
 #[test]
-fn links_of_players_of_core_version_2_at_most_32_a_player_7_for_one_of_version_1_among_them() {
+fn links_at_most_32_a_player() {
     for (how, o) in ways() {
         let mut k = Kit::new(o);
-        // 50 players on a line 10 m apart, player 15 of core version 1
+        // 50 players on a line 10 m apart
         for i in 0..50 {
-            k.from(V(i), &hello_with(100 + i, &HelloOpts { core: if i == 15 { 1 } else { 2 }, ..Default::default() }));
+            k.from(V(i), &hello(100 + i));
             k.from(V(i), &snap(100 + i, [i as f64 * 10.0, 0.0, 0.0]));
         }
         k.hub.tick();
         let l = Lists(k.lists());
-        let deg = |i: u32| if i == 15 { 7 } else { 32 };
         for i in 0..50 {
-            assert!(l.of(i).len() <= deg(i), "{how}: player {i}: at most {} ({})", deg(i), l.of(i).len());
+            assert!(l.of(i).len() <= 32, "{how}: player {i}: at most 32 ({})", l.of(i).len());
         }
         l.both_ends();
-        assert_eq!(l.of(15).len(), 7, "{how}: the version 1 player: 7, as its group of 8 holds");
         for i in 0..50 {
             for j in 0..50 {
-                if i != j && l.of(i).len() < deg(i) && l.of(j).len() < deg(j) {
+                if i != j && l.of(i).len() < 32 && l.of(j).len() < 32 {
                     assert!(l.has(i, j), "{how}: {i} and {j} both have room, so they are linked");
                 }
             }
         }
-        assert!(l.of(25).len() > 16, "{how}: more than 16 for a player of version 2 ({})", l.of(25).len());
+        assert!(l.of(25).len() > 16, "{how}: more than 16 ({})", l.of(25).len());
     }
 }
 
@@ -326,6 +438,22 @@ fn in_free_roam_driving_or_paused_each_browser_once() {
     assert_eq!(k.hub.in_roam(), 1, "left the switch");
 }
 
+// /players' room: in free roam by room, for the rooms with a name (room 0, none, is not counted), each browser once
+#[test]
+fn in_free_roam_by_room() {
+    let mut k = Kit::new(RoamOptions::default());
+    let (blue, red) = (fnv1a("blue"), fnv1a("red"));
+    k.from(V(1), &hello_with(601, &HelloOpts { room: blue, ..Default::default() }));
+    k.from(V(2), &hello_with(602, &HelloOpts { room: blue, status: 5, ..Default::default() }));
+    k.from(V(3), &hello_with(603, &HelloOpts { room: blue, status: 3, ..Default::default() }));
+    k.from(V(4), &hello_with(604, &HelloOpts { room: red, ..Default::default() }));
+    k.from(V(5), &hello(605));
+    k.hub.frame(V(1), &frame_ports(V(1), &hello_with(606, &HelloOpts { room: blue, ..Default::default() }), 47211, 47210));
+    let rooms = k.hub.in_rooms();
+    assert_eq!((rooms.get(&blue), rooms.get(&red), rooms.len()), (Some(&2), Some(&1), 2), "driving or paused, a browser once: {rooms:?}");
+    assert_eq!(k.hub.in_roam(), 4);
+}
+
 // a player that comes and goes, HELLO and BYE over and over (a client may send the hub 2500 frames a second), costs the
 // hub little: a player gone is taken out of the others' links once in a while, for many at once, not with every BYE
 // (each walked every player's links: 2000 players' 64,000)
@@ -335,7 +463,7 @@ fn a_player_that_comes_and_goes_costs_the_hub_little() {
     let v = |i: u32| 0x0A4D_0100 + i;
     let crowd = |k: &mut Kit| {
         for i in 0..2000u32 {
-            k.from(v(i), &hello_with(1000 + i, &HelloOpts { core: 2, ..Default::default() }));
+            k.from(v(i), &hello(1000 + i));
             k.from(v(i), &snap(1000 + i, [(i % 50) as f64 * 20.0, (i / 50) as f64 * 20.0, 0.0]));
         }
     };
@@ -353,7 +481,7 @@ fn a_player_that_comes_and_goes_costs_the_hub_little() {
         if n % 7 == 3 {
             // links of the crowd's own come and go too: Ann of the crowd leaves and is back at once
             k.from(v(n % 2000), &bye(1000 + n % 2000));
-            k.from(v(n % 2000), &hello_with(1000 + n % 2000, &HelloOpts { core: 2, ..Default::default() }));
+            k.from(v(n % 2000), &hello(1000 + n % 2000));
         }
         k.hub.frame(x, &frame_ports(x, &bye(50_000 + n), port, 47210));
     }
@@ -374,15 +502,14 @@ fn a_player_that_comes_and_goes_costs_the_hub_little() {
     assert!(k.info("links") > 30_000.0);
 }
 
-// 64 players of core version 1|2 in one place: each list at most 7|32, the tick stays cheap
+// 64 players in one place, at a degree of 7 | 32: each list at most that, the tick stays cheap
 #[test]
 fn sixty_four_players_in_one_place_each_list_at_most_its_degree_the_tick_stays_cheap() {
-    for core in [1u16, 2] {
-        let mut k = Kit::new(RoamOptions::default());
-        let most = if core == 1 { 7 } else { 32 };
+    for most in [7, 32] {
+        let mut k = Kit::new(RoamOptions { degree: most, ..RoamOptions::default() });
         for i in 0..64u32 {
             let v = ip(&format!("10.77.0.{}", 2 + i));
-            k.from(v, &hello_with(400 + i, &HelloOpts { core, ..Default::default() }));
+            k.from(v, &hello(400 + i));
             k.from(v, &snap(400 + i, [(i as f64).cos() * 30.0, (i as f64).sin() * 30.0, 0.0]));
         }
         for _ in 0..20 {
@@ -392,7 +519,7 @@ fn sixty_four_players_in_one_place_each_list_at_most_its_degree_the_tick_stays_c
         let l = lists(&sent[sent.len() - 64..]);
         let n: Vec<usize> = l.values().map(|l| l.len()).collect();
         assert!(n.iter().all(|&x| x <= most) && n.iter().filter(|&&x| x == most).count() >= 60, "lists of {most} ({n:?})");
-        println!("64 players of core version {core}: {} links, tick at most {:.2} ms", k.info("links"), k.info("tickMsMax"));
+        println!("64 players at a degree of {most}: {} links, tick at most {:.2} ms", k.info("links"), k.info("tickMsMax"));
         assert!(k.info("tickMsMax") < 50.0);
     }
 }
@@ -423,7 +550,7 @@ fn a_panic_in_a_tick_leaves_a_hub_that_goes_on() {
         let v = |i: u32| 0x0A4D_0100 + i;
         for tick in 0..4 {
             for i in 0..100u32 {
-                hub.frame(v(i), &frame(v(i), &hello_with(1000 + i, &HelloOpts { core: 2, ..Default::default() })));
+                hub.frame(v(i), &frame(v(i), &hello(1000 + i)));
                 hub.frame(v(i), &frame(v(i), &snap(1000 + i, [(i % 10) as f64 * 15.0, (i / 10) as f64 * 15.0, 0.0])));
             }
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hub.tick()));
@@ -454,10 +581,11 @@ fn a_panic_in_a_tick_leaves_a_hub_that_goes_on() {
 // every list of its tick (2000 players' lists were one buffer of 700 KB, kept whole for as long as any of them waited)
 #[test]
 fn a_list_waiting_holds_little() {
-    let mut k = Kit::new(RoamOptions::default());
+    // (the lattice's links by distance alone: player 7 has 32)
+    let mut k = Kit::new(ways()[0].1.clone());
     for i in 0..300u32 {
         let v = 0x0A4D_0100 + i;
-        k.from(v, &hello_with(1000 + i, &HelloOpts { core: 2, ..Default::default() }));
+        k.from(v, &hello(1000 + i));
         k.from(v, &snap(1000 + i, [(i % 20) as f64 * 10.0, (i / 20) as f64 * 10.0, 0.0]));
     }
     k.hub.tick();
@@ -482,7 +610,7 @@ fn a_busy_server_every_player_gets_fewer_links_and_more_again_once_it_has_room()
             k.clear();
             for i in 0..40u32 {
                 let v = ip(&format!("10.77.0.{}", 2 + i));
-                k.from(v, &hello_with(500 + i, &HelloOpts { core: 2, ..Default::default() }));
+                k.from(v, &hello(500 + i));
                 k.from(v, &snap(500 + i, [(i as f64).cos() * 30.0, (i as f64).sin() * 30.0, 0.0]));
             }
             k.hub.tick();
@@ -539,7 +667,7 @@ fn a_busy_server_every_player_gets_fewer_links_and_more_again_once_it_has_room()
 }
 
 // 600 players in a city | a district | a crowd: the grid links as every pair does: a room larger than `exact_room`,
-// the grid's links against every pair's, for the same players (some of core version 1; two rooms; a few far out):
+// the grid's links against every pair's, for the same players (two rooms; a few far out):
 // the same rules (at most the degree, both ends, no two with room left unlinked) and about the same distances
 #[test]
 fn six_hundred_players_the_grid_links_as_every_pair_does() {
@@ -552,7 +680,6 @@ fn six_hundred_players_the_grid_links_as_every_pair_does() {
         struct Q {
             v: u32,
             id: u32,
-            core: u16,
             room: u32,
             p: [f64; 3],
         }
@@ -560,7 +687,6 @@ fn six_hundred_players_the_grid_links_as_every_pair_does() {
             .map(|i| Q {
                 v: ip(&format!("10.77.{}.{}", i & 7, 2 + (i >> 3))),
                 id: 700 + i,
-                core: if i % 50 == 7 { 1 } else { 2 },
                 room: if i % 10 == 3 { fnv1a("red") } else { 0 },
                 p: if i % 97 == 5 {
                     [15000.0 - i as f64, -15000.0, 0.0]
@@ -576,7 +702,7 @@ fn six_hundred_players_the_grid_links_as_every_pair_does() {
             for _ in 0..3 {
                 k.clear();
                 for q in &players {
-                    k.from(q.v, &hello_with(q.id, &HelloOpts { core: q.core, room: q.room, ..Default::default() }));
+                    k.from(q.v, &hello_with(q.id, &HelloOpts { room: q.room, ..Default::default() }));
                     k.from(q.v, &snap(q.id, q.p));
                 }
                 k.hub.tick();
@@ -591,9 +717,8 @@ fn six_hundred_players_the_grid_links_as_every_pair_does() {
         let sum = |l: &Lists| {
             let (mut n, mut m) = (0usize, 0.0);
             for q in &players {
-                let most = if q.core == 1 { 7 } else { 32 };
                 let lq = l.of_vip(q.v);
-                assert!(lq.len() <= most, "at most {most} ({})", lq.len());
+                assert!(lq.len() <= 32, "at most 32 ({})", lq.len());
                 for e in lq {
                     assert!(l.of_vip(e.vip).iter().any(|x| x.vip == q.v), "both ends");
                     assert_eq!(at[&e.vip].room, q.room, "one room");
@@ -601,7 +726,7 @@ fn six_hundred_players_the_grid_links_as_every_pair_does() {
                     m += d(q, at[&e.vip]);
                 }
             }
-            let open: Vec<&Q> = players.iter().filter(|q| l.of_vip(q.v).len() < if q.core == 1 { 7 } else { 32 }).collect();
+            let open: Vec<&Q> = players.iter().filter(|q| l.of_vip(q.v).len() < 32).collect();
             for a in &open {
                 for b in &open {
                     if a.v != b.v && a.room == b.room {
@@ -625,7 +750,7 @@ fn six_hundred_players_the_grid_links_as_every_pair_does() {
 // back, a departure is forgotten') ----
 
 fn ctx() -> FrameCtx {
-    FrameCtx { group: Arc::from("client"), site: None, cause: None, slot: None }
+    FrameCtx { group: Arc::from("client"), site: None, cause: None, slot: None, owner: None }
 }
 
 fn wait_for(what: &str, mut f: impl FnMut() -> bool) {

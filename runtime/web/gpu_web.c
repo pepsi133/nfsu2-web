@@ -25,6 +25,7 @@
 #include "host_abi.h"
 #include "gpu_proto.h"
 #include "wgsl.h"
+#include "texrep.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +39,8 @@
 void guest_wait_begin(void);     /* win32_ext.c: release the guest lock around a host wait */
 void guest_wait_end(void);
 int  hfr_mailbox(void);          /* framerate.c */
+int  hfr_display_live(void);
+double hfr_frame_input_ms(void);
 void hfr_note_vsync(double ts, double dur);
 
 /* ---- shared-memory waits (wasm atomics on the shared linear memory) ---- */
@@ -64,8 +67,12 @@ static int      g_detached;      /* the page never attached: dropped back to nul
 #define MAXKB  ( 4u * 1024u * 1024u)        /* VS constant arena (bytes) */
 #define RQ_CAP (64u * 1024u * 1024u)        /* resource queue ring (bytes, power of two) */
 #define KZERO  256u                         /* K arena bytes [0, 256): an all-zero block for TVert draws (base 0) */
-#define KFIRST 1024u                        /* [GW_K_HL, + GW_HL_BYTES): the frame's headlights; the draws' blocks from here */
-_Static_assert(GW_K_HL >= KZERO && GW_K_HL + GW_HL_BYTES <= KFIRST, "K arena");
+#define KFIRST 2048u                        /* [GW_K_HL, + GW_HL_BYTES): the frame's headlights; [GW_K_MARKS, + GW_MARKS_BYTES):
+                                               quick chat's places; [GW_K_TONE, + GW_TONE_BYTES): Exposure and
+                                               White Level; [GW_K_LAT, + GW_LAT_BYTES): input age; the draws'
+                                               blocks from here */
+_Static_assert(GW_K_HL >= KZERO && GW_K_HL + GW_HL_BYTES <= KFIRST && GW_K_MARKS + GW_MARKS_BYTES <= KFIRST
+               && GW_K_TONE + GW_TONE_BYTES <= KFIRST && GW_K_LAT + GW_LAT_BYTES <= KFIRST, "K arena");
 
 typedef struct {
     GwDraw  *d;  unsigned dn;
@@ -124,7 +131,10 @@ static void gw_init(void){
             B->rv = zalloc(MAXRV); B->kb = zalloc(MAXKB + 4096); B->psc = zalloc(sizeof *B->psc * MAXD);
             if (!B->d || !B->v || !B->rv || !B->kb || !B->psc) ok = 0;
         }
-        for (int b = 0; b < GW_NBUF; b++) g_b[b].kn = KFIRST;
+        for (int b = 0; b < GW_NBUF; b++){
+            g_b[b].kn = KFIRST;
+            if (g_b[b].kb) ((GwMarks *)(g_b[b].kb + GW_K_MARKS))->magic = GW_MARKS_MAGIC;
+        }
         uint8_t *rq = zalloc(RQ_CAP);
         if (!rq) ok = 0;
         if (!ok){ fprintf(stderr, "[gpu] out of memory for the record buffers: no rendering\n"); want = 0; }
@@ -234,9 +244,10 @@ static void rq_commit(GwCmd *c){
  * Ids, sizes and formats live here (com.c reads them back synchronously);
  * the GPU textures live on the page.  Freed ids are reused three guest
  * frames later, as on the Mac: frames recorded before the Release may still
- * name the id. */
+ * name the id.  pack: a texture pack's texture stands in for the game's
+ * (metal_replace_texture), whose own uploads are dropped from then on. */
 #define MAXTEX 16384
-static struct { uint16_t w, h; uint8_t levels, cube, rt, live; uint32_t fmt, lvlmask; } g_tex[MAXTEX];
+static struct { uint16_t w, h; uint8_t levels, cube, rt, live, pack; uint32_t fmt, lvlmask; } g_tex[MAXTEX];
 static unsigned g_texn = 1;
 static unsigned g_tfree[MAXTEX], g_ntfree = 0;
 #define TFQ 16384
@@ -272,7 +283,7 @@ static unsigned tex_new(unsigned w, unsigned h, unsigned levels, unsigned f, uns
     if (!id) return 0;
     if (!levels) levels = 1;
     g_tex[id].w = (uint16_t)w; g_tex[id].h = (uint16_t)h; g_tex[id].levels = (uint8_t)(levels > 255 ? 255 : levels);
-    g_tex[id].cube = cube ? 1 : 0; g_tex[id].rt = rt ? 1 : 0; g_tex[id].live = 1;
+    g_tex[id].cube = cube ? 1 : 0; g_tex[id].rt = rt ? 1 : 0; g_tex[id].live = 1; g_tex[id].pack = 0;
     g_tex[id].fmt = f; g_tex[id].lvlmask = 0;
     g_tex_created++;
     GwCmd *c = rq_begin(GW_TEX_CREATE, 0);
@@ -310,6 +321,7 @@ static void tex_free_due(int now){
         g_tfq_h = (g_tfq_h + 1) % TFQ; g_tfq_n--;
         if (!g_tex[id].live) continue;
         g_tex[id].live = 0; g_tex_released++;
+        texrep_released(id);
         GwCmd *c = rq_begin(GW_TEX_FREE, 0);
         if (c){ c->a[0] = id; rq_commit(c); }
         g_tfree[g_ntfree++] = id;
@@ -321,9 +333,8 @@ long metal_tex_uploaded(void){ return g_tex_uploaded; }
 
 /* UnlockRect: the whole level, copied now (the lock buffer is rewritten at
  * the next Lock and freed at Release). */
-void metal_upload_texture_face(unsigned id, unsigned level, unsigned face, const void *data,
-                               unsigned pitch, unsigned w, unsigned h, unsigned f){
-    if (!id || id >= MAXTEX || !g_tex[id].live || !data) return;
+static void tex_upload(unsigned id, unsigned level, unsigned face, const void *data,
+                       unsigned pitch, unsigned w, unsigned h, unsigned f){
     unsigned bpb, blk = fmt_blk(f, &bpb);
     if (!blk || level >= g_tex[id].levels) return;
     unsigned lw = w >> level, lh = h >> level; if (!lw) lw = 1; if (!lh) lh = 1;
@@ -339,6 +350,29 @@ void metal_upload_texture_face(unsigned id, unsigned level, unsigned face, const
     c->a[0] = id; c->a[1] = level | (face << 16); c->a[2] = lw; c->a[3] = lh; c->a[4] = pitch; c->a[5] = rows;
     memcpy((uint8_t *)c + GW_CMD_HDR, data, bytes);
     rq_commit(c);
+}
+void metal_upload_texture_face(unsigned id, unsigned level, unsigned face, const void *data,
+                               unsigned pitch, unsigned w, unsigned h, unsigned f){
+    if (!id || id >= MAXTEX || !g_tex[id].live || !data || g_tex[id].pack) return;
+    tex_upload(id, level, face, data, pitch, w, h, f);
+}
+/* texrep_web.c: the texture becomes a pack's, w x h in format f with the
+ * levels in data (level 0 first, each metal_level_pitch x metal_level_rows);
+ * the game's own uploads to it are dropped from then on.  data NULL makes it
+ * the game's again, empty, at the size given (the game's), for its uploads. */
+void metal_replace_texture(unsigned id, unsigned w, unsigned h, unsigned levels, unsigned f, const uint8_t *data){
+    unsigned bpb;
+    if (!id || id >= MAXTEX || !g_tex[id].live || g_tex[id].rt || g_tex[id].cube || !fmt_blk(f, &bpb)) return;
+    if (!levels) levels = 1;
+    g_tex[id].w = (uint16_t)w; g_tex[id].h = (uint16_t)h; g_tex[id].levels = (uint8_t)(levels > 255 ? 255 : levels);
+    g_tex[id].fmt = f; g_tex[id].lvlmask = 0; g_tex[id].pack = data != NULL;
+    GwCmd *c = rq_begin(GW_TEX_CREATE, 0);        /* the page frees the old one first */
+    if (c){ c->a[0] = id; c->a[1] = w; c->a[2] = h; c->a[3] = levels; c->a[4] = f; c->a[5] = 0; rq_commit(c); }
+    for (unsigned l = 0; data && l < levels; l++){
+        unsigned pitch = metal_level_pitch(w, l, f);
+        tex_upload(id, l, 0u, data, pitch, w, h, f);
+        data += (size_t)pitch * metal_level_rows(h, l, f);
+    }
 }
 void metal_upload_texture(unsigned id, unsigned level, const void *data, unsigned pitch, unsigned w, unsigned h, unsigned f){
     metal_upload_texture_face(id, level, 0u, data, pitch, w, h, f);
@@ -704,15 +738,22 @@ int metal_draw_ix(unsigned vbo, unsigned stride, unsigned ibo, unsigned isz, uns
 }
 void metal_raw_overflow(unsigned *rv, unsigned *kb){ if (rv) *rv = g_ov_rv; if (kb) *kb = g_ov_kb; }
 
-/* StretchRect: an ordered record (whole source to whole destination). */
-void metal_blit(unsigned src, unsigned dst){
+/* StretchRect: an ordered record, the whole source (or r: left, top, right,
+ * bottom in source pixels) to the whole destination. */
+void metal_blit_rect(unsigned src, unsigned dst, const int *r){
     if (!g_on) return;
     Buf *B = &g_b[g_cur];
     if (B->dn >= MAXD){ g_ov_d++; return; }
     GwDraw *D = &B->d[B->dn++];
     memset(D, 0, sizeof *D);
     D->kind = GW_BLIT; D->target = dst; D->blit_src = src;
+    if (r){
+        uint32_t q[4];
+        for (int i = 0; i < 4; i++) q[i] = r[i] < 0 ? 0u : r[i] > 0xFFFF ? 0xFFFFu : (uint32_t)r[i];
+        if (q[2] > q[0] && q[3] > q[1]){ D->first = q[0] | q[1] << 16; D->count = q[2] | q[3] << 16; }
+    }
 }
+void metal_blit(unsigned src, unsigned dst){ metal_blit_rect(src, dst, NULL); }
 void metal_clear_target_ex(unsigned argb, unsigned flags, float z){
     if (!g_on) return;
     Buf *B = &g_b[g_cur];
@@ -815,32 +856,44 @@ static void vsync_feed(void){
 }
 
 /* ---- present --------------------------------------------------------------
- * Hand the buffer just recorded to the page and switch to the other one.
- * As on the Mac: wait (guest lock released) while the previous frame has not
- * been taken; a frame the page has not started to encode is replaced in
- * mailbox mode, or after 60 ms when the page is not encoding at all (a hidden
- * tab).  A frame being encoded is always waited for: its buffer is the one
- * the game would write next. */
+ * handoff(): the buffer just recorded goes to the page, and recording moves
+ * to the other one.  As on the Mac: wait (guest lock released) while the
+ * previous frame has not been taken; a frame the page has not started to
+ * encode is replaced in mailbox mode, or after 60 ms when the page is not
+ * encoding at all (a hidden tab).  A frame being encoded is always waited
+ * for: its buffer is the one the game would write next. */
 /* runtime/headlights.c: the other cars' headlights for the frame being recorded */
 void gw_headlights(const GwHL *blk){
     if (!g_on || !blk) return;
     memcpy(g_b[g_cur].kb + GW_K_HL, blk, sizeof *blk);
 }
+/* roam_game.c (through roam_web.c): quick chat's places over the cars for the frame being recorded */
+void gw_marks(const GwMark *m, int n){
+    if (!g_on) return;
+    GwMarks *k = (GwMarks *)(g_b[g_cur].kb + GW_K_MARKS);
+    if (n > GW_MARKS_MAX) n = GW_MARKS_MAX;
+    if (n > 0) memcpy(k->m, m, sizeof *m * (size_t)n);
+    k->n = n > 0 ? (uint32_t)n : 0;
+}
+/* tonemenu.c: Exposure (as a multiplier) and White Level for every frame from the next handed over */
+static GwTone g_tone = { GW_TONE_MAGIC, 1.f, 1.f, 1.f };
+void gw_tone(float mult, float white, float knee){ g_tone.mult = mult; g_tone.white = white; g_tone.knee = knee; }
 void metal_request_dump(long guest_frame, const char *label){
     snprintf(g_dump_label, sizeof g_dump_label, "%s", label ? label : "dump");
     for (char *q = g_dump_label; *q; q++) if (*q == '/' || *q == ' ' || *q == '\\') *q = '_';
     g_dump_req = guest_frame;
 }
-void metal_present(void){
-    gw_init();
-    g_presents++;
-    if (g_on) gw_attached();          /* the first present waits for the page; a detach ends recording */
-    if (!g_on){ g_gframe++; tex_free_due(0); return; }
+static uint32_t g_rb_n = 0;       /* textures read back (metal_read_texture) */
+static int      g_handed = 0;     /* the frame being recorded went to the page early, with a readback */
+static void handoff(uint32_t rb_id, uint32_t rb_tex, uint32_t rb_dst, uint32_t rb_pitch, uint32_t rb_rows){
     Buf *B = &g_b[g_cur];
     GwFrame *F = &g_ctl->frame[g_cur];
     F->seq = g_gframe; F->dn = B->dn; F->vn = B->vn; F->rvn = B->rvn; F->kn = B->kn; F->pscn = B->pscn;
     F->draws = (uint32_t)(uintptr_t)B->d; F->tv = (uint32_t)(uintptr_t)B->v; F->raw = (uint32_t)(uintptr_t)B->rv;
     F->k = (uint32_t)(uintptr_t)B->kb; F->psc = (uint32_t)(uintptr_t)B->psc;
+    memcpy(B->kb + GW_K_TONE, &g_tone, sizeof g_tone);
+    { GwLat *L = (GwLat *)(B->kb + GW_K_LAT);
+      L->magic = GW_LAT_MAGIC; L->input_ms = hfr_frame_input_ms(); L->handoff_ms = now_ms(); }
     F->rq_end = (uint32_t)g_ctl->rq_head;
     unsigned vw, vh; view_wh(&vw, &vh);
     F->bb_w = g_bb_w ? g_bb_w : vw; F->bb_h = g_bb_h ? g_bb_h : vh;
@@ -852,6 +905,7 @@ void metal_present(void){
         memcpy(F->dump_label, g_dump_label, sizeof F->dump_label);
         g_dump_req = -1;
     }
+    F->rb_id = rb_id; F->rb_tex = rb_tex; F->rb_dst = rb_dst; F->rb_pitch = rb_pitch; F->rb_rows = rb_rows;
     int mailbox = hfr_mailbox();
     int32_t mine = g_cur + 1;
     double t0 = now_ms();
@@ -889,11 +943,91 @@ void metal_present(void){
     Buf *N = &g_b[g_cur];
     N->dn = N->vn = N->rvn = N->pscn = 0; N->kn = KFIRST; N->last_ksz = 0;
     ((GwHL *)(N->kb + GW_K_HL))->n = 0;           /* no other cars' headlights until headlights.c sets them */
+    ((GwMarks *)(N->kb + GW_K_MARKS))->n = 0;     /* nor quick chat's places until roam_game.c does */
     g_frame_clear = g_clear_argb;
+}
+/* After a handoff: wait until the page has taken the frame (it takes one
+ * only while fewer than its limit are on the GPU), so the next frame starts,
+ * and reads its input, only once the page can take that one too.  Without it
+ * a GPU-bound page had the GPU's frames, a frame ready and one recorded
+ * between a press and the screen: with ~16 ms of GPU work a frame at 60 Hz,
+ * input ~78 ms old at the next rAF, now ~61, at the same frame rate.  Not in
+ * mailbox mode (frames replaced, nothing queues) nor while the page draws
+ * nothing (a hidden tab), at most 100 ms.  NFSU2_WAIT_TAKEN=0: no wait (A/B). */
+static void wait_taken(void){
+    static int on = -1;
+    if (on < 0){ const char *e = getenv("NFSU2_WAIT_TAKEN"); on = !(e && *e == '0'); }
+    if (!on || hfr_mailbox() || !hfr_display_live()) return;
+    int32_t mine = (g_cur ^ 1) + 1;
+    double t0 = now_ms();
+    int unlocked = 0;
+    for (;;){
+        int32_t s = ald(&g_ctl->state);
+        if (GW_ST_READY(s) != mine || ald(&g_ctl->attached) != GW_ATTACHED) break;
+        double left = 100.0 - (now_ms() - t0);
+        if (left <= 0) break;
+        if (!unlocked){ guest_wait_begin(); unlocked = 1; }
+        wait32(&g_ctl->state, s, left > 1.0 ? left : 1.0);
+    }
+    if (unlocked) guest_wait_end();
+    g_wait_present_ms += now_ms() - t0;
+}
+void metal_present(void){
+    gw_init();
+    g_presents++;
+    if (g_on) gw_attached();          /* the first present waits for the page; a detach ends recording */
+    if (!g_on){ g_gframe++; tex_free_due(0); g_handed = 0; return; }
+    /* a readback handed the frame over already: only what was drawn since */
+    if (!g_handed || g_b[g_cur].dn){ handoff(0, 0, 0, 0, 0); wait_taken(); }
+    g_handed = 0;
     g_gframe++;
     tex_free_due(0);
     vsync_feed();
     view_follow();
+}
+
+/* LockRect on a render target the game made lockable (com.c, CreateRenderTarget):
+ * the pixels the GPU drew there, level 0, rows x pitch bytes at dst.  The game
+ * takes the picture of a DVD or magazine cover this way (0x5C3120: the middle
+ * of the screen StretchRect'ed into a 512x512 target, locked, copied into the
+ * cover's save and its texture), after EndScene and just before Present.
+ * Records the page has not seen yet drew it, so the frame recorded so far goes
+ * to the page now with the request: the page shows it as any frame (it is the
+ * whole frame), copies the texture out and writes dst, and the game waits for
+ * that with the guest lock released, at most 3 s (a hidden tab may not draw).
+ * Present then hands off only what was drawn in between.  1: dst holds the
+ * pixels; 0: no renderer, or the page did not answer (dst as it was). */
+int metal_read_texture(unsigned id, void *dst, unsigned pitch, unsigned rows){
+    gw_init();
+    if (!g_on || !dst || !id || id >= MAXTEX || !g_tex[id].live || !g_tex[id].rt || g_tex[id].cube) return 0;
+    if (!gw_attached()) return 0;
+    uint32_t rid = ++g_rb_n & ~GW_RB_FLAG;
+    if (!rid) rid = g_rb_n = 1;
+    ast(&g_ctl->rb_want, (int32_t)rid);
+    double t0 = now_ms();
+    handoff(rid, id, (uint32_t)(uintptr_t)dst, pitch, rows);
+    g_handed = 1;
+    double lim = 3000.0;
+    int got = -1;
+    guest_wait_begin();
+    for (;;){
+        int32_t d = ald(&g_ctl->rb_done);
+        if (((uint32_t)d & ~GW_RB_FLAG) == rid){ got = !((uint32_t)d & GW_RB_FLAG); break; }
+        double left = lim - (now_ms() - t0);
+        if (left <= 0 || ald(&g_ctl->attached) != GW_ATTACHED){
+            /* no answer: cancel, unless the page is writing dst right now (it
+             * claims and writes in one go: a moment) */
+            int32_t w = (int32_t)rid;
+            if (__atomic_compare_exchange_n(&g_ctl->rb_want, &w, 0, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) break;
+            if (lim >= 5000.0) break;
+            lim = 5000.0; continue;
+        }
+        wait32(&g_ctl->rb_done, d, left < 50.0 ? (left > 1.0 ? left : 1.0) : 50.0);
+    }
+    guest_wait_end();
+    fprintf(stderr, "[gpu] texture %u (%ux%u) read back for the game: %s after %.0f ms\n", id, g_tex[id].w, g_tex[id].h,
+            got > 0 ? "done" : got == 0 ? "the page could not read it" : "no answer", now_ms() - t0);
+    return got > 0;
 }
 
 long metal_frames(void){ return g_on && g_ctl ? (long)g_ctl->frames_done : g_presents; }

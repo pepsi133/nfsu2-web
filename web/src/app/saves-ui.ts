@@ -8,14 +8,16 @@
 // deleted.  The game data is never part of a backup and never written back:
 // it stays on the server.
 
-import { cacheBytes, clearCache, clearSaveDir, filesOf, isScreenshot, listFiles, listProfiles, PROFILES_DIR, readBytes, writeFile, type Profile } from './savefs';
+import { cacheBytes, clearCache, clearSaveDir, filesOf, isScreenshot, listFiles, listProfiles, PROFILES_DIR, readBytes, readText, writeFile, type Profile } from './savefs';
 import { AUTOSAVE_SEEN, coverOf, isProfileFile, modCars, NAME_MAX, profileName, renameProfile, sealed, type RenameFiles } from './profile';
 import { listZip, unzip, zip, ZipError, type ZipEntry } from './zip';
 import { downloadBlob, stamp } from './logs';
 import { fmtBytes } from './checks';
-import { resolveEnv } from './settings';
+import { resolveEnv, withDevice } from './settings';
 import { gameDataKept, type DownloadState, type DownloadStatus, type Predownload } from './predownload';
 import { ScreenshotsPart } from './shots';
+import { GAMEFILE, kept } from './vault';
+import { dateLocale, listOf, live, N, t, tn, tvars, type Msg } from './i18n';
 
 export interface SavesDeps {
   saveDir: string;
@@ -50,12 +52,13 @@ export function settingsWarnings(text: string): string[] {
   const out: string[] = [];
   const net = Object.keys(r.env).filter(k => set(k) && /^NFSU2_(ROAM|NET|LAN)/.test(k)).map(k => `${k}=${r.env[k]}`);
   if (set('NFSU2_ROAM') && parseInt(r.env.NFSU2_ROAM, 10) === 1)
-    out.push(`It turns on free-roam multiplayer: your profile name${set('NFSU2_ROAM_NAME') ? ` (shown as "${r.env.NFSU2_ROAM_NAME}")` : ''}, car and position go to the other players on this server.`);
-  if (net.length) out.push(`Network settings: ${net.join(', ')}`);
+    out.push(set('NFSU2_ROAM_NAME') ? t('It turns on free-roam multiplayer: your profile name (shown as "{name}"), car and position go to the other players on this server.', { name: r.env.NFSU2_ROAM_NAME })
+      : t('It turns on free-roam multiplayer: your profile name, car and position go to the other players on this server.'));
+  if (net.length) out.push(t('Network settings: {list}', { list: net.join(', ') }));
   const raw = r.other.filter(o => !o.refused).map(o => `${o.key} = ${o.value}`);
-  if (raw.length) out.push(`Variables set by their own names: ${raw.slice(0, 6).join(', ')}${raw.length > 6 ? ' …' : ''}`);
+  if (raw.length) out.push(t('Variables set by their own names: {list}', { list: raw.slice(0, 6).join(', ') + (raw.length > 6 ? ' …' : '') }));
   const ignored = r.other.filter(o => o.refused === 'only the page sets it').map(o => o.key);
-  if (ignored.length) out.push(`Ignored, only the page sets them: ${ignored.join(', ')}`);
+  if (ignored.length) out.push(t('Ignored, only the page sets them: {list}', { list: ignored.join(', ') }));
   return out;
 }
 
@@ -132,7 +135,7 @@ function backupIn(files: FileIn[], skipped: string[]): Restore {
     const s = e.path.split('/');
     if (s.length !== 3 || s[0] !== PROFILES_DIR || lower(s[2]) !== lower(s[1]) || coverOf(s[1])) continue;
     let r = profileName(e.data);
-    if ('name' in r && lower(r.name) !== lower(s[1])) r = { bad: `the name inside is "${r.name}"` };
+    if ('name' in r && lower(r.name) !== lower(s[1])) r = { bad: t('the name inside is "{name}"', { name: r.name }) };
     if ('bad' in r) { out.refused.push({ name: s[1], why: r.bad }); gone.add(lower(s[1])); continue; }
     out.profiles.push(s[1]);
     if (r.edited) { out.edited.push(s[1]); e.data = sealed(e.data); }
@@ -185,8 +188,11 @@ export async function restoreSaves(saveDir: string, r: Restore) {
 }
 
 /**
- * A keyphrase's saves (vault.ts: a zip of the save folder but the screenshots) as a backup of this page's, whatever is
- * at their top: restoreVault puts them in place of everything here.  The same checks as a backup's.
+ * A keyphrase's saves (vault.ts kept(): a zip of the save folder but the screenshots, the covers, the graphics options,
+ * the LAN server's file and the device's own settings) as a backup of this page's, whatever is at their top:
+ * restoreVault puts them in place of everything here.  The same checks as a backup's; what a keyphrase does not keep is
+ * left out (in one sent before 2026-10-25: covers, black ones as they were then, and the other browser's graphics
+ * options and device settings; before 2026-10-28: the other browser's gamefile.bin).
  */
 export async function readVault(buf: Uint8Array): Promise<Restore> {
   const refused: string[] = [];
@@ -195,38 +201,48 @@ export async function readVault(buf: Uint8Array): Promise<Restore> {
     const p = safeEntryPath(name);
     return !!p && !isScreenshot(p) && size <= MAX_ENTRY && ((other += size) <= MAX_OTHER || ((other -= size), false));
   }, refused);
-  return backupIn(all.map(e => ({ path: safeEntryPath(e.name)!, data: e.data, mtime: e.mtime })), refused);
+  const files = all.map(e => ({ path: safeEntryPath(e.name)!, data: e.data, mtime: e.mtime }));
+  return backupIn(kept(files), refused);
 }
 
-/** readVault's saves in place of the ones here: everything goes but the screenshots (and a test's input script). */
+/** readVault's saves in place of the ones here: everything goes but what a keyphrase does not keep (vault.ts kept()):
+ *  the screenshots (and a test's input script), the DVD and magazine covers of the profiles they bring, the game's
+ *  graphics options, the LAN server's file, and the device's own settings, which settings.ini keeps from the one here
+ *  (settings.ts withDevice). */
 export async function restoreVault(saveDir: string, r: Restore) {
-  await clearSaveDir(saveDir, name => isScreenshot(name) || name === 'autotest-script.txt');
-  for (const e of r.entries) await writeFile(saveDir, e.path, e.data);
+  const names = new Set(r.profiles.map(lower)), dec = new TextDecoder();
+  const ini = r.entries.find(e => e.path === 'settings.ini');
+  const settings = withDevice(ini ? dec.decode(ini.data) : null, await readText(saveDir, 'settings.ini'));
+  await clearSaveDir(saveDir, name => isScreenshot(name) || name === 'autotest-script.txt' || name === 'registry.txt' || name === GAMEFILE || name === PROFILES_DIR);
+  await clearSaveDir(saveDir, name => names.has(lower(coverOf(name)?.profile ?? '')), PROFILES_DIR);
+  for (const e of r.entries) if (e !== ini) await writeFile(saveDir, e.path, e.data);
+  if (settings !== null) await writeFile(saveDir, 'settings.ini', settings);
 }
-
-/** a list of names: "a, b and c" */
-const listOf = (names: string[]) => names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}` : names[0];
 
 /** What a restore's question says of its profiles' state: changed by a save editor, mod cars, left out, skipped. */
 function restoreNotes(r: Restore): string[] {
   const items: string[] = [];
   const refused = r.refused.map(x => `${x.name}: ${x.why}`).join('; ');
-  if (r.edited.length) items.push(`${listOf(r.edited)} ${r.edited.length > 1 ? 'were' : 'was'} changed outside the game, by a save editor (the checksums no longer matched): ` +
-    'a value the game would not make itself may crash it or break the career.');
-  if (r.modded.length) items.push(`${listOf(r.modded)} ${r.modded.length > 1 ? 'have' : 'has'} cars a mod added, which this game does not have: the game may crash or show them wrong when it loads them.`);
-  if (refused) items.push(`Left out, as the game would not load ${r.refused.length > 1 ? 'them' : 'it'}: ${refused}.`);
-  if (r.skipped.length) items.push(`${r.skipped.length} ${r.kind === 'profiles' ? 'other files are left out' : 'entries are skipped (unsafe names, or over the size limits)'}: ${r.skipped.slice(0, 3).join(', ')}${r.skipped.length > 3 ? ' …' : ''}`);
+  if (r.edited.length) items.push(tn(r.edited.length, '{names} was edited with a save editor: values the game wouldn\'t make can crash it or break the career.',
+    '{names} were edited with a save editor: values the game wouldn\'t make can crash it or break the career.', { names: listOf(r.edited) }));
+  if (r.modded.length) items.push(tn(r.modded.length, '{names} has modded cars this game lacks: it may crash or show them wrong.',
+    '{names} have modded cars this game lacks: it may crash or show them wrong.', { names: listOf(r.modded) }));
+  if (refused) items.push(tn(r.refused.length, 'Left out, as the game would not load it: {list}.', 'Left out, as the game would not load them: {list}.', { list: refused }));
+  const skipped = r.skipped.slice(0, 3).join(', ') + (r.skipped.length > 3 ? ' …' : '');
+  if (r.skipped.length) items.push(r.kind === 'profiles' ? tn(r.skipped.length, '{n} other file is left out: {list}', '{n} other files are left out: {list}', { list: skipped })
+    : tn(r.skipped.length, '{n} entry is skipped (an unsafe name, or over the size limits): {list}', '{n} entries are skipped (unsafe names, or over the size limits): {list}', { list: skipped }));
   return items;
 }
 
-/** What a backup's restore brings (or a keyphrase's, vault-ui.ts): its profiles, the game's options, settings.ini, restoreNotes. */
-export function backupItems(r: Restore): string[] {
+/** What a backup's restore brings (or a keyphrase's, vault-ui.ts: the game's options stay), its profiles, the game's
+ *  options, settings.ini, restoreNotes. */
+export function backupItems(r: Restore, vault = false): string[] {
   const ini = r.entries.find(e => e.path === 'settings.ini');
   const warn = ini ? settingsWarnings(new TextDecoder().decode(ini.data)) : [];
   return [
-    r.profiles.length ? `Profiles: ${r.profiles.join(', ')}` : 'No profiles',
-    r.entries.some(e => e.path === 'registry.txt') ? 'The game\'s options (registry.txt)' : 'No registry.txt: the next launch starts with fresh game options',
-    ini ? (warn.length ? `settings.ini. ${warn.join(' ')}` : 'settings.ini') : 'No settings.ini: the defaults apply',
+    r.profiles.length ? t('Profiles: {names}', { names: r.profiles.join(', ') }) : t('No profiles'),
+    ...vault ? [] : [r.entries.some(e => e.path === 'registry.txt') ? t('The game\'s options (registry.txt)') : t('No registry.txt: the next launch starts with fresh game options')],
+    ini ? (warn.length ? `settings.ini. ${warn.join(' ')}` : 'settings.ini') : t('No settings.ini: the defaults apply'),
     ...restoreNotes(r),
   ];
 }
@@ -255,10 +271,12 @@ export async function addProfiles(fs: RenameFiles, r: Restore) {
 /** "about 3 min left" */
 function eta(s: number): string {
   if (!isFinite(s)) return '';
-  if (s < 60) return 'less than a minute left';
-  if (s < 3600) return `about ${Math.round(s / 60)} min left`;
-  return `about ${(s / 3600).toFixed(1)} h left`;
+  if (s < 60) return t('less than a minute left');
+  if (s < 3600) return t('about {n} min left', { n: Math.round(s / 60) });
+  return t('about {n} h left', { n: (s / 3600).toFixed(1) });
 }
+const QUIT_TO_CHANGE = N('Quit the game (or close the other tab that runs it) to change the game data.');
+const QUIT_TO_RENAME = N('Quit the game (or close the other tab that runs it) to rename a profile or restore a backup.');
 
 export class SavesPanel {
   /** root: the Saves section; dataPanel: Game data on this PC */
@@ -273,8 +291,14 @@ export class SavesPanel {
 
   private shots: ScreenshotsPart;
 
-  private msg(s: string) { this.root.querySelector('#saves-msg')!.textContent = s; }
-  private dataMsg(s: string, warn = false) { const m = this.dataPanel.querySelector('#data-msg')!; m.textContent = s; m.classList.toggle('warn', warn); }
+  /** the section's messages, drawn again when the page's language changes (a Msg); said: which English text each says
+   *  (the "quit the game first" ones, which go once the game ended) */
+  private said = { saves: '', data: '' };
+  private msg(s: string | Msg, en = '') { this.said.saves = en; live(this.root.querySelector('#saves-msg')!, typeof s === 'string' ? () => s : s); }
+  private dataMsg(s: string | Msg, warn = false, en = '') {
+    const m = this.dataPanel.querySelector('#data-msg')!;
+    this.said.data = en; live(m, typeof s === 'string' ? () => s : s); m.classList.toggle('warn', warn);
+  }
 
   /** the game data in this browser: of the server's files (null: their list did not load), and all that is kept */
   private data: { have: number; total: number } | null = null;
@@ -304,16 +328,15 @@ export class SavesPanel {
     this.root.querySelector<HTMLLabelElement>('.file-btn')!.toggleAttribute('aria-disabled', busy);
     this.root.querySelector<HTMLInputElement>('#import')!.disabled = busy;
     this.dataPanel.querySelector<HTMLButtonElement>('#clear-cache')!.disabled = busy;
-    const waiting = /^Quit the game \(or close/;
-    if (busy) { this.msg('Quit the game (or close the other tab that runs it) to rename a profile or restore a backup.'); this.dataMsg('Quit the game (or close the other tab that runs it) to change the game data.'); }
+    if (busy) { this.msg(() => t(QUIT_TO_RENAME), QUIT_TO_RENAME); this.dataMsg(() => t(QUIT_TO_CHANGE), false, QUIT_TO_CHANGE); }
     else {
-      if (waiting.test(this.root.querySelector('#saves-msg')!.textContent ?? '')) this.msg('');
-      if (waiting.test(this.dataPanel.querySelector('#data-msg')!.textContent ?? '')) this.dataMsg('');
+      if (this.said.saves === QUIT_TO_RENAME) this.msg('');
+      if (this.said.data === QUIT_TO_CHANGE) this.dataMsg('');
     }
     this.root.dataset.files = String(files.length);
     if (this.deps.download.running) { this.showData(); return; }     // it counts as it goes
     const n = ++this.counted;
-    const [kept, data] = await Promise.all([cacheBytes(), gameDataKept(this.deps.download.language()).catch(() => null)]);
+    const [kept, data] = await Promise.all([cacheBytes(), gameDataKept(this.deps.download.language(), this.deps.download.texpack()).catch(() => null)]);
     if (n !== this.counted) return;
     this.kept = kept; this.data = data;
     this.showData();
@@ -325,8 +348,8 @@ export class SavesPanel {
     if (active && st.total) this.data = { have: st.have, total: st.total };
     if (st.state !== this.shownState) {
       this.shownState = st.state;
-      if (st.state === 'done') { this.data = { have: st.have, total: st.total }; this.dataMsg('The game data is on this PC now.'); }
-      if (st.state === 'error') this.dataMsg(`Preloading stopped: ${st.error}. What it preloaded is kept.`, true);
+      if (st.state === 'done') { this.data = { have: st.have, total: st.total }; this.dataMsg(() => t('The game data is on this PC now.')); }
+      if (st.state === 'error') { const e = st.error; this.dataMsg(() => t('Preloading stopped: {error}. What\'s done is kept.', { error: e ?? '' }), true); }
       if (!active) void this.refresh();                         // counted again; shown now with what is known
     }
     const info = this.dataPanel.querySelector('#cache-info')!, bar = this.dataPanel.querySelector<HTMLElement>('#data-bar')!;
@@ -339,24 +362,27 @@ export class SavesPanel {
       (bar.firstElementChild as HTMLElement).style.width = `${(f * 100).toFixed(1)}%`;
       bar.setAttribute('aria-valuenow', String(Math.floor(f * 100)));
       fetchBtn.hidden = false;
-      fetchBtn.textContent = 'Stop preloading';
+      fetchBtn.textContent = t('Stop preloading');
       fetchBtn.disabled = st.state === 'paused';
-      info.textContent = st.state === 'paused' ? `Preloading paused while the game runs: ${d ? `${fmtBytes(d.have)} of ${fmtBytes(d.total)}` : 'counting'}. It goes on when the game ends.`
-        : !d ? 'Preloading the game data: counting what is here already.'
-        : `Preloading the game data: ${fmtBytes(d.have)} of ${fmtBytes(d.total)} (${Math.floor(f * 100)} %)${st.rate ? `, ${fmtBytes(st.rate)}/s, ${eta(rest / st.rate)}` : ''}. ` +
-          'Play whenever you like: preloading pauses while the game runs and goes on after it.';
+      info.textContent = st.state === 'paused' ? (d ? t('Preloading paused while you play: {have} of {total}.', { have: fmtBytes(d.have), total: fmtBytes(d.total) })
+          : t('Preloading paused while you play.'))
+        : !d ? t('Preloading: checking what\'s here already.')
+        : t('Preloading: {have} of {total} ({pct} %){speed}. You can play meanwhile: it pauses while you do.',
+          { have: fmtBytes(d.have), total: fmtBytes(d.total), pct: Math.floor(f * 100), speed: st.rate ? `, ${fmtBytes(st.rate)}/s, ${eta(rest / st.rate)}` : '' });
       return;
     }
-    fetchBtn.textContent = d && d.have ? `Preload the rest (${fmtBytes(rest)})` : `Preload the game data${d ? ` (${fmtBytes(d.total)})` : ''}`;
+    fetchBtn.textContent = d && d.have ? t('Preload the rest ({size})', { size: fmtBytes(rest) }) : d ? t('Preload the game data ({size})', { size: fmtBytes(d.total) }) : t('Preload the game data');
     fetchBtn.hidden = !!d && rest <= 0;
     if (d && rest <= 0)
-      info.textContent = `The game data (${fmtBytes(d.total)}) is kept in this browser: the game loads it from this PC, not the network. Only the movies stream from the server, as they play` +
-        `${'serviceWorker' in navigator ? ', and the game starts without the server too (offline, with the movies off)' : ''}. Deleting it only means loading it from the server again.`;
+      info.textContent = 'serviceWorker' in navigator
+        ? t('All game data ({size}) is on this PC; only the movies stream from the server. The game starts offline too, without movies.', { size: fmtBytes(d.total) })
+        : t('All game data ({size}) is on this PC; only the movies stream from the server.', { size: fmtBytes(d.total) });
     else if (d ? d.have : this.kept.bytes)
-      info.textContent = `${d ? `${fmtBytes(d.have)} of the game's ${fmtBytes(d.total)} (without the movies)` : fmtBytes(this.kept.bytes)} is kept in this browser, so the game loads that from this PC instead of the network. ` +
-        'Preload the rest too, and no loading screen waits on the network. Deleting it only means loading it from the server again.';
+      info.textContent = (d ? t('{have} of {total} is on this PC (movies not included).', { have: fmtBytes(d.have), total: fmtBytes(d.total) })
+        : t('{have} is on this PC.', { have: fmtBytes(this.kept.bytes) })) + ' ' +
+        t('Preload the rest so loading never waits on the network.');
     else
-      info.textContent = 'Nothing here yet. The game streams its data from the server as it needs it and keeps it here. Preload it now (all but the movies, compressed on the way) and no loading screen waits on the network.';
+      info.textContent = t('Nothing here yet: the game downloads data as it needs it. Preload it now so loading never waits on the network.');
   }
 
   /** The profiles, each with its Rename button, or the name being edited. */
@@ -366,7 +392,7 @@ export class SavesPanel {
     ul.replaceChildren();
     if (!this.profiles.length) {
       const li = document.createElement('li'); li.className = 'empty';
-      li.textContent = 'No profiles yet. Create one in the game: it is saved in this browser.';
+      li.textContent = t('No profiles yet. Create one in the game.');
       ul.append(li);
     }
     for (const p of this.profiles) {
@@ -374,7 +400,7 @@ export class SavesPanel {
       if (p.name === this.renaming) {
         const { form, input } = this.renameForm(p.name, busy);
         const help = document.createElement('p'); help.className = 'hint'; help.id = 'rename-help';
-        help.textContent = `Letters and digits, up to ${NAME_MAX}, as in the game.`;
+        help.textContent = t('Letters and digits, up to {n}, as in the game.', { n: NAME_MAX });
         const m = document.createElement('p'); m.className = 'msg warn'; m.id = 'rename-msg'; m.setAttribute('role', 'alert');
         li.className = 'renaming'; li.append(form, help, m); ul.append(li);
         focus = input;
@@ -382,9 +408,9 @@ export class SavesPanel {
       }
       const n = document.createElement('span'); n.className = 'name'; n.textContent = p.name;
       const m = document.createElement('span'); m.className = 'meta';
-      m.textContent = `saved ${new Date(p.mtime).toLocaleString()}, ${fmtBytes(p.size)}`;
-      const b = document.createElement('button'); b.type = 'button'; b.className = 'text-btn rename-btn'; b.textContent = 'Rename';
-      b.setAttribute('aria-label', `Rename ${p.name}`); b.disabled = busy;
+      m.textContent = t('saved {when}, {size}', { when: new Date(p.mtime).toLocaleString(dateLocale()), size: fmtBytes(p.size) });
+      const b = document.createElement('button'); b.type = 'button'; b.className = 'text-btn rename-btn'; b.textContent = t('Rename');
+      b.setAttribute('aria-label', t('Rename {name}', { name: p.name })); b.disabled = busy;
       b.onclick = () => { this.renaming = p.name; this.showProfiles(); };
       if (p.name === this.focusName) focus = b;
       li.append(n, m, b); ul.append(li);
@@ -397,7 +423,7 @@ export class SavesPanel {
     const form = document.createElement('form'); form.className = 'row';
     const input = document.createElement('input');
     input.type = 'text'; input.value = name; input.maxLength = NAME_MAX; input.spellcheck = false; input.autocomplete = 'off';
-    input.setAttribute('aria-label', `New name for ${name}`); input.setAttribute('aria-describedby', 'rename-help rename-msg');
+    input.setAttribute('aria-label', t('New name for {name}', { name })); input.setAttribute('aria-describedby', 'rename-help rename-msg');
     // what the game's field keeps: other characters never appear
     input.oninput = () => {
       const v = input.value, keep = (t: string) => t.replace(/[^A-Za-z0-9]/g, '');
@@ -405,8 +431,8 @@ export class SavesPanel {
       const at = keep(v.slice(0, input.selectionStart ?? v.length)).length;
       input.value = keep(v); input.setSelectionRange(at, at);
     };
-    const ok = document.createElement('button'); ok.type = 'submit'; ok.className = 'btn'; ok.textContent = 'Rename'; ok.disabled = busy;
-    const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'text-btn'; cancel.textContent = 'Cancel';
+    const ok = document.createElement('button'); ok.type = 'submit'; ok.className = 'btn'; ok.textContent = t('Rename'); ok.disabled = busy;
+    const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'text-btn'; cancel.textContent = t('Cancel');
     cancel.onclick = () => this.endRename(name);
     form.append(input, ok, cancel);
     form.onsubmit = e => { e.preventDefault(); void this.doRename(name, input.value); };
@@ -419,23 +445,23 @@ export class SavesPanel {
   private async doRename(from: string, to: string) {
     const say = (s: string) => { this.root.querySelector('#rename-msg')!.textContent = s; };
     if (to === from) { this.endRename(from); return; }
-    if (this.deps.busy()) { say('Quit the game (or close the other tab that runs it) to rename a profile.'); return; }
+    if (this.deps.busy()) { say(t('Quit the game (or close the other tab that runs it) to rename a profile.')); return; }
     const ok = this.root.querySelector<HTMLButtonElement>('.profiles .renaming [type="submit"]')!;
     if (ok.disabled) return;
     ok.disabled = true;
     let r: Awaited<ReturnType<typeof renameProfile>>;
     try { r = await this.write(renameProfile(filesOf(this.deps.saveDir), PROFILES_DIR, from, to)); }
-    catch (err) { this.renaming = null; this.msg(`Renaming ${from} stopped: ${err}`); await this.refresh(); return; }
+    catch (err) { this.renaming = null; this.msg(() => t('Renaming {name} stopped: {error}', { name: from, error: String(err) })); await this.refresh(); return; }
     if ('refused' in r) { ok.disabled = this.deps.busy(); say(r.refused); return; }
     this.renaming = null; this.focusName = to;
-    this.msg(`Renamed ${from} to ${to}.`);
+    this.msg(() => t('Renamed {from} to {to}.', { from, to }));
     this.deps.onChanged?.();
     await this.refresh();
   }
 
   private async doDownload() {
     const dl = this.deps.download;
-    if (dl.running) { await dl.stop(); this.dataMsg('Preloading stopped. What it preloaded is kept: Preload the rest goes on from there.'); return; }
+    if (dl.running) { await dl.stop(); this.dataMsg(() => t('Preloading stopped. What\'s done is kept.')); return; }
     if (this.deps.busy()) return;
     this.dataMsg('');
     dl.start();
@@ -445,28 +471,30 @@ export class SavesPanel {
     try {
       const e = await exportSaves(this.deps.saveDir);
       downloadBlob(e.zip as BlobPart, e.name, 'application/zip');
-      this.msg(`Downloaded ${e.name}: ${e.files} files, ${fmtBytes(e.zip.length)}.` + (e.shotBytes > MAX_SHOTS
-        ? ` It holds ${fmtBytes(e.shotBytes)} of screenshots: a restore keeps the saves and settings and only the first ${fmtBytes(MAX_SHOTS)} of screenshots.` : ''));
-    } catch (err) { this.msg(`The backup failed: ${err}`); }
+      this.msg(() => tn(e.files, 'Downloaded {name}: {n} file, {size}.', 'Downloaded {name}: {n} files, {size}.', { name: e.name, size: fmtBytes(e.zip.length) }) + (e.shotBytes > MAX_SHOTS
+        ? ' ' + t('It holds {shots} of screenshots: a restore keeps only the first {max} of them.', { shots: fmtBytes(e.shotBytes), max: fmtBytes(MAX_SHOTS) }) : ''));
+    } catch (err) { this.msg(() => t('The backup failed: {error}', { error: String(err) })); }
   }
 
   private async doImport(file: File) {
-    if (this.deps.busy()) { this.msg('Quit the game first: restoring replaces the saves it is using.'); return; }
+    if (this.deps.busy()) { this.msg(() => t('Quit the game first: restoring replaces the saves it is using.')); return; }
     let r: Restore;
     try { r = await readBackup(new Uint8Array(await file.arrayBuffer()), file.name); }
     catch (err) {
-      this.msg(err instanceof ZipError ? `${file.name} cannot be restored: ${err.message === 'not a zip file' ? 'it is neither a backup (a zip) nor a profile of the game\'s' : err.message}.`
-        : `${file.name} cannot be read: ${err}`);
+      const name = file.name;
+      this.msg(() => err instanceof ZipError ? t('{file} cannot be restored: {why}.', { file: name, why: err.message === 'not a zip file' ? t('it is neither a backup (a zip) nor a profile of the game\'s') : err.message })
+        : t('{file} cannot be read: {error}', { file: name, error: String(err) }));
       return;
     }
     const refused = r.refused.map(x => `${x.name}: ${x.why}`).join('; ');
     if (!r.profiles.length && (r.kind === 'profiles' || !r.entries.length)) {
       const one = r.refused.length === 1 ? r.refused[0] : null;
       const covers = r.skipped.length && r.skipped.every(s => coverOf(s.split('/').pop()!));
-      this.msg(one ? `${one.name === file.name ? file.name : `The profile ${one.name} in ${file.name}`} cannot be restored: ${one.why}.`
-        : refused ? `${file.name} has no profile the game can load: ${refused}.`
-        : covers ? `${file.name} holds DVD or magazine covers only: they come with their profile, in a zip of the NFS Underground 2 folder.`
-        : `${file.name} has no save files.`);
+      const name = file.name;
+      this.msg(() => one ? (one.name === name ? t('{file} cannot be restored: {why}.', { file: name, why: one.why }) : t('The profile {name} in {file} cannot be restored: {why}.', { name: one.name, file: name, why: one.why }))
+        : refused ? t('{file} has no profile the game can load: {list}.', { file: name, list: refused })
+        : covers ? t('{file} holds only covers: restore them with their profile, in a zip of the NFS Underground 2 folder.', { file: name })
+        : t('{file} has no save files.', { file: name }));
       return;
     }
     const list = listOf;
@@ -476,34 +504,40 @@ export class SavesPanel {
     const here = new Map(this.profiles.map(x => [x.name.toLowerCase(), x.name]));
     const replaced = r.profiles.map(n => here.get(n.toLowerCase())).filter((x): x is string => !!x);
     if (r.kind === 'profiles') {
-      p.textContent = `Adds the ${r.profiles.length > 1 ? 'profiles' : 'profile'} in ${file.name} to this browser. The other profiles here, the game's options and settings.ini stay as they are.`;
-      items.push(`Profiles: ${r.profiles.map(n => {
+      p.textContent = tn(r.profiles.length, 'Adds the profile in {file}. Other profiles, the game\'s options and settings.ini stay as they are.',
+        'Adds the profiles in {file}. Other profiles, the game\'s options and settings.ini stay as they are.', { file: file.name });
+      items.push(t('Profiles: {names}', { names: r.profiles.map(n => {
         const covers = r.entries.filter(e => coverOf(e.path.split('/')[1])?.profile === n).length;
-        return covers ? `${n} (with ${covers === 1 ? 'its cover shoot' : `its ${covers} cover shoots`})` : n;
-      }).join(', ')}`);
-      if (replaced.length) items.push(replaced.length > 1 ? `Replaces the profiles ${list(replaced)} in this browser, their careers and cover shoots too`
-        : `Replaces the profile ${replaced[0]} in this browser, its career and cover shoots too`);
+        return covers ? tn(covers, '{name} (with its cover shoot)', '{name} (with its {n} cover shoots)', { name: n }) : n;
+      }).join(', ') }));
+      if (replaced.length) items.push(tn(replaced.length, 'Replaces {names} here, with its career and cover shoots',
+        'Replaces {names} here, with their careers and cover shoots', { names: list(replaced) }));
       items.push(...restoreNotes(r));
     } else {
-      p.textContent = `Restoring replaces every profile, the game's options and settings.ini in this browser with the ${r.entries.length} files in ${file.name}.`;
+      p.textContent = tn(r.entries.length, 'Replaces every profile, the game\'s options and settings.ini here with the {n} file in {file}.',
+        'Replaces every profile, the game\'s options and settings.ini here with the {n} files in {file}.', { file: file.name });
       items.push(...backupItems(r));
     }
     const ul = document.createElement('ul');
     for (const t of items) { const li = document.createElement('li'); li.textContent = t; ul.append(li); }
     body.append(p, ul);
     const adding = r.kind === 'profiles';
-    if (!await this.deps.confirm(adding ? `Add ${r.profiles.length > 1 ? 'these profiles' : 'this profile'}?` : 'Restore this backup?', body,
-      adding ? `Add ${r.profiles.length > 1 ? 'profiles' : 'profile'}` : 'Restore backup', !adding || replaced.length > 0)) { this.msg('Nothing changed.'); return; }
+    const many = r.profiles.length > 1, name = file.name;
+    if (!await this.deps.confirm(adding ? (many ? t('Add these profiles?') : t('Add this profile?')) : t('Restore this backup?'), body,
+      adding ? (many ? t('Add profiles') : t('Add profile')) : t('Restore backup'), !adding || replaced.length > 0)) { this.msg(() => t('Nothing changed.')); return; }
     try {
       if (adding) {
         await this.write(addProfiles(filesOf(this.deps.saveDir), r));
-        this.msg(`Added ${list(r.profiles)} from ${file.name}.`);
+        this.msg(() => t('Added {names} from {file}.', { names: list(r.profiles), file: name }));
       } else {
         await this.write(restoreSaves(this.deps.saveDir, r));
-        this.msg(`Restored ${r.entries.length} files from ${file.name}.`);
+        this.msg(() => tn(r.entries.length, 'Restored {n} file from {file}.', 'Restored {n} files from {file}.', { file: name }));
         this.deps.onRestored();
       }
-    } catch (err) { this.msg(`${adding ? 'Adding' : 'Restoring'} stopped halfway: ${err}. ${adding ? 'Add the profiles' : 'Restore the backup'} again before playing.`); }
+    } catch (err) {
+      this.msg(() => adding ? t('Adding stopped halfway: {error}. Add the profiles again before playing.', { error: String(err) })
+        : t('Restoring stopped halfway: {error}. Restore the backup again before playing.', { error: String(err) }));
+    }
     this.deps.onChanged?.();
     await this.refresh();
   }
@@ -511,10 +545,11 @@ export class SavesPanel {
   private async doClearCache() {
     if (this.deps.busy()) return;
     const dl = this.deps.download;
-    if (!await this.deps.confirm('Delete the game data on this PC?', `${dl.running ? 'This stops preloading. ' : ''}The game will stream it from the server again the next time, which is slower once. Your saves are not touched.`, 'Delete game data', true)) return;
+    if (!await this.deps.confirm(t('Delete the game data on this PC?'), (dl.running ? t('This stops preloading.') + ' ' : '') +
+      t('The game downloads it again as needed. Your saves stay.'), t('Delete game data'), true)) return;
     await dl.stop();
     await clearCache();
     await this.refresh();
-    this.dataMsg('Game data on this PC deleted.');
+    this.dataMsg(() => t('Game data on this PC deleted.'));
   }
 }

@@ -71,6 +71,8 @@ const values = ['on', 'off', 'yes', 'No', 'TRUE', 'false', '1', '0', 'enabled', 
   'inf', 'nan', '1.', '.5', '5x', '1024', '65535', '65536', '99', '2', '8', '9', '1000', '1001', '64000', '20000', 'Tester', 'Tester ; comment',
   'Team#1', 'Team #1', 'a;b', '; only comment', 'x # y', '1.2.3.4', '1.2.3.4:80', '1.2.3.4.5', '1.2.3.4:', '256.1.1.1', '1.2.3.4:0',
   '1.2.3.4:65536', 'host.name', '1.2.3.4, 5.6.7.8:9', '1.2.3.4;5.6.7.8', ',', '1.2.3', 'x'.repeat(24), 'y'.repeat(25), 'ünï',
+  // crews (K_CREWS): names joined by commas, each at most 24 characters without the blanks round it
+  'Blue Room, Night Owls', ` ${'é'.repeat(24)} , a`, `a,${'é'.repeat(25)}`, `${'x'.repeat(24)},${'y'.repeat(24)},z,w,v`, 'a,,b',
   '12345678901234567890123456789012', '1234567890123456789012345678901', '12ab', 'has space', 'https://x.example/y.png', 'asset_key',
   '43', '4:3', 'wide', 'ultrawide', 'hotplug', 'pause', 'run', 'fit', 'fill', 'stretch', 'full', 'minimal', 'backing', 'panel',
   'default,-audio', '2560x1600', '9000000', '0.08', '0.97', '/Users/x/NFSU2', 'skippable', 'Original', 'SKIPPABLE ', 'skip',
@@ -110,7 +112,7 @@ console.log(`single settings: ${agree} agree, ${diffs} differ (${cases.length} c
 const files = [
   '# NFSU2 settings, read at every launch.\nmovies = off\n  fps = 120  \n[section]\n; comment\nhud = "43"\nhud = wide\nno equals here\nroam_name = Thom ; me\nroam_room = Team#1\nresolution =\nNFSU2_STATUS_EVERY = 600\npad_log = 1\nrender = scale:0.75\nwatchdog = soon\n',
   'movies=OFF\r\nsound = 0\r\nbackground=Run\r\ngamepad = TRUE\r\n',
-  "fps = 'auto'\nmax_pixels = 6000000\nroam_peers = 10.0.0.2, 10.0.0.3:47211\nroam_port = 47210 # default\nroam = yes ; on\n",
+  "fps = 'auto'\nmax_pixels = 6000000\nroam_room = Team ; ours\nroam_rate = 20 # default\nroam = yes ; on\n",
 ];
 let fileDiffs = 0;
 files.forEach((text, i) => {

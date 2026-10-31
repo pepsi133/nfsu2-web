@@ -16,7 +16,7 @@
 
 #define AUDIO_MAGIC        0x4E415544u  /* 'NAUD' */
 #define AUDIO_VERSION      1u
-#define AUDIO_RING_FRAMES  8192u        /* power of two: 186 ms at 44.1 kHz */
+#define AUDIO_RING_FRAMES  16384u       /* power of two: 372 ms at 44.1 kHz (a phone's 175 ms bursts, smoothly) */
 #define AUDIO_RATE         44100u       /* the mixer's output rate */
 
 /* header words */

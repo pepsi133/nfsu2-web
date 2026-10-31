@@ -60,6 +60,7 @@ int  lifecycle_quit_requested(void);
 int  lifecycle_game_parked(void);                               /* inactive and not in a LAN session */
 void lifecycle_tick(void);
 int  lifecycle_drain_writes(double max_s);
+void watchdog_log_download(void);                               /* watchdog.c */
 int  win32_freeze_guest(int max_ms);                              /* win32_ext.c */
 void metal_game_size(unsigned *w, unsigned *h);                   /* the renderer */
 long metal_frames(void);
@@ -134,8 +135,10 @@ static unsigned lookup_key(const char *nm){
 
 /* ---- keys: keyboard_mac.m's delivery rules ------------------------------- */
 /* alttext: pressed with Option/AltGr and typed text, so its release is a
- * WM_KEYUP even while Alt is still down, as with AltGr on Windows */
-typedef struct { uint8_t down, vk, sys, alttext; } Down;
+ * WM_KEYUP even while Alt is still down, as with AltGr on Windows.
+ * lost: held when release_all() let it go, and no key up since: its next
+ * autorepeat presses it again (the key is still down) */
+typedef struct { uint8_t down, vk, sys, alttext, lost; } Down;
 static Down g_down[256];             /* by DIK: keys the game has seen go down */
 static int  g_alt_other;             /* a key was pressed while Alt was down */
 static int  g_nheld;
@@ -180,10 +183,15 @@ static const char *reason_name(int r){
 static void mouse_release_all(void);
 /* every key the game holds goes up (WM_KEYUP and DirectInput), and with
  * mouse != 0 the buttons too: a focus loss takes both, as the Mac's resign
- * handlers did; a Meta press only the keys */
-static void release_all(const char *why, int mouse){
+ * handlers did; a Meta press only the keys.  A key still down afterwards
+ * is pressed again by its next autorepeat (key_down), except an Escape
+ * held to leave fullscreen (reason IREASON_FULLSCREEN) */
+static void release_all(const char *why, int mouse, int reason){
     int n = 0;
-    for (unsigned k = 1; k < 256u; k++) if (g_down[k].down){ release(k, 0); n++; }
+    for (unsigned k = 1; k < 256u; k++) if (g_down[k].down){
+        release(k, 0); n++;
+        g_down[k].lost = !(reason == IREASON_FULLSCREEN && k == 0x01);
+    }
     kbd_release_source(KSRC_HOST);
     g_alt_other = 0; g_nheld = 0;
     if (mouse) mouse_release_all();
@@ -196,14 +204,19 @@ static int is_modifier(unsigned dik){
 static void key_down(const InEv *e){
     unsigned dik = e->dik;
     if (!dik || dik == 0xDB || dik == 0xDC) return;            /* Meta: the browser's */
-    int repeat = (e->flags & IKF_REPEAT) != 0;
-    if (repeat && !g_down[dik].down) return;    /* pressed with Meta, or released by a focus loss */
+    int repeat = (e->flags & IKF_REPEAT) != 0, again = 0;
+    if (repeat && !g_down[dik].down){
+        if (!g_down[dik].lost) return;                              /* pressed with Meta */
+        repeat = 0; again = 1;                    /* held through a focus loss: down again */
+    }
     if (!repeat && g_down[dik].down) repeat = 1;                  /* its key up was lost */
+    g_down[dik].lost = 0;
     int alt = (e->flags & IKF_ALT) != 0;
     if (kbd_log())
-        fprintf(stderr, "[key] host %s dik=0x%02x vk=0x%02x flags 0x%02x chars %d%s%s\n",
+        fprintf(stderr, "[key] host %s dik=0x%02x vk=0x%02x flags 0x%02x chars %d%s%s%s\n",
                 repeat ? "repeat " : "keyDown", dik, e->vk, e->flags, e->nch,
-                (e->flags & IKF_DEAD) ? " (dead key)" : "", (e->flags & IKF_SYNTH) ? " [synthetic]" : "");
+                (e->flags & IKF_DEAD) ? " (dead key)" : "", (e->flags & IKF_SYNTH) ? " [synthetic]" : "",
+                again ? " (held through a release)" : "");
     if (is_modifier(dik)){
         /* modifiers: as keyboard_mac.m's flags_changed */
         if (!repeat){
@@ -234,6 +247,7 @@ static void key_up(const InEv *e){
     unsigned dik = e->dik;
     if (!dik || dik > 255u) return;
     if (kbd_log() && g_down[dik].down) fprintf(stderr, "[key] host keyUp   dik=0x%02x\n", dik);
+    g_down[dik].lost = 0;
     release(dik, (e->flags & IKF_ALT) != 0);
 }
 
@@ -254,8 +268,16 @@ static uint64_t mono_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,
  * next button change, or that button change.  Moving alone comes as soon as
  * before; a press right after a move comes a frame later.  Changes older than
  * a second (the game did not read the mouse, as in a race) are taken at once,
- * not played back one a frame. */
-enum { MS_MOVE, MS_BTN };
+ * not played back one a frame.
+ * The menus look for what is under the cursor only in a frame it moved, in
+ * their 640x480 units (sub_005bf750 from GetCursorPos; if (dx || dy) in
+ * sub_004ed140, sub_0055d410 ...), and a dialog opened by the last tap
+ * starts on its default button: a tap where the cursor already was (Yes,
+ * then Yes on the next question) pressed nothing.  So a finger landing
+ * within two of those units of the cursor first puts it two units aside for
+ * a frame of its own (MS_HOP), and the cursor comes back to the finger with
+ * a move the menu sees. */
+enum { MS_MOVE, MS_BTN, MS_HOP };
 typedef struct { int kind, x, y, dx, dy; unsigned btn; uint64_t us; } MouseStep;
 #define MOUSE_STEPS 64
 static MouseStep g_ms[MOUSE_STEPS];
@@ -266,7 +288,7 @@ static long g_view_frame = -1;
 static pthread_mutex_t g_ms_mx = PTHREAD_MUTEX_INITIALIZER;
 static void step_take(void){                  /* g_ms_mx held */
     const MouseStep *s = &g_ms[g_ms_head];
-    if (s->kind == MS_MOVE){ g_view_x = s->x; g_view_y = s->y; g_view_dx += s->dx; g_view_dy += s->dy; }
+    if (s->kind != MS_BTN){ g_view_x = s->x; g_view_y = s->y; g_view_dx += s->dx; g_view_dy += s->dy; }
     else g_view_btn = s->btn;
     g_ms_head = (g_ms_head + 1) % MOUSE_STEPS; g_ms_n--;
 }
@@ -290,7 +312,7 @@ static void mouse_take(void){
     while (g_ms_n && now - g_ms[g_ms_head].us > 1000000u) step_take();
     if (f != g_view_frame){
         g_view_frame = f;
-        if (g_ms_n && g_ms[g_ms_head].kind == MS_BTN) step_take();
+        if (g_ms_n && g_ms[g_ms_head].kind != MS_MOVE) step_take();
         else while (g_ms_n && g_ms[g_ms_head].kind == MS_MOVE) step_take();
     }
     pthread_mutex_unlock(&g_ms_mx);
@@ -380,6 +402,13 @@ static void mouse_move(const InEv *e){
     double x = nx * lw, y = ny * lh;
     if (x < 0.0) x = 0.0; else if (x > lw - 1.0) x = lw - 1.0;
     if (y < 0.0) y = 0.0; else if (y > lh - 1.0) y = lh - 1.0;
+    if (e->flags & IKF_TOUCH){
+        double ux = lw / 640.0, uy = lh / 480.0;
+        if (fabs(x - atomic_load(&g_mouse_x)) < 2.0 * ux && fabs(y - atomic_load(&g_mouse_y)) < 2.0 * uy){
+            int h = (int)ceil(2.0 * ux), hx = (int)x + h <= (int)lw - 1 ? (int)x + h : (int)x - h;
+            mouse_step((MouseStep){ .kind = MS_HOP, .x = hx, .y = (int)y });
+        }
+    }
     mouse_step((MouseStep){ .kind = MS_MOVE, .x = (int)x, .y = (int)y, .dx = dx, .dy = dy });
     atomic_store(&g_mouse_x, (int)x); atomic_store(&g_mouse_y, (int)y);
     atomic_store(&MH(IM_MOUSE_X), (uint32_t)(int)x); atomic_store(&MH(IM_MOUSE_Y), (uint32_t)(int)y);
@@ -447,18 +476,24 @@ static void lifecycle_poll(void){
  * player's keys, mouse and pad are not passed on meanwhile (releases and
  * focus still are: nothing stays held) */
 int mprace_owns_input(void);
+void sms_request(int id);
+void photo_input(int cmd, int a, int b);                 /* photo.c */
 static int g_muted;
 static void handle(const InEv *e){
     int mute = mprace_owns_input();
     if (mute != g_muted){
         g_muted = mute;
-        if (mute) release_all("a multiplayer race's trip drives the game", 1);
+        if (mute) release_all("a multiplayer race's trip drives the game", 1, IREASON_NONE);
         fprintf(stderr, "[key] the player's input %s\n", mute ? "muted: the game drives itself to the multiplayer race" : "back");
     }
-    if (mute && (e->type == IEV_KEY_DOWN || e->type == IEV_KEY_TAP || e->type == IEV_MOUSE_MOVE || e->type == IEV_MOUSE_DOWN || e->type == IEV_WHEEL)) return;
+    if (mute && (e->type == IEV_KEY_DOWN || e->type == IEV_KEY_TAP || e->type == IEV_TEXT || e->type == IEV_MOUSE_MOVE || e->type == IEV_MOUSE_DOWN || e->type == IEV_WHEEL)) return;
     switch (e->type){
     case IEV_KEY_DOWN: key_down(e); break;
     case IEV_KEY_UP:   key_up(e); break;
+    case IEV_TEXT:                                       /* a phone's keyboard: characters, no key */
+        if (kbd_log()) fprintf(stderr, "[key] host text, %d char(s)\n", e->nch);
+        for (int i = 0; i < e->nch && i < 3; i++) post(WM_CHAR, e->ch[i], 1u);
+        break;
     case IEV_KEY_TAP: {                                  /* Caps Lock on macOS */
         InEv u = *e; u.type = IEV_KEY_UP; u.flags &= (uint8_t)~IKF_REPEAT;
         InEv d = u; d.type = IEV_KEY_DOWN;
@@ -470,16 +505,19 @@ static void handle(const InEv *e){
     case IEV_WHEEL:      mouse_wheel(e); break;
     case IEV_FOCUS: {
         char why[48]; snprintf(why, sizeof why, "%s %s", reason_name(e->b), e->a ? "active" : "inactive");
-        if (!e->a) release_all(why, 1);
+        if (!e->a) release_all(why, 1, e->b);
         if (e->b == IREASON_SCRIPT) fprintf(stderr, "[key] simulated %s\n", e->a ? "focus gain" : "focus loss");
         lifecycle_set_active(e->a ? 1 : 0, why);
         break; }
-    case IEV_RELEASE_ALL: release_all(reason_name(e->b), e->b != IREASON_META); break;
+    case IEV_RELEASE_ALL: release_all(reason_name(e->b), e->b != IREASON_META, e->b); break;
     case IEV_QUIT:
         g_quit_events++;
         lifecycle_request_quit(e->b == IREASON_SCRIPT ? "autotest" : "page quit request");
         if (g_quit_events >= 2) force_exit("second quit request");
         break;
+    case IEV_LOG: watchdog_log_download(); break;
+    case IEV_SMS: sms_request(e->a); break;
+    case IEV_PHOTO: photo_input(e->dik, e->a, e->b); break;
     default: break;
     }
 }
@@ -509,6 +547,39 @@ static void *input_main(void *unused){
         click_release_due();
     }
     return 0;
+}
+
+/* ---- the game's text entry, for the page ------------------------------------------ */
+/* A phone has no keys: while the game's text entry is up (a new profile's
+ * name, the LAN name), the page shows a field of its own that brings up the
+ * phone's keyboard, starts it with the game's text and sends what is typed
+ * as IEV_TEXT (web/src/app/textentry.ts).  The game has one text entry, the
+ * object at 0x83A7B0 (set up by 0x4FF3B0; 0x55DBD0 hands it every WM_CHAR
+ * while +0x210 and +0x214 are set, 0x551270 takes it in): +0x100 the text,
+ * +0x200 its length, +0x204 its kind (0x4FF310: letters and digits, kind 4
+ * also @._, kind 5 also space,@., kinds 0 and 3 also 0xC0..0xFF and the
+ * punctuation of 0x7FA3D0), +0x20C the most it takes.  Published at every
+ * Present (autotest.c) when it changed, under IM_TEXT_SEQ. */
+#define G_TXT 0x0083a7b0u
+void input_web_frame(void){
+    static uint32_t l_max, l_kind, l_len;
+    static uint8_t l_txt[INPUT_TEXT_BYTES];
+    uint32_t max = 0, kind = 0, len = 0;
+    uint8_t txt[INPUT_TEXT_BYTES] = { 0 };
+    if (MR8(G_TXT + 0x210u) && MR32(G_TXT + 0x214u)){
+        max = MR32(G_TXT + 0x20cu); kind = MR32(G_TXT + 0x204u); len = MR32(G_TXT + 0x200u);
+        if (len > max) len = max;
+        for (uint32_t i = 0; i < len && i < INPUT_TEXT_BYTES; i++) txt[i] = MR8(G_TXT + 0x100u + i);
+    }
+    if (max == l_max && kind == l_kind && len == l_len && !memcmp(txt, l_txt, sizeof txt)) return;
+    if (!max != !l_max) fprintf(stderr, "[input] the game's text entry %s\n", max ? "is up" : "is down");
+    l_max = max; l_kind = kind; l_len = len; memcpy(l_txt, txt, sizeof txt);
+    uint32_t s = atomic_load(&MH(IM_TEXT_SEQ));
+    atomic_store(&MH(IM_TEXT_SEQ), s + 1u);
+    atomic_store(&MH(IM_TEXT_MAX), max); atomic_store(&MH(IM_TEXT_KIND), kind); atomic_store(&MH(IM_TEXT_LEN), len);
+    for (unsigned i = 0; i < INPUT_TEXT_BYTES / 4u; i++)
+        atomic_store(&MH(IM_TEXT + i), (uint32_t)txt[4*i] | (uint32_t)txt[4*i+1] << 8 | (uint32_t)txt[4*i+2] << 16 | (uint32_t)txt[4*i+3] << 24);
+    atomic_store(&MH(IM_TEXT_SEQ), s + 2u);
 }
 
 void input_web_init(void){
@@ -932,6 +1003,7 @@ static void read_real(PadState *s){
         t.connected = (int)atomic_load_explicit(&MH(IM_PAD_CONNECTED), memory_order_relaxed);
         t.family = (int)atomic_load_explicit(&MH(IM_PAD_FAMILY), memory_order_relaxed);
         t.buttons = atomic_load_explicit(&MH(IM_PAD_BUTTONS), memory_order_relaxed);
+        t.wheel = atomic_load_explicit(&MH(IM_PAD_WHEEL), memory_order_relaxed) == 1u;
         for (int i = 0; i < PAD_NAXES; i++){
             uint32_t v = atomic_load_explicit(&MH(IM_PAD_AXIS + i), memory_order_relaxed);
             memcpy(&t.axis[i], &v, 4);
@@ -947,8 +1019,8 @@ static void read_real(PadState *s){
     uint32_t gen = atomic_load(&MH(IM_PAD_GEN));
     if (gen != gen_seen){
         gen_seen = gen;
-        fprintf(stderr, "[pad] player 1 controller: %s (%s)\n", s->connected ? s->name : "none",
-                s->connected ? family_name(s->family) : "-");
+        fprintf(stderr, "[pad] player 1 controller: %s (%s%s)\n", s->connected ? s->name : "none",
+                s->connected ? family_name(s->family) : "-", s->connected && s->wheel ? ", a steering wheel" : "");
     }
 }
 static void stick_dz(float *x, float *y, float dz){
@@ -972,8 +1044,9 @@ int gamepad_read(PadState *s){
     if (syn) *s = g_syn;                         /* the script's pad wins while connected */
     pthread_mutex_unlock(&g_pad_mx);
     if (!syn) read_real(s);
-    if (!syn && mprace_owns_input()){ int con = s->connected; memset(s, 0, sizeof *s); s->connected = con; }   /* (handle above) */
-    stick_dz(&s->axis[PAD_AXIS_LX], &s->axis[PAD_AXIS_LY], dz);
+    if (!syn && mprace_owns_input()){ int con = s->connected, wh = s->wheel; memset(s, 0, sizeof *s); s->connected = con; s->wheel = wh; }   /* (handle above) */
+    /* a wheel's position is the steering, with no dead zone around the middle (its pedals keep the triggers') */
+    if (!s->wheel) stick_dz(&s->axis[PAD_AXIS_LX], &s->axis[PAD_AXIS_LY], dz);
     stick_dz(&s->axis[PAD_AXIS_RX], &s->axis[PAD_AXIS_RY], dz);
     s->axis[PAD_AXIS_LT] = trig_dz(s->axis[PAD_AXIS_LT], tdz);
     s->axis[PAD_AXIS_RT] = trig_dz(s->axis[PAD_AXIS_RT], tdz);
@@ -993,14 +1066,41 @@ void gamepad_rumble(float strong, float weak){
     atomic_store_explicit(&MH(IM_RUMBLE_WEAK), w, memory_order_relaxed);
     atomic_fetch_add_explicit(&MH(IM_RUMBLE_SEQ), 1u, memory_order_release);
 }
+/* the phone's tilt the 3D view turns against (web/src/app/touch.ts: the
+ * level horizon), radians, + = the phone turned clockwise; read once a
+ * frame, so the main view and its road reflection (overrides.c
+ * sub_005c7ec0) turn alike */
+float input_view_roll(void){
+    static long frame = -1; static float roll = 0.f;
+    long f = metal_frames();
+    if (f == frame) return roll;
+    frame = f;
+    uint32_t v = atomic_load_explicit(&MH(IM_VIEW_ROLL), memory_order_relaxed);
+    memcpy(&roll, &v, 4);
+    if (!isfinite(roll)) roll = 0.f;
+    if (roll > 1.5f) roll = 1.5f; else if (roll < -1.5f) roll = -1.5f;
+    return roll;
+}
+/* the menus' small buttons' size (web/src/app/touch.ts: the Controls
+ * sheet's Menu button size; runtime/menusize.c), 1 = the game's own: bar,
+ * the help bar's, else the scroller arrows'.  A negative word is the arrows'
+ * alone, the bar at the game's own (auto on a touch screen) */
+float input_menu_scale(int bar){
+    uint32_t v = atomic_load_explicit(&MH(IM_MENU_SCALE), memory_order_relaxed);
+    float s; memcpy(&s, &v, 4);
+    if (s < 0.f){ if (bar) return 1.f; s = -s; }
+    return isfinite(s) && s >= 1.f ? s : 1.f;
+}
+/* on: 0 unplugged, 1 a pad, 2 a steering wheel */
 void gamepad_synth_connect(int on){
     pthread_mutex_lock(&g_pad_mx);
-    if (on != g_syn.connected){
+    if ((on != 0) != g_syn.connected || (on == 2) != g_syn.wheel){
         memset(&g_syn, 0, sizeof g_syn);
         g_syn.connected = on ? 1 : 0;
         g_syn.synthetic = 1;
+        g_syn.wheel = on == 2;
         g_syn.family = PADF_XBOX;
-        snprintf(g_syn.name, sizeof g_syn.name, "Virtual Controller (autotest)");
+        snprintf(g_syn.name, sizeof g_syn.name, on == 2 ? "Virtual Wheel (autotest)" : "Virtual Controller (autotest)");
     }
     pthread_mutex_unlock(&g_pad_mx);
 }

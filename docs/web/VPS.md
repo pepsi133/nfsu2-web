@@ -93,8 +93,9 @@ web/deploy/release.sh root@<vps> --undo                # back to the module and 
 It checks that the registry has the image (CI cancels a commit's image when a newer push comes), pulls it on the VPS
 before anything changes there (a pull that fails leaves the site as it was), copies the module into place by
 renames, sets `NFSU2_IMAGE` in `.env`, restarts only the server and waits until it is healthy; `-n` first only says
-what it would do. Run again after a failure, it keeps the module and image of before for `--undo`. `NFSU2_DIR` names
-another folder than `/srv/nfsu2`.
+what it would do. Run again after a failure, it keeps the module and image of before for `--undo`. Last it writes
+`module/release.json`, the module's and the image's commits, for the forum bot (`discord-bot/`): after a release of
+only the page or the server, the image's commit is what is live. `NFSU2_DIR` names another folder than `/srv/nfsu2`.
 
 **When something is wrong:**
 
@@ -126,18 +127,21 @@ The rest of this guide is reference.
 - **What it serves:** the page, the game module, the game's own files from your game folder (read-only) and the
   multiplayer switch. Of the game folder it serves only `SPEED2.EXE`, `server.dll`, `server.cfg` and the game's
   data folders (`CARS`, `CREDITS`, `FRONTEND`, `GLOBAL`, `LANGUAGES`, `memcard`, `MOVIES`, `NIS`, `pfdata`, `SOUND`,
-  `speech`, `SUBTITLES`, `TRACKS`), the language packs (`LANGPACKS`, [Languages](#languages)), compared without
-  case, and everything in those folders except dot files.
+  `speech`, `SUBTITLES`, `TRACKS`), the language packs (`LANGPACKS`, [Languages](#languages)) and the texture packs
+  (`TEXPACKS`, [Texture packs](#texture-packs)), compared without case, and everything in those folders except dot
+  files.
   Nothing else at the top of the folder: never an installer's log (`unins000.dat` names the PC, the Windows account
   and the install time), a `SAVE` folder, mod plugins and their settings, or anything else you keep there.
 - **What it never shows:** anything about the VPS or the other players (`web/test/deploy.test.mjs` checks what is
   and is not exposed).
 - **What it keeps for players:** their keyphrase saves, locked ([Keyphrase saves](#keyphrase-saves)), and the Online
-  mode's race results and friends lists ([Multiplayer over the internet](#multiplayer-over-the-internet)).
+  mode's race results and EA Messenger lists, with the messages that wait for a friend
+  ([Multiplayer over the internet](#multiplayer-over-the-internet)).
 
 ## Keyphrase saves
 
-A player can keep their saves on the server under a keyphrase (`nfsu2-xyz-` and 8 words), and load them in any
+A player can keep their saves on the server under a keyphrase (`nfsu2-xyz-` and 8 words; the page calls it a
+passphrase, the server's code, console and these notes a keyphrase), and load them in any
 browser by typing it (the page's Cloud saves: PLAYING.md, Saves). The page locks them before they leave the browser (AES-GCM, with a key made
 from the keyphrase); the server keeps those bytes under the SHA-256 of a token also made from the keyphrase. It never
 sees a keyphrase, a key or a save, and its files name no player.
@@ -157,20 +161,40 @@ sees a keyphrase, a key or a save, and its files name no player.
   day; 60 saves, then one every 2 s; 60 loads, then one a second; and 30 loads of keyphrases there are not, then 30
   an hour, so nobody learns anything by guessing. A version is at most 256 KB. More gets 429 (or 413, or 507 when the
   room is full).
-- **What all clients may do:** new keyphrases come at most as many a day as would fill the room in 30 days if each held
-  the most it can (two versions of 256 KB), 2000 a day at least (50 GB: about 2,800; 140 GB: about 7,900; the start-up
-  line says), a quarter of that at once; more gets 503 and the console a line `[vault] refused a new keyphrase:
-  today's N are taken`. Without it, anyone with enough addresses could fill the room within days, and keep every new
-  player out for the two years the files stay. Saves of the keyphrases already there never wait for it.
+- **What all clients may do:** the saves add at most as many bytes a day to the disk as fill the room for new
+  keyphrases in 30 days (50 GB: 1.5 GB a day; 140 GB: 4.2 GB; the start-up line says), a quarter of that at once. A
+  new keyphrase counts as 32 KB at least (a player's saves pack into 6-14 KB, two versions of them), so 50 GB takes
+  about 45,000 new keyphrases a day; a save that grows its keyphrase past 32 KB counts what it adds. More gets 503 and
+  the console a line `[vault] refused a save: the 1.50 GB a day the saves may add are taken for now`. Without it,
+  anyone with enough addresses could fill the room within days, and keep every new player out for the two years the
+  files stay. A save that keeps its size, or stays within 32 KB, never waits for it.
 - **The disk:** any save that would grow a file stops (507, `[vault] refused a save: the disk has less than ...`)
   while the disk under the state folder has less than 2 GB or 100,000 inodes free, whatever `NFSU2_VAULT_GB` says.
 - **Backups:** copy `vault/` while the server runs: each file is replaced whole, by a rename. Without the folder the
   players' copies on the server are gone; their browsers keep their own.
 
+## Claimed names
+
+With keyphrase saves on, a player's keyphrase can claim their name (PLAYING.md, Online: "Your name is yours"): while
+the claim holds (180 days after they last played under it) nobody else plays under it in the Online menu or free
+roam, and EA Messenger keeps its lists for it. The server keeps `names.json` in the state folder: each name, a code
+made from its keyphrase's token (never the keyphrase), when it was claimed and last played. Written whole within a
+minute of a change. A keyphrase deleted from the cloud frees its name.
+
+- **Cloudflare Turnstile** (a check that a person, not a script, claims a name): create a widget in the Cloudflare
+  dashboard (Turnstile, Add widget: the site's hostname, mode Managed), then put its two keys in `.env`:
+  `NFSU2_TURNSTILE_SITE=<site key>` and `NFSU2_TURNSTILE_SECRET=<secret key>`, and `docker compose up -d server`.
+  The start-up line says `[names] N names claimed; Cloudflare's check on`. With the keys the page's
+  Content-Security-Policy lets in Cloudflare's script and frame (`challenges.cloudflare.com`), and the server asks
+  Cloudflare (HTTPS out to challenges.cloudflare.com) once per claim. Without them claims need no check.
+- **What one client may do:** 10 claims, then 10 a day (one per keyphrase, a change once a week), and 120 checks of
+  a name, then 2 a second.
+- **The operator:** `nfsu2-server ctl unclaim <name>` frees a name (the console says which).
+
 ## Sizing
 
-For up to 4000 players at once (the image's limit; the Node server's was 2000, [From the Node
-server](#from-the-node-server)): 8 vCPU for 2000 and 16 for 4000 (4000 in free roam took the Rust server 6-8 cores of a Ryzen 9 5900X,
+For up to 7000 players at once (the image's limit; the Node server's was 2000, [From the Node
+server](#from-the-node-server)): 8 vCPU for 2000 and 16 for 4000 to 6000 (4000 in free roam took the Rust server 6-8 cores of a Ryzen 9 5900X,
 and a Cloudflare Tunnel's cloudflared pays for each message again, `web/server-rs/README.md`), 8 GB of memory (the
 compose file's limit), 40 GB of disk and a 1 Gbit/s port with a few TB of traffic a month.
 
@@ -184,8 +208,8 @@ compose file's limit), 40 GB of disk and a 1 Gbit/s port with a few TB of traffi
 - The game folder takes about 3 GB of disk.
 - Each new player downloads the 7 MB module (again after each new build; with the Cache Rule below from Cloudflare,
   which takes it from the server once) and then the game data they play (about 70 MB for a quick race, up to
-  the whole 3 GB over a career), once: the browser keeps it. The data is compressed on the way (zstd, or br through
-  Cloudflare): all but the movies is 1.37 GB on the network for 1.98 GB, the tracks about 40 %; the movies' video
+  the whole 3 GB over a career), once: the browser keeps it. The data is compressed on the way (br, kept at its best,
+  below): all but the movies is 1.28 GB on the network for 2.09 GB, the tracks about a third; the movies' video
   does not compress and goes as it is. "Preload the game data" on the start page fetches all but the movies at
   once, 4 requests at a time, so a player on a slow line never waits on a loading screen. It asks for one block a
   request at the addresses the game's own reads use, so with the Cache Rule below Cloudflare serves both.
@@ -193,6 +217,22 @@ compose file's limit), 40 GB of disk and a 1 Gbit/s port with a few TB of traffi
   that). At most 128 answers are compressed at once (8 per player, about 200 MB of memory); past that they go as
   they are, never held up. The compressing runs on threads of its own (half the cores, at least two) at a lower
   priority than the switch, so a burst of downloads takes only what the players' traffic leaves.
+- The server also compresses each 1 MiB block of the game data once at brotli's best and keeps it in the state
+  volume (`blocks/`, 1.5 GB for a game folder with every language pack). All but the movies then crosses the network
+  in 1.28 GB instead of the 1.39 GB of compressing as it is sent (the tracks 41 -> 33 % of their size, SPEED2.EXE
+  50 -> 41 %, the voices 84 -> 79 %, the music 86 -> 84 %; the movies not at all), at no CPU per player. Two threads
+  at the lowest priority make them after each start and each change of the game files (a manifest `?refresh`), the
+  blocks players ask for first: about half an hour for the whole folder (5600 blocks, 3100 that compress). Their two
+  cores count against `nfsu2.slice`'s quota all the same, so they wait while the slice is 70 % used and go on below
+  55 % (`kept blocks: waiting while /nfsu2.slice uses ...`, then `going on`): on a busy evening the folder takes
+  longer, and free roam's busy cap never sees them. Without room (16 GB in `blocks/`, or less than 2 GB free on its
+  disk) they wait too, the room looked at again every minute. Until a block is kept it goes out as before, compressed
+  as it is sent, and
+  Cloudflare keeps that answer 10 minutes only. The page asks at `/data-blocks/v2/` since, so Cloudflare's copies of
+  the answers from before are not served for them (the Cache Rule covers both). `NFSU2_COMPRESS_THREADS` in the
+  server's environment sets the threads (0: none, every block as before). The `[blocks]` line every 5 minutes counts
+  the answers: kept blocks, compressed as sent (zstd, br, gzip), as they are. Through Cloudflare nearly all should be
+  kept ones once the blocks are made; none at all would mean Cloudflare asks the server for gzip only.
 - Free roam is at most about 25 KB/s each way per player: the server's free-roam hub pairs each player with the 7
   nearest, and snapshots go between those only. 2000 players roaming at once are about 400 Mbit/s each way through
   the VPS, 4000 about 800 Mbit/s. Measured with 62 simulated players and 2 real pages on one server
@@ -201,23 +241,33 @@ compose file's limit), 40 GB of disk and a 1 Gbit/s port with a few TB of traffi
 
 ### A share of the VPS
 
-The compose files put every container of theirs (the server, Caddy, or cloudflared and its namespace) into the
-systemd slice `nfsu2.slice` (`cgroup_parent`, `NFSU2_SLICE` to name another), and `web/deploy/nfsu2.slice` gives that
-slice at most 80 % of a 16-vCPU VPS (`CPUQuota=1280%`, 12.8 cores; 80 times the vCPUs for another size), so the
-rest of the VPS keeps at least 3.2 cores whatever the players do. The server and cloudflared share the 12.8 as their
-load goes. At the limit they are slowed down, never the rest: the server's workers count the time they wait as busy
-(wall time), so the free-roam hub's busy cap gives players fewer friends, as it does on a busy server.
+The compose files put every container of theirs (the server, Caddy, or cloudflared and its namespace) into the systemd
+slice `nfsu2.slice` (`cgroup_parent`, `NFSU2_SLICE` to name another), and `web/deploy/nfsu2.slice` gives that slice at
+most 15 of a 16-vCPU VPS (`CPUQuota=1500%`; for another size, its vCPUs less what the rest needs, times 100), so the
+rest of the VPS keeps at least 1 core whatever the players do (it used about half of one at 5,857 players). The
+server and cloudflared share the 15 as their load goes. The server sees what the whole slice uses (`cgroup: host` in `compose.yml`: the VPS's cgroup tree, read only),
+and over 85 % of the quota the free-roam hub's busy cap gives players fewer friends, as it does when the server's own
+workers are busy: fewer car states to send costs cloudflared less too (bytes, not messages: each player still gets a
+bundle every 50 ms). At the limit they are slowed down, never the rest. The server's console says the quota it found
+at the start (`CPU quota : 15 cores for /nfsu2.slice`; "none seen" in a container without `cgroup: host`), and every
+5 minutes what the slice used (`[players] CPU in the last 5 minutes: the server 1.09 cores, its switch's workers 13 %
+busy; /nfsu2.slice 4.51 of its 14 cores (32 %)`).
 
     cp web/deploy/nfsu2.slice /etc/systemd/system/ && systemctl daemon-reload
     docker compose up -d --force-recreate
     systemctl status nfsu2.slice                               # the containers in it
-    systemctl show nfsu2.slice -p CPUQuotaPerSecUSec           # 12.8s
+    systemctl show nfsu2.slice -p CPUQuotaPerSecUSec           # 15s
+
+A new quota for a slice that runs already needs no recreate: after the `cp` and `daemon-reload`,
+`systemctl set-property --runtime nfsu2.slice CPUQuota=1500%` sets it at once (`cat
+/sys/fs/cgroup/nfsu2.slice/cpu.max`: `1500000 100000`), and the file keeps it after a reboot.
 
 It needs Docker's systemd cgroup driver (`docker info`: `Cgroup Driver: systemd`, the default with cgroup v2).
 Without the file the containers still start, in a slice systemd makes for them with no limit; with the cgroupfs
 driver (Docker Desktop) `nfsu2.slice` is a plain cgroup, also with no limit.
 
-How far 12.8 cores go: 1209 players took the server 0.7 of a core and cloudflared 1.7 (2026-10-21). 4000 simulated
+How far the cores go: 1209 players took the server 0.7 of a core and cloudflared 1.7 (2026-10-21); 4,294 took the
+server 3.4 and cloudflared 8.9, 11.8 in all, when the slice was 12.8 (2026-10-23). 4000 simulated
 players in free roam took the server 8.2 cores on 12 workers at 32 friends each (`NFSU2_THREADS=12`), 6.5 on 8
 workers at the busy cap's 8 (`web/server-rs/README.md`); cloudflared pays for each message again, so 4000 players
 are about where the slice's limit is reached, and past it free roam gives fewer friends instead of taking more of the
@@ -234,7 +284,7 @@ VPS.
   |---|---|---|---|
   | `/game` | your game folder | `/srv/nfsu2/game` | read-only |
   | `/module` | `nfsu2.wasm` and `nfsu2.json` | `/srv/nfsu2/module` | read-only |
-  | `/state` | the server's keys, the Online mode's records, the keyphrase saves | the volume `nfsu2-web_state` | |
+  | `/state` | the server's keys, the Online mode's records, the keyphrase saves, the kept blocks | the volume `nfsu2-web_state` | |
 
 - **From GitHub's registry:** `.github/workflows/image-rs.yml` builds `ghcr.io/th0mk/nfsu2-web-rs` for amd64 and
   arm64 on every push: `latest` from `main`, `sha-<commit>` from every push, and `<version>` and `<major>.<minor>`
@@ -288,11 +338,12 @@ NFSU2_IMAGE=ghcr.io/th0mk/nfsu2-web-rs:sha-<commit>
   commit, then `docker compose up -d`. The state volume serves either.
 - `UV_THREADPOOL_SIZE` means nothing to the Rust server; `NFSU2_THREADS` sets its worker threads (by default half
   the cores, 2 to 8). Its console has the Node server's lines.
-- **4000 players** where the Node server took 2000 (`--max-peers` 1 to 4000, the image's `NFSU2_MAX_PEERS=4000`): the
-  virtual network is 10.77.0.0/20, and the game module's peer bits cover a /21, so for a player on 10.77.8-15.x the
+- **7000 players** where the Node server took 2000 (`--max-peers` 1 to 7000, the image's `NFSU2_MAX_PEERS=7000`: at 5,857 players the game
+  used 1.96 cores a thousand, nfsu2.xyz 2026-10-30, so 7000 fill about 91 % of the slice's 15): the
+  virtual network is 10.77.0.0/19 (addresses in 10.77.0-27.x), and the game module's peer bits cover a /21, so for a player on 10.77.8-27.x the
   game asks that host itself (a LAN race's connect to one who has just gone ends after the same 3 s as "timed out"
   instead of "unreachable"; nothing else differs, and pages and modules of before need no change). Online mode takes
-  2000 lobby sessions and 600 games (Node: 1000 and 300), the free-roam hub 4096 players. 4000 players need 65536
+  3500 lobby sessions and 1050 games (Node: 1000 and 300), the free-roam hub 7168 players. 7000 players need 65536
   open files (`ulimits: { nofile: 65536 }` in `compose.yml`), and past about 3000 in free roam more workers than 8
   (`NFSU2_THREADS=12` in `.env`; `compose.yml` passes it on) keep them at 32 friends each instead of the busy cap's 8.
 
@@ -334,7 +385,10 @@ players the evening before.
 Every player picks the game's language in Settings. The North American game folder has the text of thirteen,
 but English voices and movies only, and short early versions of the Chinese, Japanese and Thai text. The rest comes
 from KyoriAsh's "Multi 13 languages" mod ([nfsmods.xyz/mod/5749](https://nfsmods.xyz/mod/5749)), for Brazilian
-Portuguese TraduMix's and MixMods' translation and for Polish PLProjekt's, as language packs: a `LANGPACKS` folder in
+Portuguese TraduMix's and MixMods' translation, for Polish PLProjekt's, for Turkish muntazam's, for Hungarian
+GameHunter's and for the English subtitles VileStuff's "English Subtitles Fixed"
+([nfsmods.xyz/mod/5286](https://nfsmods.xyz/mod/5286)), as language
+packs: a `LANGPACKS` folder in
 the game folder, one folder per language, whose files a game in that language reads in place of the game folder's
 (`runtime/language.c`). The game folder itself stays as it is.
 
@@ -347,19 +401,105 @@ the game folder, one folder per language, whose files a game in that language re
    [portal24h.pl](https://www.portal24h.pl/spolszczenia-gier/spolszczenia-gier/mo/Need-For-Speed-Underground-2-(plprojekt)-1456/))
    and extract it into a third empty folder (`unrar x`). It holds two Windows installers; the tool reads either one's
    files and never runs it.
-4. `tools/langpacks.py "<your game folder>" --multi13 "<the mod's folder>" --ptbr "<the translation's folder>"
-   --pl "<the Polish folder>"` builds `LANGPACKS` (1.6 GB) and prints what each language got: the dubbed voices and
-   movies of French, German, Italian, Spanish, Japanese and Russian, the full Chinese, Japanese and Thai text with
-   their fonts, Russian, Portuguese and Polish in English's place (Polish with its fonts), and the Danish, Dutch and
-   Swedish EA logos. Korean needs nothing. Any source can be left out: the others' packs stay as they are.
-5. Copy it like the rest, from inside the game folder:
+4. Download the English subtitles (`English Subtitles Fixed (v1.0).7z`) and extract it into a fourth empty folder
+   (`7z x`; `bsdtar` and Windows' `tar` read it too). The tool reads its Binary script; neither Binary nor the
+   Extra Options mod it asks for is needed.
+5. Download the Turkish translation (`need_for_speed_underground_2_turkish_translation_patch_v1.1.zip`, muntazam's
+   "Need for Speed Underground 2 Turkish Translation Patch" v1.1 at
+   [moddb.com](https://www.moddb.com/mods/need-for-speed-underground-2-turkish-translation-patch)) and extract it into
+   a fifth empty folder. It holds a Windows installer, `nfsu2tr11.exe` (Inno Setup): unpack it there with
+   [innoextract](https://constexpr.org/innoextract/) (`innoextract nfsu2tr11.exe`, into `app/`), never run. The
+   Extra Options mod it asks for is not needed either.
+6. Download the Hungarian translation (GameHunter's v1.1 by L_zooltan, `nfs_underground2.exe`, from
+   [gamehunter.hu](http://www.gamehunter.hu/2010/08/need-for-speed-underground-2-pc.html) or
+   [magyaritasok.hu](https://magyaritasok.hu/games/need-for-speed-underground-2), the GameHunter TEAM one) into a
+   sixth empty folder. It is a Windows installer (Astrum InstallWizard, as the Polish ones); the tool reads its files
+   and never runs it.
+7. `tools/langpacks.py "<your game folder>" --multi13 "<the mod's folder>" --ptbr "<the translation's folder>"
+   --pl "<the Polish folder>" --subs "<the subtitles' folder>" --tr "<the Turkish folder>" --hu "<the Hungarian
+   folder>"` builds `LANGPACKS` (1.6 GB) and prints what each language got: the dubbed voices and movies of French,
+   German, Italian, Spanish, Japanese and Russian, the full Chinese, Japanese and Thai text with their fonts, Russian,
+   Portuguese, Polish, Turkish and Hungarian in English's place (Polish and Turkish with their fonts), the Danish,
+   Dutch and Swedish EA logos, and English's text with the movies' lines whole (0.3 MB). Korean needs nothing. Any
+   source can be left out: the others' packs stay as they are.
+8. Copy it like the rest, from inside the game folder:
    `rsync -rlt LANGPACKS root@<vps>:/srv/nfsu2/game/`, then the same `chmod`.
 
 A player's browser fetches only their own language's pack: "Preload the game data" adds about 50 MB of dubbed
 voices (Russian 94 MB), and the dubbed movies (206 MB in all) stream in place of the English ones (725 MB). Without
-`LANGPACKS` every language but Russian, Portuguese and Polish still plays its text, with English voices and movies;
-those three play in English. All but English, French, German, Italian and Spanish (whose texts leave the lines their
-dubs speak empty) show the movies' subtitles; the North American game shows none.
+`LANGPACKS` every language but Russian, Portuguese, Polish, Turkish and Hungarian still plays its text, with English
+voices and movies; those five play in English. All but French, German, Italian and Spanish (whose texts leave the lines
+their dubs speak empty) show the movies' subtitles (Settings, Game, Subtitles, on by default), English only with its
+pack: the game folder's English lines stop at their first apostrophe ("But if you"). The North American game shows none.
+
+## Texture packs
+
+Settings, Display, More, Menus and HUD, Upscaled (Original is the default) shows LunicAura106's "Upscaled HUD" (UHUD,
+[nfsmods.xyz/mod/4319](https://nfsmods.xyz/mod/4319)): the menus, the race HUD, the fonts and the car and brand logos
+redrawn at four times their size. It comes from a texture pack, `TEXPACKS/uhud.pak` in the game folder, which the
+port reads in place of the game's textures on the GPU only (`runtime/web/texrep_web.c`): the game keeps reading its
+own files and keeps its layout. The mod's own installer and plugin are not used.
+
+1. Download the mod's archive (`NFSU2UHUD11192022a.7z`) and extract it into an empty folder, not the game folder
+   (`7z x`; `bsdtar` and Windows' `tar` read it too).
+2. `tools/texpacks.py "<your game folder>" --uhud "<the mod's folder>"` builds `TEXPACKS/uhud.pak` (101 MB, a few
+   seconds) and prints what it holds.
+3. Copy it like the rest, from inside the game folder:
+   `rsync -rlt TEXPACKS root@<vps>:/srv/nfsu2/game/`, then the same `chmod`.
+
+A player's browser fetches the pack only with Upscaled; its blocks compress to about 5 MB ("Preload the game data"
+counts its 101 MB). Without `TEXPACKS` Upscaled plays with the game's own textures.
+
+## Smaller music
+
+The game's music, `pfdata/MusicSFx.mus`, is 510 MB: 27 of its 43 songs are 4-bit ADPCM at 382 kbit/s, and 30 of its
+73 streams are never played (copies that the game's song table does not name). `tools/musicpack.py` rebuilds it with
+those 27 songs in EALayer3, the MP3 variant the game already plays its other 16 songs in, and without the unused
+streams: 235 MB, with a `MusicSFx.mpf` that points at the songs' new places. The game plays it with its own decoder
+and no change to the port. Every song keeps its length to the sample, its first 47 and last 100 samples are the
+original's (as in EA's own EALayer3 songs), and the 16 EALayer3 songs are the same bytes. The new songs are LAME VBR
+`-V 1` (231 kbit/s on average), which the PEAQ measure rates as imperceptible against the ADPCM (-0.17 to -0.02,
+0 being no difference). Over the network the file takes 231 MB instead of 425 MB, and a song while it plays 24 %
+fewer bytes (206 instead of 271 kbit/s on average).
+
+1. `apt install lame` (LAME 3.100: the same game folder and LAME make the same bytes).
+2. `tools/musicpack.py "<your game folder>" <an empty folder>` (about a minute on 12 cores) writes `MusicSFx.mus`
+   and `MusicSFx.mpf` there. It reads the game folder and never writes to it.
+3. Copy both to the VPS next to the game folder, not into it: `rsync -t MusicSFx.mus MusicSFx.mpf
+   root@<vps>:/srv/nfsu2/music-new/`.
+4. On the VPS, keep the originals and move the new pair in with one command, so no page sees one new file and one
+   old: `cd /srv/nfsu2 && mkdir -p music-orig && cp -a game/pfdata/MusicSFx.* music-orig/ && chmod 644
+   music-new/* && mv music-new/MusicSFx.mus music-new/MusicSFx.mpf game/pfdata/`, then open
+   `https://<your site>/data-manifest?refresh`. Going back is the same `mv` from `music-orig`.
+
+A player who is in a game at that moment keeps the old song table: when their browser asks for a part of the music it
+has not kept and Cloudflare has not either, the music stops or turns to noise until they reload the page (tested: the
+game itself carries on). A quiet hour keeps that to a few players. Browsers keep the old file's blocks they already
+have (the cache names a file by its size and time) until the player deletes the game data.
+
+## Movies in AV1
+
+The game's movies are VP6 at 5 to 12 Mbit/s, the most a player downloads after the game data. Browsers that decode
+AV1 (Chrome, Edge and Firefox, on computers and phones; Safari on the Macs and iPhones that decode it in hardware, M3
+and iPhone 15 Pro on) can play them as AV1 instead, at about a fifth of the size and looking the same: a copy of each
+movie in an `AV1` folder next to it (`MOVIES/AV1`, `LANGPACKS/<language>/MOVIES/AV1`), which the page opens in its
+place (`runtime/movie.c`). Safari on older Macs and iPhones, and any browser without AV1, keeps playing the VP6
+movies, so the game folder keeps them too.
+
+1. `sudo apt install ffmpeg` (the encoder is its libaom), then from the repository:
+   `tools/movies_av1.py "<your game folder>" <out>`. The AV1 files land in `<out>`, at their places in the game
+   folder: the game folder's 965 MB of movies become 179 MB, each dubbed language's 216 MB 153 MB. It took about
+   50 minutes on 12 cores; a second run makes only what is new, and the dubbed languages share their pictures, so
+   those are encoded once.
+2. Optional: `tools/movies_av1.py --check "<your game folder>" <out> --ffmpeg <an ffmpeg with libvmaf>` measures
+   each AV1 movie against its VP6 one (VMAF; 95 or more looks the same).
+3. Copy them over like the rest, from inside `<out>`:
+   `rsync -rlt MOVIES LANGPACKS root@<vps>:/srv/nfsu2/game/`, then the same `chmod`, and open
+   `https://<your site>/data-manifest?refresh`.
+
+The order of this and a new version does not matter: a page that does not know the AV1 files never opens them, and
+one that does opens a movie's AV1 copy only where there is one. `NFSU2_MOVIE_CODEC = vp6` in a player's settings.ini
+plays the VP6 movies anyway.
 
 ## How it runs
 
@@ -380,8 +520,8 @@ dubs speak empty) show the movies' subtitles; the North American game shows none
     restarts);
   - closes, without an answer, a connection that asks for another name (the bare address, a scanner's made-up
     name), on 80 and on 443; a TLS handshake without your name fails, so the certificate is not shown;
-  - opens at most 31900 connections to the server (one per request in progress; with 4000 players the Rust server
-    takes 32000, 8 per player; the Node image, at most 2000 players, takes 16000);
+  - opens at most 55900 connections to the server (one per request in progress; with 7000 players the Rust server
+    takes 56000, 8 per player; the Node image, at most 2000 players, takes 16000);
   - has its admin API off: nothing reconfigures it while it runs, and a changed `.env` takes `docker compose up -d`.
 - **NFSU2_HOST is one name.** For a second name, or a wildcard, edit the Caddyfile in `compose.yml` and the
   server's `NFSU2_HOST` (a comma list; `*.example.com` for one label under it). A wildcard certificate needs Let's
@@ -391,9 +531,10 @@ dubs speak empty) show the movies' subtitles; the North American game shows none
   them, but for the memory: the unit's 3 GB was too little for 110 players (2.6 GB). It writes only to `/state`.
   At the memory limit the kernel stops the server and Docker starts it again.
 - **Keep the state volume.** It holds the ETag key (a new key makes every player's browser download the game data
-  again), the switch's addresses (`lan-addresses.json`: a player who reconnects gets the same one back) and the
-  Online mode's records (`online/`) and the players' keyphrase saves (`vault/`). `docker compose down` keeps it;
-  `down -v` deletes it.
+  again), the switch's addresses (`lan-addresses.json`: a player who reconnects gets the same one back), the
+  Online mode's records (`online/`), the players' keyphrase saves (`vault/`), your [bans](#kick-and-ban)
+  (`bans.json`, `bans.key`) and the kept blocks (`blocks/`: made again when lost, half an hour of two threads).
+  `docker compose down` keeps it; `down -v` deletes it.
 - **In every mode the server:**
   - answers only `GET` and `HEAD` (and `PUT` and `DELETE` at `/vault`, the keyphrase saves, from its own pages), and
     only for its own names (any other `Host` gets 421);
@@ -430,29 +571,191 @@ and HTTP/3's UDP, and port 80 stays with whatever has it (another API, say), whi
 
 ## What the log keeps
 
+The server keeps its log in the state volume too, one file a day (UTC) in `logs/`, each line after its time
+(`2026-10-31T10:20:40.155Z`). A deploy or a restart does not lose it, and it reaches further back than Docker's own
+(`docker compose logs`, 100 MB: about 16 hours with 4,000 players). A day that ended is gzipped (20-30 MB with 4,000
+players) and kept for 30 days. To get it out, on the VPS or from your computer:
+
+```sh
+ssh root@<vps> /srv/nfsu2/nfsu2 logs 2 > logs.gz    # the last 2 days (1: today so far), gzipped
+gzcat logs.gz | grep -F '[cheat]'                   # zcat on Linux
+```
+
+`nfsu2` is the operator's script of [kick and ban](#kick-and-ban): copy it to the VPS again after it changed.
+
 `docker compose logs server` is the server's console: start-up, players joining (by virtual address, `10.77.x.x`)
 and leaving (by virtual address and nickname), refused requests and connections, and errors (method, path and the
 server's own stack, never the client's details). Every 5 minutes while anyone is on, a `[players]` line says what
-the players on the switch do, each counted once: in Online mode, on the LAN or Online screens, in free roam, on an
-older page (one loaded before the page let its place go; it holds the place until its tab closes), and leaving or
-starting (the page lets the place go 10 s after the last network feature). It ends with how many players are more
+the players on the switch do, each counted once: in Online mode, on the LAN or Online screens, in free roam, and
+leaving or starting (the page lets the place go 10 s after the last network feature). It ends with how many players are more
 than a second behind on their connection (the server times each one's round trip every second, queues past the
 server included: cloudflared's, the tunnel's) and how many of them get fewer of the other cars' updates meanwhile,
 with the updates left out since the last line. Many players behind while the server is idle: look at the tunnel
 (the cloudflared copies' sites, below). Counts only, no names or addresses.
 
+After each multiplayer race from free roam, every player's game reports it once back in free roam, and the log has a
+`[race]` line for each: the race (its lobby, which every player's line of that race shares, the race type, track,
+laps and cars), the player's nickname, place (or "did not finish", "quit") and the car as the game rated it (its
+type, the game's class and rating, the race's average rating, power, weight, top speed, and the factor its engine
+power had in the race) and its time. For evening out the cars:
+`gzcat logs.gz | grep -F '[race]'`.
+
+Cheats are `[cheat]` lines, each with the player's virtual address and nickname, as [kick and ban](#kick-and-ban)
+take them. The lines are for you to read: nobody is kicked or banned by them. A line about a race (Online mode's, or
+a race lobby's in free roam) ends with a handle, `(ban c17)`, that `ban` takes for a week after the line, long after
+the player left: `./nfsu2 ban c17 2w Cheating in races`. The same player's next lines keep the handle, under any name,
+in any browser that has its keyphrase or page id, and say the names its earlier lines had and the bans of it since
+(`(ban c17; before as "Bob"; was ban #4)`: banned, and back once that ban ended or was lifted; `ban #4 in force`: back
+past a ban that still holds). Free roam's lines get none.
+
+- **In races**: every racer's game reports the race's results too (each racer's time, how far it came, the way it
+  drove), only from a player who asked to join the race's lobby, naming only its players, one report a race. Once
+  all of them came, or 90 s after the first, the server judges the race: its winner is the one most reports had
+  first, at the slowest time any report gave it, and the race's length is what another finisher's own game says it
+  drove. A line (`won the race of lobby …`) when the winner averaged 350 km/h or more over it, which no car does (a
+  free-roam sprint's average: 107 km/h); won in under half the race's quickest clean win the server saw since it
+  started (two reports, another finisher), which a teleport to the finish with nobody else over the line does; won,
+  once the race had 10 clean wins, in under 70 % of the third quickest other winner's time (a car made faster than
+  any tuning makes it: the honest wins of a day came at 78 % of it or more), unless another racer finished close
+  behind (over 70 % of its time: that time can be driven); or came under half the way by two reports or more, as a
+  cheat that ends the race at once does ("having driven 0.6 % of the way"). One player's report cannot make a winner
+  or a time, and the line says how many of the race's reports saw it, and what the winner's own game said when it did
+  not agree ("its own game: did not finish": a game out of step with the others, more likely than a cheat) or sent
+  no report. A car no tuning makes (an
+  edited save's: 600 kW, 420 km/h or a rating of 1000 or more; the game's best cars make 450 kW, 380 km/h and 800) is
+  a line of its own, `raced in the race of lobby … in an edited car`, whether it won or not.
+  In Online mode each racer is judged by its own game's figures (`won the online race …`, "by its own game"): a time
+  under the shortest its race type takes (the result is not taken either), 350 km/h or more on average, or a way
+  under half another racer's own (both by their own games: "each by its own game"; a racer who finished, or was on
+  the way when the race ended, 30 s after the first: a game that went on alone long after says nothing), or a top
+  speed of 420 km/h or more, finished or not ("an edited car": of 39,000 players' top speed records 5 went over it);
+  a race won in under 40 % of the next finisher's time, by the result; and, once the track (race type, track,
+  direction, laps) had 10 clean wins since the start, one won in under 70 % of the third quickest other winner's time
+  there, unless another racer finished close behind (over 70 % of its time). A report that
+  leaves out a player of the race (one who joined as it started and never raced) is taken and looked at, as any
+  other. An Online line names the track and laps and the racer's own top speed;
+  the other racers' times are on that race's `[online]` lines (`grep -F '"<race name>"'`). A drift race is won by
+  points: of the checks above only the edited car's top speed is made (and in a free-roam lobby the edited car's
+  line). An Online drift race's result line has the points and the track (`(drift, ranked, track 4311, 3 laps): 1 Bob
+  310400 points, ...`), and each racer's report a line of what its own game said (`Bob's own game: 1 of 4, 310400
+  points, its biggest drift 42000, top speed 220 km/h, 3:10.50`): what the game does with a car that hits a barrier
+  mid-drift (its drift so far lost) never reaches the server, so there is no line for it, and points far above the
+  others' on a track are for you to compare.
+- **Speed hacks in races**: a game whose clock runs fast does not get past a race's start, in a free-roam lobby
+  (1.25 and 1.5 times as fast in a test) or in Online mode (1.5): every racer stays on the pre-race screen. The race's
+  finish times are the same in every game, so they could not show one either.
+- **In free roam**: a teleport (the car went 300 m or more farther than any car drives, in one jump or in short hops),
+  a car over 450 km/h for 2 s, or a game whose clock runs 1.3 times as fast as the server's or more for a minute (a
+  speed hack); a teleport's or a fast car's line names the players within 40 m of where it came to, and a race lobby
+  that starts there. A player gets 5 of these lines, then one every 2 minutes; the rest are counted, and summed up
+  every 10 minutes and when it leaves free roam.
+- **None**: the game's own jumps (Respawn, the World Map's jump to an event or a shop, the garage, shops and races),
+  a bad connection (delays, stalls, a backlog that comes at once or catches up slowly), a car that flies (an edited
+  save) unless it does one of those, an honest winner over racers who stood still or were still on the way, what one
+  player's game shows of another's car (a racer who left the race is put far away: 462 km in a 4-minute sprint), a
+  race report the server could not read as the race's (a racer named twice, other players: `race report not taken:
+  players named twice`), a race whose other racers quit, by the one report that came. The World Map's jump stays in free roam, so a teleport that lands within 25 m of an event's
+  start or 45 m of a shop's door is taken for one, whoever made it.
+
+The races won by cheating: `gzcat logs.gz | grep -F '[cheat]' | grep 'race'`; and the cheats that bother others in
+free roam: `... | grep -e 'next to' -e 'race lobby'`.
+
 - **No player's real IP address** is written, and the page sends the server nothing about the player but the
-  nickname.
+  nickname, a random id the browser keeps for [bans](#kick-and-ban), a token of its keyphrase when it has one
+  (claimed names and bans: the server keeps only hashes of it), and after a multiplayer race its car and place.
 - **`--access-log`** adds a line per request with the client's IP address and the URL. It is off by default, for
   debugging only: add it to the server's `command` in `compose.yml` (`["--behind-proxy", "--access-log"]`), and
-  the log then holds your friends' addresses for as long as Docker keeps it.
+  the log then holds your friends' addresses for as long as Docker keeps it, and the log files for 30 days.
 - **What one client can cause** is limited per minute: 2 lines about its refused requests, 2 about its refused
   `/lan` connections, 20 joins and leaves, 30 lines of Online mode and 3000 access-log lines; then one line saying
   how many were left out. Errors are written in full.
-- **Docker keeps the console** in files it rotates (the `local` log driver: 5 files of 20 MB per container), so
-  the log never fills the disk.
+- **Docker keeps the console** in files it rotates (the `local` log driver: 5 files of 20 MB per container), and
+  the server its log files for 30 days (about 1 GB with 4,000 players), so the log never fills the disk.
 
 The console names paths and addresses: it is yours.
+
+## Players a day
+
+The server counts how many come each day (UTC), each browser once: the ones that opened the page, played (pressed
+Play, or used free roam, LAN or Online), drove in free roam, and were in Online mode. On the VPS:
+
+```sh
+cd /srv/nfsu2
+./nfsu2 days         # the last 30 days, then today so far
+./nfsu2 days 90      # the last 90
+```
+
+The log has a `[days]` line every 5 minutes with today's counts so far, and one when a day ends. The days that ended
+are kept in the state folder's `days.csv` (`docker compose cp server:/state/days.csv .` copies it out), the day so
+far in `days.json`, so a restart counts on.
+
+A browser is the random id its page keeps (the one bans use); the server keeps only a hash of it with a key that is
+new each day, and forgets the day's hashes when it ends. The same person on two devices counts twice, a private window
+once a load. Players with a page from before this server only count once they play with others. Cloudflare's own
+"Unique visitors" (Analytics, Traffic) counts addresses instead: many players share one on mobile networks.
+
+## Kick and ban
+
+You can take a player out of playing with others (free roam, Online mode and LAN races) for now, for a while or for
+good, with a message their game shows them. Their game goes on, on their own. `web/deploy/nfsu2` runs the commands
+in the server's container: copy it next to `compose.yml` once (`scp web/deploy/nfsu2 root@<vps>:/srv/nfsu2/`, then
+`chmod +x /srv/nfsu2/nfsu2` on the VPS), and on the VPS:
+
+```sh
+cd /srv/nfsu2
+./nfsu2 who                              # who is on: address, name, what they do, for how long; and who left in the last hour
+./nfsu2 who bob                          # only names with "bob" in them (theirs, or the one over their car)
+./nfsu2 kick Bob Stop ramming people     # off now, with that message; reloading the page brings them back
+./nfsu2 ban Bob 3d Ramming, 3 days       # off, and turned away for 3 days: 30m, 12h, 3d, 2w, or perm for good
+./nfsu2 ban 10.77.4.17 perm              # a player by address, when two have the same name
+./nfsu2 ban c17 2w Cheating in races     # the player a [cheat] line of a race names, "(ban c17)", for a week after it
+./nfsu2 bans                             # the bans: number, name, until when, the message
+./nfsu2 unban Bob                        # or unban '#4'
+```
+
+From your own computer it is one line: `ssh root@<vps> /srv/nfsu2/nfsu2 kick Bob Stop ramming`. The message needs
+no quotes, but over ssh an apostrophe needs them twice (`"'Don't ram'"`), or log in first.
+
+- **What the player sees**: a box in the middle of the game, "You were removed from playing with others: Stop
+  ramming people." or "You can't play with others until 27 Oct 2026, 15:05: Ramming, 3 days." (in their own time
+  and language), and that they can keep playing on their own. Nothing connects them again until they reload (a
+  kick) or the ban ends. A page loaded before this version does not know the message: it shows the server as gone
+  for a while and keeps trying.
+- **What a ban names**: there are no accounts, so a ban names the player three ways: the random id their browser
+  keeps for the site (in two places, so clearing one does not lose it), the keyphrase they play with (the one that
+  keeps their cloud saves and their name, the same on every device), and their address (an IPv4 address or an IPv6
+  /56). A page with any is turned away. If the player is on twice (a phone and a PC with one keyphrase), the ban
+  names both. The id and the keyphrase for as long as the ban lasts; the address only for a week after it was last
+  the player's: addresses change hands (a phone network gives many people one address in turn), so a ban for good
+  would one day hit strangers. When the banned id or keyphrase shows up at a new address (a VPN, the phone), that
+  address is banned too; when the keyphrase shows up in a new browser, or a new keyphrase in the banned browser, that
+  one is banned for 30 days after it was last seen with them. What is taken in that way brings in nothing further: a
+  friend's computer the player typed the keyphrase into is turned away for a month at most, never the friend's own
+  keyphrase or network. A ban also takes off whoever is on the switch from its addresses at the moment (a
+  household): `ban` lists who it removed. A player who clears the site's data, leaves their keyphrase (and their
+  saves and name) behind and changes networks comes back; no ban can stop that without accounts.
+- **Who left**: `ban` takes a player who left in the last hour too (`who` lists them), so you can ban someone who
+  is gone already, and the player of a `[cheat]` line about a race by its handle (`ban c17`) for a week after the
+  line. `kick` needs them on.
+- **Two names**: `who` lists the name a player's page sent when it joined. The name over their car in free roam (and
+  in quick chat) is their game's. The two are the same unless the page was edited. Then `who` shows both
+  (`"player" free roam, 5 min; its game shows "…"`), `who`, `kick` and `ban` find the player by either, and a ban by
+  the name over the car is listed under that name. The log has a line when it happens, `[roam] 10.77.4.17 "player":
+  its game shows "…" over its car`: `grep` it for one who left, and ban the address within the hour.
+- **Banning again** replaces the earlier ban of the same player: `ban Bob perm` after `ban Bob 1d` leaves one ban,
+  for good.
+- **Blocks**: players block others by name (Settings, Online, More online settings, Blocked players): the free-roam
+  hub links neither way, nor with the host of a race lobby the other is in. The log has a line each time such a page
+  connects (again after a dropped connection), `[roam] 10.77.4.17 blocks "Bob", "carl"` (`who 10.77.4.17` names the
+  blocker): a name many block is one to look at (`grep blocks` in the log).
+- **What is kept**: `bans.json` in the state volume, with keyed hashes of the addresses, ids and keyphrases only
+  (the key, `bans.key`, beside it): none can be read back from them. The handles of `[cheat]` lines are kept there
+  the same way, for a week, with the names of their earlier lines and the numbers of the bans made of them. The log
+  has a `[ban]` line for each kick, ban (`in place of #6` when it replaced one) and lift, and when a banned player is
+  turned away (2 a minute per client at most).
+- **How it works**: the commands go to `control.sock` in the state volume, which only the server's own user and
+  root can open; nothing on the network reaches it. Without Docker: `sudo /opt/nfsu2-web/nfsu2-server ctl --state
+  /var/lib/nfsu2-web who` (and the same for the others).
 
 ## SSH
 
@@ -544,7 +847,10 @@ the origin-pull certificate with a stand-in CA ([What was tested](#what-was-test
 `compose.tunnel.yml` puts `cloudflared` where Caddy was.
 
 1. In Cloudflare's dashboard (Zero Trust, Networks, Tunnels), create a tunnel with the Docker connector and copy
-   its token. Give it a public hostname: your name, service `http://127.0.0.1:8080`.
+   its token. Give it a public hostname: your name, service `http://127.0.0.1:8080`. (The server listens on the
+   socket `@nfsu2-http` in the namespace below too, without TCP's work for each message, but the dashboard's Service
+   URL field refuses `unix:@nfsu2-http`, nfsu2.xyz 2026-10-30: only a tunnel run from a config file of its own
+   takes it.)
 2. Copy `web/deploy/compose.tunnel.yml` next to `compose.yml`, and add to `.env`:
 
    ```sh
@@ -560,19 +866,25 @@ the origin-pull certificate with a stand-in CA ([What was tested](#what-was-test
 What follows from this setup:
 
 - **cloudflared and the server share one network namespace**, on a Docker network, held by a small `pause`
-  container (`net`), so either can restart on its own. cloudflared reaches the server on 127.0.0.1:8080; nothing
-  else can.
+  container (`net`), so either can restart on its own. cloudflared reaches the server on its socket `@nfsu2-http`
+  (or 127.0.0.1:8080); nothing else can.
 - **The client's address** comes from Cloudflare's `CF-Connecting-IP`, and only from `cloudflared`. It opens a
   connection to the server for each request in progress and has no limit of its own per client: the server's own
   limits per client address hold.
 - **Settings:** 7 and 9 of the proxy's list above apply too (8 is step 4 here). Authenticated Origin Pulls is not
   needed: the server is reached through cloudflared alone.
-- **Four copies of cloudflared** (`nfsu2-web-cloudflared-1` to `-4`), each with 4 connections to Cloudflare.
+- **Four copies of cloudflared** (`nfsu2-web-cloudflared-1` to `-4`), each with 4 connections to Cloudflare and
+  4 threads of Go (`GOMAXPROCS`: with one for each of the slice's cores, a copy's profile on nfsu2.xyz, 2026-10-30,
+  showed a fifth of its CPU in Go waking idle threads that found nothing to do).
   Each player's connection goes over one of them. A connection that went to a far or lossy Cloudflare site slows
   every player on it: on nfsu2.xyz (2026-10-22, 2,950 players) two connections had gone to Amsterdam, and about 600
   players got the other cars seconds late while the server was idle. A copy's sites are in its log:
   `docker logs nfsu2-web-cloudflared-1 2>&1 | grep 'Registered tunnel connection'`. Restart only the copy with the
   bad site (`docker restart nfsu2-web-cloudflared-1`); `docker compose restart cloudflared` drops every player.
+- **QUIC, not HTTP/2.** A fifth copy over HTTP/2 (`--protocol http2`, TCP) next to the four, on nfsu2.xyz
+  (2026-10-23, ~4,300 players), took 2.58 cores per 1000 of its players against the QUIC copies' 2.20-2.38: no
+  cheaper (its players had all come within the hour, still loading, which costs more). Over TCP a lost packet also
+  holds up every player on that connection, not only the one it was for.
 - **Small receive buffers** in the namespace (`sysctls` on `net`: 128 KiB at most, not Linux's 32 MiB): what a
   player's connection does not take waits at the server, which then sends that player fewer of free roam's
   updates, instead of piling up unread at cloudflared. A change to it recreates `net`, and with it cloudflared and
@@ -580,6 +892,107 @@ What follows from this setup:
 
 A real tunnel was **not** opened here (**UNVERIFIED**). The layout was: `cloudflared` stood in by a container that
 reaches the server on 127.0.0.1, crashes of either side, a reboot.
+
+### Cloudflare's proxy, straight to the server
+
+No Caddy and no `cloudflared`: Cloudflare's proxy connects to the server itself, which does TLS with a Cloudflare
+Origin CA certificate (TLS choice B with C, [Without Docker](#tls-pick-one)). An Origin Rule sends
+`https://<your name>` to a high port (28443 here), so the VPS needs nothing on 80 or 443. On nfsu2.xyz cloudflared
+took 7.5 of the slice's 11.6 cores at 5,985 players (2026-10-30); without it the 1 Gbit/s port (0.13 Mbit/s a
+player) is the limit, about 7,000-7,500 players.
+
+The proxy's settings 7-9 above apply as they are. Steps 1-5 change nothing for the players (the tunnel stays in
+front) and try every part with a second name, `origin-test.<your name>`, and a second server of its own; step 6
+switches.
+
+1. **The certificate** (SSL/TLS, Origin Server, Origin Certificates tab, **Create Certificate**): "Generate private
+   key and CSR with Cloudflare", key type **ECC** (cheaper handshakes than RSA: every player's connection is one), the
+   hostnames as they are (your name and `*.<your name>`, which covers the test name), 15 years, **Create**, key format
+   PEM. The key is shown once: on the VPS, `mkdir -p /srv/nfsu2/tls`, paste the certificate into
+   `/srv/nfsu2/tls/origin.pem` and the key into `origin.key`, then `chown -R 1000:1000 /srv/nfsu2/tls && chmod 700
+   /srv/nfsu2/tls && chmod 600 /srv/nfsu2/tls/*` (the container runs as uid 1000).
+2. **Cloudflare, for the test name:**
+   - SSL/TLS, Origin Server, **Authenticated Origin Pulls** tab, section **Global**: **On**. Cloudflare's own
+     certificate, shared by every Cloudflare account, the one the server trusts (built in, valid until 2029-11-01);
+     the Zone-level section is for a certificate of your own, which the server does not take. It changes nothing
+     for the tunnel or an origin that asks for no certificate.
+   - DNS, Records, **Add record**: `A`, name `origin-test`, the VPS's IPv4, proxied (orange).
+   - The encryption mode: SSL/TLS, Overview. If it says Full (strict), nothing to do; otherwise (Automatic, or
+     another mode other names need) a **Configuration Rule** (Rules, Overview, **Create rule**, Configuration Rule):
+     Hostname equals `origin-test.<your name>`, **SSL**: Strict, **Deploy**.
+   - **Origin Rule** (Rules, Overview, **Create rule**, Origin Rule): Hostname equals `origin-test.<your name>`,
+     **Destination Port**: rewrite to `28443`, **Deploy**.
+3. **Firewall:** 28443 for Cloudflare's addresses only, in an nftables table of its own (nothing else on the VPS
+   changes; with ufw on, also `ufw allow 28443/tcp`, and in Hetzner's Robot firewall, if one is on, a rule for TCP
+   28443):
+
+   ```sh
+   cp web/deploy/cloudflare-only.sh /srv/nfsu2/ && cp web/deploy/nfsu2-cloudflare-only.service /etc/systemd/system/
+   systemctl daemon-reload && systemctl enable --now nfsu2-cloudflare-only   # again at boot
+   nft list table inet nfsu2_cloudflare
+   ```
+
+4. **A test server** on the VPS's network, with the running image, the game data and module read only, and a state
+   of its own (its players are its own; `--access-log` names each request's client address):
+
+   ```sh
+   cd /srv/nfsu2
+   env1() { grep -s "^$1=" .env | tail -1 | cut -d= -f2-; }
+   d=$(env1 NFSU2_DATA); data=$(realpath -m "${d:-./game}")
+   m=$(env1 NFSU2_MODULE); mod=$(realpath -m "${m:-./module}")
+   echo "game data $data, module $mod, image $(env1 NFSU2_IMAGE)"
+   docker run -d --name nfsu2-origintest --network host --read-only --cap-drop ALL \
+     --security-opt no-new-privileges --memory 3g --memory-swap 3g --ulimit nofile=65536 --no-healthcheck \
+     -e NFSU2_HOST=origin-test.<your name> -e NFSU2_HTTP_PORT=0 -e NFSU2_MAX_PEERS=16 -e NFSU2_COMPRESS_THREADS=0 \
+     -e NFSU2_REAL_IP_HEADER=cf-connecting-ip \
+     -v "$data":/game:ro -v "$mod":/module:ro -v /srv/nfsu2/tls:/tls:ro -v nfsu2-origintest-state:/state \
+     "$(env1 NFSU2_IMAGE)" \
+     --port 28443 --tls-cert /tls/origin.pem --tls-key /tls/origin.key --trusted-proxies cloudflare --access-log
+   docker logs nfsu2-origintest 2>&1 | grep -E 'HTTPS|cloudflare'
+   ```
+
+   (The game data and module as `.env` names them, `./game` and `./module` where it names none.)
+5. **Try it:** open `https://origin-test.<your name>`, Play, drive in free roam (alone: it is the test server's
+   world). `docker logs nfsu2-origintest 2>&1 | grep '\[http\]' | tail` names your own address, not Cloudflare's.
+   From any machine, `curl -sk --max-time 5 --resolve origin-test.<your name>:28443:<vps> https://origin-test.<your
+   name>:28443/` gets no answer (the firewall). What a step left out shows: 525 "SSL handshake failed"
+   (Authenticated Origin Pulls off, or the certificate files), 526 (the encryption mode above Full (strict) with
+   another certificate), 521 or 522 (the Origin Rule, the firewall, or the test server not running). Then
+   `docker rm -f nfsu2-origintest && docker volume rm nfsu2-origintest-state`.
+6. **The switch** (at a quiet hour: from the first command until the DNS record, a minute or two, nobody can play;
+   then every page reconnects by itself):
+   - On the VPS: copy `web/deploy/compose.origin.yml` next to `compose.yml`; in `.env`
+     `COMPOSE_FILE=compose.yml:compose.origin.yml` and `NFSU2_TLS_DIR=/srv/nfsu2/tls` (keep `TUNNEL_TOKEN`: it is
+     the way back). Then `docker compose config -q && docker compose up -d --remove-orphans` (`--remove-orphans`
+     stops and removes `cloudflared` and `net`). The log says `HTTPS : port 28443` and `cloudflare: its addresses
+     must show its origin-pull certificate`.
+   - The Origin Rule and the Configuration Rule (if you made one): Hostname is in `<your name>` and the test name.
+   - DNS: delete the tunnel's record for your name (a `CNAME` to `<tunnel id>.cfargotunnel.com`), add an `A` record
+     for it (`@`) to the VPS's IPv4, proxied. Leave out `AAAA`. Leave the tunnel and its published application in
+     Zero Trust as they are: they are the way back, and a DNS record and a tunnel are independent.
+7. **Check:** the page loads, players come back (`./nfsu2 who`), and `measure.sh` says the front is Cloudflare's
+   proxy.
+
+**Back to the tunnel:** in `.env` `COMPOSE_FILE=compose.yml:compose.tunnel.yml`, `docker compose up -d
+--remove-orphans` (brings `net` and `cloudflared` back), then in DNS delete the `A` record and add the `CNAME` again
+(your name to `<tunnel id>.cfargotunnel.com`, proxied), and take your name out of the Origin Rule. The firewall can
+stay (`cloudflare-only.sh --off` and `systemctl disable nfsu2-cloudflare-only` to remove it).
+
+What the handshake lets through: an address outside Cloudflare's ranges never gets past the firewall; one inside
+must show the origin-pull certificate, and every handshake must ask for a name in the certificate (none, or another
+name: no certificate, no answer). Authenticated Origin Pulls' Global certificate is the same for every Cloudflare
+account, so it proves Cloudflare's proxy, not your zone: another account's proxy would also need to send your name
+as its SNI, which only Enterprise plans can set, and Cloudflare sets `CF-Connecting-IP` there itself. A certificate
+of your own (Zone-level Authenticated Origin Pulls) would close that too, but the server trusts Cloudflare's CA only
+(built in).
+
+Checked (2026-10-30): the server's built-in Cloudflare ranges and origin-pull CA are Cloudflare's published ones
+(22 ranges; CA fingerprint 9A:1A:...:A2:B9); on a Mac, the arguments of `compose.origin.yml` with an ECC key in
+Cloudflare's format (PKCS#8): your name and a name under the wildcard answer, a WebSocket upgrades with the Host
+Cloudflare sends (no port), the bare address, another name and two labels under the wildcard get no handshake, and
+the local port answers the health check; `cloudflare-only.sh` in Debian 12 (nftables 1.0.6): the port closed to
+another address, another port open, a second run replacing the first, `--off` opening it. Through a real Cloudflare:
+steps 1-5 are that check.
 
 ## A proxy you already have
 
@@ -626,18 +1039,20 @@ paths to the VPS, so pick a VPS location between you.
   - **Its own cost:** in a Room of more than 256 players the hub finds each player's nearest through a grid of the
     map instead of weighing every pair, with the same links. Measured on a Ryzen 9 5900X: 1000 players in one Room
     took about 30 ms a second (every pair took 0.5 s), 2000 about 70 ms, spread over the city or all in one spot.
-  - **A busy server gives every player fewer links:** each second the hub looks at how busy the server's thread was.
-    Over 85 %, the most links a player may have goes down by a quarter (32, 24, 18, 13, 9, 8 at the least), at most
+  - **A busy server gives every player fewer links:** at each tick the hub looks at how busy the server's workers
+    were, and at the share of the CPU quota the game's containers used together (nfsu2.slice, where the server sees
+    it), the higher of the two. Over 85 %, the most links a player may have goes down by a quarter (32, 24, 18, 13, 9, 8 at the least), at most
     every 5 s; under 65 %, it goes back up by 2, at most every 15 s. The nearest links stay. The console says each
     change (`[roam] the server's thread was 93 % busy: at most 24 links a player (was 32)`).
-- **Free roam** draws another player's car where it is now (solid cars, the default: the newest snapshot carried on
-  by half the round trip), or with Solid cars off `roam_delay` milliseconds (100 by default) behind its newest
+- **Free roam** draws another player's car where it is now (ghost mode off, the default: the newest snapshot carried
+  on by half the round trip), or with Ghost mode on `roam_delay` milliseconds (100 by default) behind its newest
   snapshot. That delay hides the 50 ms between snapshots, jitter and the odd lost snapshot. Network delay comes on
   top of it.
   - **Measured with impairment on a local switch:** 100 ± 10 ms one way and 5 % loss.
     98.1 % of frames were interpolated, 1.9 % extrapolated, and none were held.
   - **For 50–150 ms round trips, the default is enough.** If friends' cars stutter (Wi-Fi or mobile jitter), set
-    `roam_delay = 150` in Settings (settings.ini). It only adds display delay.
+    `roam_delay = 150` in settings.ini (the text editor at the bottom of Settings; the page has no row for it). It
+    only adds display delay.
   - **There is no automatic raise from the measured ping.** The runtime reads `roam_delay` once at start; making it
     follow the ping is a runtime change for the net track.
   - **Over the real internet:** **UNVERIFIED**.
@@ -647,11 +1062,16 @@ paths to the VPS, so pick a VPS location between you.
 - **Keepalive:** the switch pings every connection every 25 s. Proxies and Cloudflare then never cut a quiet player,
   and the switch finds players whose connection died.
 - **Limits:**
-  - 4000 players on the switch with the Rust image (`NFSU2_MAX_PEERS=4000`; the server's own default is 128, and
-    4000 is the most its virtual network, 10.77.0.0/20, has addresses for), 2000 with the Node image (its network
-    is 10.77.0.0/21). A game the switch refuses as full shows "The
-    server is full" in the game and tries again every 5 s; it says so again when it gets a place, and the start
-    page says the server is full;
+  - 7000 players on the switch with the Rust image (`NFSU2_MAX_PEERS=7000`; the server's own default is 128, and
+    7000 is the most addresses it hands out on its virtual network, 10.77.0.0/19: 250 in each of 10.77.0-27.x), 2000 with
+    the Node image (its network is 10.77.0.0/21);
+  - when every place is taken a game waits in line for one, first come first served (nfsu2-lan `queue.rs`): the
+    line's first takes the next place that frees up, and while anyone waits a newcomer waits too. The game shows
+    its place in line and, once a few went in, about how long it takes at the pace of the last ten minutes; the
+    start page shows how many wait, and at Play offers to wait or play offline. A waiting page whose connection
+    drops keeps its place for a minute (a ticket only it has), as a dropped player keeps its address; one that
+    lets go (no network feature in use, away, "Stop waiting") leaves the line. At most 5000 wait. A page from
+    before the line gets "LAN full" instead, tries again every 5 s and gets in only once nobody waits;
   - a player holds a place only while a network feature needs it: free roam while it is on, LAN play and Online
     from the game's LAN or Online screens until it leaves them. 10 s after the last one ends the page closes its
     connection and the switch frees the address at once; going back into those screens connects again (a new
@@ -676,8 +1096,8 @@ paths to the VPS, so pick a VPS location between you.
   - a player who drops (a lost connection, not the page letting go) gets the same address back when it reconnects:
     the switch keeps the address a minute for that player alone (a token only that browser has), also across a restart of the server, and never gives it to
     anyone else. At most 8 such addresses are kept per client address (16 per /48; past that its own oldest goes;
-    the ones kept across a restart do not count). When every address is held or kept, a newcomer gets "LAN full"
-    until one frees.
+    the ones kept across a restart do not count). A kept address holds its place, so when every place is held or
+    kept a newcomer waits in line until one frees.
 - **LAN races** (the game's own LAN mode, from the LAN-play track) use the same switch. Over the internet they are
   **UNVERIFIED**.
 - **The game's Online mode** is served by the server itself, at the switch's reserved address 10.77.0.1 (on by
@@ -685,18 +1105,25 @@ paths to the VPS, so pick a VPS location between you.
   to 15 letters, digits, `-` and `_` logs in; there are no accounts. One player per name, while online and while
   racing: a name in use is given with four digits in place of its end (on a busy server many players come as
   `NAME`), and the game plays under that.
-  - **Kept in the state volume:** `online/stats.json` (race results and best times per persona) and
-    `online/buddies.json` (EA Messenger friends lists, persona names only), each with the month a persona was last
-    seen, written atomically. No passwords, CD keys, addresses or chat. The server never reads an account's
+  - **Kept in the state volume:** `online/stats.json` (race results, best times and records per persona) and
+    `online/buddies.json` (EA Messenger: each persona's friends and blocked by name, its friend requests waiting for
+    an answer, and the messages from friends waiting for it while it is away, text included, 7 days at most), each
+    with the month a persona was last seen, written atomically (0600). When the server stops, `online/races.json`
+    keeps the races going on (each one's players by persona and virtual address, and the reports so far), read back
+    at the next start and removed once it is up: the players race on through a restart (the switch gives their
+    addresses back) and their reports afterwards still count, as long as their pages are back within about 10 s (the
+    game ends a race whose network was gone that long). No passwords, CD keys, addresses, and no chat
+    but those waiting messages. The server never reads an account's
     password; a game's password it checks against an HMAC kept in memory with that game, under a key of the game's
     own.
   - **The console** names online players by persona and virtual address (10.77.x.x) only, and shows at most 30
     Online lines a minute caused by one client address (then one line saying how many were left out).
   - **Who plays now:** `/players` answers anyone who reaches the server with three numbers for the start page,
-    whether it is full and whether free roam is busy:
-    `{"players":3,"online":1,"roam":2,"full":false,"roamBusy":false}`, the games on the switch, how many of them
-    are in Online mode (logged in, or in an online race; `null` with `--online off`), how many drive in free roam
-    or are paused there (`null` with `--roam-hub off`), whether a game that connects now gets "LAN full", and
+    whether it is full, how many wait and whether free roam is busy:
+    `{"players":3,"online":1,"roam":2,"full":false,"queue":0,"roamBusy":false}`, the games on the switch, how many
+    of them are in Online mode (logged in, or in an online race; `null` with `--online off`), how many drive in free
+    roam or are paused there (`null` with `--roam-hub off`), whether a game that connects now waits in line, how
+    many wait in it, and
     whether the free-roam hub gives fewer than 24 links a player (its thread is busy; the start page doesn't ask
     its free-roam question then). Nothing else: no names, addresses or times, never cached. The game's own lobby
     shows its players to anyone who logs in anyway.
@@ -707,9 +1134,11 @@ paths to the VPS, so pick a VPS location between you.
     second (a burst of 4; a car description over that is not passed on); chat 1 a second with a burst of 5 (then
     10 s muted), 255 characters; a silent session goes after 120 s; a race whose players' browsers left the switch
     ends after 2 minutes. EA Messenger: 10 messages a second per connection (a flood closes it), the lists and the
-    search 1 a second, a presence at most once a second; 50 friends each, 5000 friends lists (the least recently
-    seen go), 20 new ones an hour per client address. Results: 100,000 personas (the least recently seen go), a
-    race counts once two of its players in different browsers sent the same result.
+    search 1 a second, a presence at most once a second; 50 friends and 50 blocked each, 20 friend requests waiting
+    from one persona (30 days), 20 messages waiting for one (the oldest goes) and 20,000 in all (7 days), 5000
+    persona lists (the least recently seen go), 20 new ones an hour per client address. Results: 100,000 personas
+    (the least recently seen go), a
+    race counts once two of its players who finished it, in different browsers, sent the same result.
   - **What one client costs the others:** what the online host sends because of a client's message (its answer,
     and what the others hear of it: room chat, a game's players) comes out of that client's switch budget; over
     it, the connection that message came on closes, and the client must pay the overspend back before its next

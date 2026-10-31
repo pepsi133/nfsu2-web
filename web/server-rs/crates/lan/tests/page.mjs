@@ -1,4 +1,4 @@
-// Four tests of the page (web/src/net/index.ts, bundled as the app bundles it) against the Rust switch, started by
+// Seven tests of the page (web/src/net/index.ts, bundled as the app bundles it) against the Rust switch, started by
 // tests/page.rs, which passes its ports.  What they read of the switch's insides (its peers, info(), reserved) comes
 // from the harness's GET /state.
 //   node page.mjs <case> <port> [<port> ...]
@@ -88,12 +88,12 @@ async function pageNet(port) {
   globalThis.location ??= new URL(`http://127.0.0.1:${port}/`);
   return import('data:text/javascript;base64,' + Buffer.from(pageJs).toString('base64'));
 }
-function mailbox(memory, ptr, ver = P.NET_VERSION) {
-  const hdr = ver === 2 ? P.NET_V2_HDR_BYTES : P.NET_HDR_BYTES, w = new Int32Array(memory.buffer, ptr, hdr / 4);
-  w[P.W_MAGIC] = P.NET_MAGIC; w[P.W_VERSION] = ver; w[P.W_HDR_BYTES] = hdr; w[P.W_SLOT_BYTES] = P.NET_SLOT_BYTES;
+function mailbox(memory, ptr) {
+  const hdr = P.NET_HDR_BYTES, w = new Int32Array(memory.buffer, ptr, hdr / 4);
+  w[P.W_MAGIC] = P.NET_MAGIC; w[P.W_VERSION] = P.NET_VERSION; w[P.W_HDR_BYTES] = hdr; w[P.W_SLOT_BYTES] = P.NET_SLOT_BYTES;
   w[P.W_TX_SLOTS] = P.NET_TX_SLOTS; w[P.W_RX_SLOTS] = P.NET_RX_SLOTS;
   w[P.W_TX_OFF] = hdr; w[P.W_RX_OFF] = hdr + P.NET_TX_SLOTS * P.NET_SLOT_BYTES;
-  return { w, ptr, size: ver === 2 ? P.NET_V2_MAILBOX_BYTES : P.NET_MAILBOX_BYTES };
+  return { w, ptr, size: P.NET_MAILBOX_BYTES };
 }
 function want(mb, on) { Atomics.store(mb.w, P.W_WANT, on); Atomics.add(mb.w, P.W_TX_BELL, 1); Atomics.notify(mb.w, P.W_TX_BELL); }
 const fakeGame = (memory, boxes) => ({ memory, ctl: new Int32Array(1), exited: new Promise(() => {}),
@@ -141,45 +141,103 @@ function roamDatagram(type, n) {
   return d;
 }
 
+/** a SNAP of one state as roam_core.c rc_encode makes it (its fields from k, so that each differs), with an extension
+ *  of x bytes when x is given */
+function snapDatagram({ sender = 0xABCD0001, seq, t, p, v, k, x }) {
+  const b = 8, d = Buffer.alloc(b + 66 + (x !== undefined ? 1 + x : 0) + 4);
+  d.write('N2FR', 0, 'latin1'); d[4] = 1; d[5] = 3; d.writeUInt16LE(d.length, 6);
+  d.writeUInt32LE(sender, b); d.writeUInt16LE(seq & 0xffff, b + 4); d.writeUInt16LE((x !== undefined ? 0x40 : 0) | 0x20, b + 6);
+  d[b + 8] = 2; d[b + 9] = 7; d.writeUInt16LE(0x0102, b + 10); d[b + 12] = 1; d[b + 13] = 3;
+  d.writeUInt32LE(t >>> 0, b + 14);
+  p.forEach((f, i) => d.writeFloatLE(f, b + 18 + 4 * i)); v.forEach((f, i) => d.writeFloatLE(f, b + 30 + 4 * i));
+  [100 + k, -200, 30000 - k, 5].forEach((q, i) => d.writeInt16LE(q, b + 42 + 2 * i));
+  [3 * k, -k, 7].forEach((w, i) => d.writeInt16LE(w, b + 50 + 2 * i));
+  d.writeInt16LE((k * 101) << 16 >> 16, b + 56); d[b + 58] = 200; d[b + 59] = k % 3; d.writeUInt16LE((3000 + 7 * k) & 0xffff, b + 60);
+  d.writeInt16LE(1500 + k, b + 62); d[b + 64] = 4; d[b + 65] = 0x10;
+  if (x !== undefined) {
+    d[b + 66] = x;
+    if (x > 0) {
+      for (let i = 0; i < 4; i++) d.writeInt16LE(-300 + k + i, b + 67 + 2 * i);
+      let o = b + 76;
+      if (x >= 11) { d[o] = 1; d[o + 1] = 2; o += 2; }
+      if (x >= 23) { for (let i = 0; i < 12; i++) d[o + i] = (i * 9 + k) & 255; o += 12; }
+      if (x === 16 || x === 28) { d.writeUInt16LE(4000 + k, o); d[o + 2] = 10; d[o + 3] = 20; d[o + 4] = 30; }
+    }
+  }
+  d.writeUInt32LE(zlib.crc32(d.subarray(0, d.length - 4)), d.length - 4);
+  return d;
+}
+/** the same as the game gets it through the fields (nfsu2-lan fpred.rs): the time to 256 us, the position to 1 mm, the
+ *  velocity to 1 cm/s (rounded half away from zero, as Rust's round), and the CRC made again */
+function roundedDatagram(d) {
+  const r = Buffer.from(d), b = 8, away = x => Math.sign(x) * Math.round(Math.abs(x)) + 0;
+  r.writeUInt32LE((Math.floor((r.readUInt32LE(b + 14) + 128) / 256) % 2 ** 24) * 256, b + 14);
+  for (let i = 0; i < 3; i++) {
+    r.writeFloatLE(away(r.readFloatLE(b + 18 + 4 * i) * 1000) / 1000, b + 18 + 4 * i);
+    r.writeFloatLE(away(r.readFloatLE(b + 30 + 4 * i) * 100) / 100, b + 30 + 4 * i);
+  }
+  r.writeUInt32LE(zlib.crc32(r.subarray(0, r.length - 4)), r.length - 4);
+  return r;
+}
+
 const cases = {
-  // the page: a notice when the switch is full, and one when a place frees up (a switch with room for one)
+  // the page: in line when the switch is full (where it is, and a notice once), its place kept across a dropped link,
+  // in when a place frees up, with a notice (a switch with room for one)
   async full([port]) {
     const { attachNet } = await pageNet(port);
-    const game = (name, notices) => {
+    const game = (name, notices, line) => {
       const memory = new WebAssembly.Memory({ initial: 10, maximum: 10, shared: true }), mb = mailbox(memory, 0);
       want(mb, 1);
-      return attachNet(fakeGame(memory, { 4: mb }), { url: `ws://127.0.0.1:${port}/lan`, name, onNotice: t => notices.push(t), pingMs: 60_000 });
+      return attachNet(fakeGame(memory, { 4: mb }), { url: `ws://127.0.0.1:${port}/lan`, name, onNotice: t => notices.push(t),
+        onQueue: q => line.push(q), pingMs: 60_000 });
     };
-    const na = [], nb = [];
-    const a = game('A', na);
+    const na = [], nb = [], qa = [], qb = [];
+    const a = game('A', na, qa);
     try {
       await a.online;
-      const b = game('B', nb);
+      const b = game('B', nb, qb);
       try {
-        await until(() => nb.length === 1);
-        assert.equal(nb[0], 'The server is full: playing with others waits for a free place');
-        await until(async () => (await state(port)).info.refused >= 3);
-        assert.equal(nb.length, 1, 'said once while it keeps trying');
-        assert.equal(b.state === 'online', false);
+        await until(() => qb.length === 1);
+        assert.deepEqual(qb[0], { pos: 1, of: 1 });
+        assert.equal(b.state, 'queued');
+        assert.deepEqual(nb, ["The server is full: you're in line and join the others when it's your turn"]);
+        assert.equal((await state(port)).info.waiting, 1);
+        // its link drops: back to the same place, with no second notice
+        b['ws'].close(4000, 'dropped');
+        await until(async () => (await state(port)).info.rejoined === 1);
+        await until(() => qb.length === 2 && b.state === 'queued');
+        assert.deepEqual(qb[1], { pos: 1, of: 1 });
+        assert.equal(nb.length, 1);
+        assert.equal((await state(port)).info.waiting, 1);
         a.close();
-        assert.match(await b.online, /^10\.77\.([0-9]|1[0-5])\.\d+$/);
+        assert.match(await b.online, /^10\.77\.([0-9]|1[0-9])\.\d+$/);
         await until(() => nb.length === 2);
         assert.equal(nb[1], 'A place on the server freed up: you can play with others now');
-        assert.deepEqual(na, [], 'the first game heard nothing');
+        assert.equal(qb.at(-1), null, 'out of line');
+        assert.deepEqual([na, qa], [[], []], 'the first game heard nothing');
+        // a third waits in line, then stops waiting (the page menu's Play offline): out of line for good
+        const nc = [], qc = [], c = game('C', nc, qc);
+        try {
+          await until(() => qc.length === 1 && c.state === 'queued');
+          c.goOffline();
+          await until(async () => (await state(port)).info.lineLeft === 1);
+          assert.deepEqual([c.state, qc.at(-1), (await state(port)).info.waiting], ['away', null, 0]);
+          c.setAway(false); await sleep(600);
+          assert.deepEqual([c.state, (await state(port)).info.queued], ['away', 2], 'nothing takes the switch again');
+        } finally { c.close(); }
       } finally { b.close(); }
     } finally { a.close(); }
   },
 
-  // the page: the switch let go when no mailbox wants it, taken again when one does; LAN play open or not; a module of
-  // before
-  async mailboxes([port, port2, port3]) {
+  // the page: the switch let go when no mailbox wants it, taken again when one does; LAN play open or not
+  async mailboxes([port]) {
     const { attachNet } = await pageNet(port);
     const pages = Math.ceil(2 * P.NET_MAILBOX_BYTES / 65536);
     const memory = new WebAssembly.Memory({ initial: pages, maximum: pages, shared: true });
     const roam = mailbox(memory, 0), lanMb = mailbox(memory, P.NET_MAILBOX_BYTES);
     const logs = [];
     const link = attachNet(fakeGame(memory, { 4: roam, 7: lanMb }), { url: `ws://127.0.0.1:${port}/lan`, name: 'P', pingMs: 60_000, idleMs: 300, log: l => logs.push(l) });
-    const peers = async (p = port) => (await state(p)).peers;
+    const peers = async () => (await state(port)).peers;
     try {
       await sleep(300);
       assert.equal((await peers()).length, 0, 'nothing wants the switch yet: no connection');
@@ -209,13 +267,13 @@ const cases = {
       assert.notEqual(v2, v1, 'a new address (the old one went back)');
       want(lanMb, 0); await sleep(100); want(lanMb, 1); await sleep(500);
       assert.equal((await peers()).length, 1); assert.equal((await state(port)).info.released, 1, 'a short break keeps the place');
-      // peer bits: one bit per host of the /20 up to the module's 2048 (a peer in another /24 has its own bit; the
+      // peer bits: one bit per host of the /19 up to the module's 2048 (a peer in another /24 has its own bit; the
       // third lands in 10.77.4.x, past a /22); the seventh lands in 10.77.8.x, past the /21 and the bitmap: no bit
       // (the module asks that host itself, runtime/web/net_lan.c), and nothing written past the bitmap (its header's
       // padding)
       const others = Array.from({ length: 7 }, (_, i) => new Client(port, `O${i + 1}`));
       for (const o of others) await o.welcome();
-      const hs = others.map(o => (o.vip & 0xfff) >>> 0), low = hs.filter(h => h < P.NET_PEER_BITS);
+      const hs = others.map(o => (o.vip & 0x1fff) >>> 0), low = hs.filter(h => h < P.NET_PEER_BITS);
       assert.ok(low.some(h => h >= 1024), `a host past the /22 (${hs.map(h => h.toString(16))})`);
       assert.ok(low.length < hs.length, `a host past the /21 (${hs.map(h => h.toString(16))})`);
       for (const h of low) await until(() => (Atomics.load(lanMb.w, P.W_PEER_BITS + (h >>> 5)) >>> (h & 31)) & 1);
@@ -223,38 +281,6 @@ const cases = {
       for (const o of others) await o.close();
       assert.ok(logs.some(l => /goes back/.test(l)), 'the console says why it let go');
     } finally { link.close(); }
-    // a module of before: version 2, no want word, always connected
-    {
-      const mem2 = new WebAssembly.Memory({ initial: 10, maximum: 10, shared: true }), old = mailbox(mem2, 0, 2);
-      const l2 = attachNet(fakeGame(mem2, { 7: old }), { url: `ws://127.0.0.1:${port2}/lan`, name: 'Old', pingMs: 60_000, idleMs: 100 });
-      try {
-        await l2.online;
-        await until(async () => { const p = await peers(port2); return p.length === 1 && p[0].hello; });
-        assert.equal((await peers(port2))[0].lan, true, 'its LAN mailbox counts as open');
-        await sleep(400);
-        assert.equal((await peers(port2)).length, 1, 'never let go');
-        const c = new Client(port2, 'C'); await c.welcome();
-        const h = c.vip & 255;                                               // its bitmap: by the last byte, 8 words
-        await until(() => (Atomics.load(old.w, P.W_PEER_BITS + (h >>> 5)) >>> (h & 31)) & 1);
-        await c.close();
-      } finally { l2.close(); }
-    }
-    // a module of version 3: bits for a /22 (32 words), nothing written past them (its header's padding)
-    {
-      const mem3 = new WebAssembly.Memory({ initial: 10, maximum: 10, shared: true }), v3 = mailbox(mem3, 0, 3);
-      want(v3, 1);
-      const l3 = attachNet(fakeGame(mem3, { 7: v3 }), { url: `ws://127.0.0.1:${port3}/lan`, name: 'V3', pingMs: 60_000, idleMs: 60_000 });
-      try {
-        await l3.online;
-        const cs = [1, 2, 3, 4, 5].map(i => new Client(port3, `C${i}`));
-        for (const c of cs) await c.welcome();
-        const hs = cs.map(c => (c.vip & 0xfff) >>> 0), low = hs.filter(h => h < 1024);
-        assert.ok(low.length && low.length < hs.length, `hosts on both sides of 1024 (${hs.map(h => h.toString(16))})`);
-        for (const h of low) await until(() => (Atomics.load(v3.w, P.W_PEER_BITS + (h >>> 5)) >>> (h & 31)) & 1);
-        for (let i = P.NET_V3_PEER_BITS / 32; i < P.NET_PEER_BITS / 32; i++) assert.equal(Atomics.load(v3.w, P.W_PEER_BITS + i), 0, `word ${i} untouched`);
-        for (const c of cs) await c.close();
-      } finally { l3.close(); }
-    }
   },
 
   // the page: away, the place goes back while the game wants it and stays free; back, it is taken again
@@ -287,6 +313,54 @@ const cases = {
       await until(async () => (await size()) === 1 && Atomics.load(roam.w, P.W_PAGE_STATE) === P.NET_PAGE_ONLINE);
       assert.notEqual(P.ipStr(Atomics.load(roam.w, P.W_VIP) >>> 0), v1, 'a new address');
       assert.ok(logs.some(l => /the player is away/.test(l)) && logs.some(l => /here again/.test(l)), 'the console says so');
+    } finally { link.close(); }
+  },
+
+  // the page: kicked, it tells the game and stays off the switch for the rest of the game, whatever wants it; a page
+  // whose id is banned is turned away at its hello the same way
+  async removed([port]) {
+    const { attachNet } = await pageNet(port);
+    const memory = new WebAssembly.Memory({ initial: 10, maximum: 10, shared: true }), roam = mailbox(memory, 0);
+    const mem2 = new WebAssembly.Memory({ initial: 10, maximum: 10, shared: true }), roam2 = mailbox(mem2, 0);
+    const logs = [], told = [];
+    const size = async () => (await state(port)).peers.length;
+    const link = attachNet(fakeGame(memory, { 4: roam }), { url: `ws://127.0.0.1:${port}/lan`, name: 'P', id: 'page-p', pingMs: 60_000, idleMs: 100,
+      log: l => logs.push(l), onRemoved: r => told.push(r) });
+    const banned = attachNet(fakeGame(mem2, { 4: roam2 }), { url: `ws://127.0.0.1:${port}/lan?gate=page-b`, name: 'B', id: 'page-b', pingMs: 60_000,
+      onRemoved: r => told.push(r) });
+    try {
+      want(roam, 1);
+      const vip = P.ipNum(await link.online);
+      await until(async () => (await size()) === 1);
+      assert.equal((await fetch(`http://127.0.0.1:${port}/expel?vip=${vip}&code=4001&msg=Stop`)).status, 200);
+      await until(() => told.length === 1);
+      assert.deepEqual(told[0], { ban: false, msg: 'Stop' });
+      assert.equal(link.state, 'away');
+      assert.equal(Atomics.load(roam.w, P.W_PAGE_STATE), P.NET_PAGE_IDLE, 'C hears that the page let go');
+      await until(async () => (await size()) === 0);
+      assert.equal((await state(port)).reserved, 0, 'its address free at once');
+      want(roam, 0); want(roam, 1); link.setAway(true); link.setAway(false); await sleep(300);
+      assert.equal(await size(), 0, 'nothing connects again: not a want, not the away check');
+      assert.ok(logs.some(l => /the operator kicked this player \("Stop"\): no switch for the rest of this game/.test(l)), logs.join('\n'));
+      // its id banned: told at its hello, and off
+      want(roam2, 1);
+      await until(() => told.length === 2);
+      assert.deepEqual(told[1], { ban: true, msg: 'page-b' });
+      assert.equal(banned.state, 'away');
+      await sleep(300);
+      assert.equal(await size(), 0);
+    } finally { link.close(); banned.close(); }
+  },
+
+  // the page: its hello names the players it blocks (NetOptions.block): page.rs reads what the hub was told
+  async block([port]) {
+    const { attachNet } = await pageNet(port);
+    const memory = new WebAssembly.Memory({ initial: 10, maximum: 10, shared: true }), roam = mailbox(memory, 0);
+    const link = attachNet(fakeGame(memory, { 4: roam }), { url: `ws://127.0.0.1:${port}/lan`, name: 'P', block: ['Bob', 'carl'], pingMs: 60_000 });
+    try {
+      want(roam, 1);
+      await link.online;
+      await until(async () => (await state(port)).peers.some(p => p.hello));
     } finally { link.close(); }
   },
 
@@ -332,7 +406,157 @@ const cases = {
         sent.map(x => [true, x.dst >>> 0, x.sport, x.dport, x.data.toString('hex')]), 'byte for byte');
       assert.equal(link.stats().framesIn, 3 + sent.length);
       assert.ok(link.stats().compactIn >= 2, 'as compact bundles');
+      // its hello took deltas too: a friend's snapshots, a few bytes new each time and now and then longer, come as
+      // what changed (nfsu2-lan compact.rs Refs, proto.ts unpackCompact) and still reach the game byte for byte
+      const seq = [];
+      let snapNow = Buffer.from(roamDatagram(3, 70));
+      for (let i = 0; i < 60; i++) {
+        const body = Buffer.from(snapNow.subarray(16, snapNow.length - 4));
+        body[(i * 7) % body.length] = i; body[(i * 13 + 3) % body.length] ^= 0x5a;
+        const d = Buffer.alloc(16 + body.length + (i === 30 ? 1 : 0) + 4);
+        snapNow.copy(d, 0, 0, 16); body.copy(d, 16);
+        d.writeUInt16LE(d.length, 6); d.writeUInt32LE(zlib.crc32(d.subarray(0, d.length - 4)), d.length - 4);
+        seq.push(d); snapNow = d;
+      }
+      for (let i = 0; i < seq.length; i += 6) {
+        c.sendBundle(seq.slice(i, i + 6).map(d => ({ f: frameOf(me, d, 1, 47210, 47210) })));
+        await until(() => Atomics.load(roam.w, P.W_RX_HEAD) - Atomics.load(roam.w, P.W_RX_TAIL) >= Math.min(6, seq.length - i));
+        assert.deepEqual(rxTakeRaw(memory, roam).map(g => g.data.toString('hex')), seq.slice(i, i + 6).map(d => d.toString('hex')), `snapshots ${i} on`);
+      }
+      assert.ok(link.stats().deltaIn >= 50, `as deltas (${link.stats().deltaIn} of ${seq.length})`);
+      // free roam's own datagrams (a ping, a pong) wait for the next car state to a friend, at most TX_HOLD_MS (50)
+      // after the page's last send, and go with it as one message; one long after the last send goes at once
+      const ping = roamDatagram(6, 8), pong = roamDatagram(7, 16), carState = roamDatagram(3, 70);
+      const ins = async () => (await state(port)).info.bundlesIn, in0 = await ins(), nb = b.dgrams().length, nc = c.dgrams().length;
+      await sleep(80);
+      txPush(memory, roam, { dst: b.vip, data: ping }); txBell(roam);
+      await b.until(() => b.dgrams().length >= nb + 1);
+      txPush(memory, roam, { dst: b.vip, data: pong }); txBell(roam);
+      await sleep(15);
+      assert.equal(b.dgrams().length, nb + 1, 'a pong right after a send waits');
+      txPush(memory, roam, { dst: c.vip, data: carState }); txBell(roam);
+      await b.until(() => b.dgrams().length >= nb + 2); await c.until(() => c.dgrams().length >= nc + 1);
+      assert.equal(await ins(), in0 + 1, 'the ping alone (a frame), then the pong with the car state (a bundle)');
+      txPush(memory, roam, { dst: b.vip, data: carState }); txBell(roam);
+      await b.until(() => b.dgrams().length >= nb + 3);
+      const t0 = performance.now();
+      txPush(memory, roam, { dst: b.vip, data: ping }); txBell(roam);
+      await b.until(() => b.dgrams().length >= nb + 4);
+      const held = performance.now() - t0;
+      assert.ok(held >= 25, `without a car state it waits until 50 ms after the last send (${held.toFixed(0)} ms)`);
+      // a game not driving (its HELLO says a race): its own wait until 500 ms after the last send (TX_HOLD_AWAY_MS; the
+      // switch holds what its friends send it as long, nfsu2-lan away.rs), and a HELLO that says it drives again goes
+      // at once, with what waited
+      const helloSt = st => {
+        const d = roamDatagram(1, 40);
+        d[19] = st; d.writeUInt32LE(zlib.crc32(d.subarray(0, d.length - 4)), d.length - 4);
+        return d;
+      };
+      txPush(memory, roam, { dst: b.vip, data: helloSt(3) }); txBell(roam);
+      await b.until(() => b.dgrams().length >= nb + 5);
+      let t1 = performance.now();
+      txPush(memory, roam, { dst: b.vip, data: ping }); txBell(roam);
+      await b.until(() => b.dgrams().length >= nb + 6);
+      const away = performance.now() - t1;
+      assert.ok(away >= 300, `not driving, it waits until 500 ms after the last send (${away.toFixed(0)} ms)`);
+      await sleep(30);
+      t1 = performance.now();
+      txPush(memory, roam, { dst: b.vip, data: ping }); txPush(memory, roam, { dst: b.vip, data: helloSt(2) }); txBell(roam);
+      await b.until(() => b.dgrams().length >= nb + 8);
+      const back = performance.now() - t1;
+      assert.ok(back < 200, `driving again: at once (${back.toFixed(0)} ms)`);
       await b.close(); await c.close();
+    } finally { link.close(); }
+  },
+
+  // its hello took every other datagram as what changed too ("ldelta":1, nfsu2-lan compact.rs Refs::other): a race's
+  // LAN UDP from two rivals, a few bytes new each time, now and then of another length or on other ports, with a LAN
+  // broadcast and the race horn's UDP among them, reaches the game byte for byte, most of it as deltas
+  async races([port]) {
+    const { attachNet } = await pageNet(port);
+    const memory = new WebAssembly.Memory({ initial: 10, maximum: 10, shared: true }), lanMb = mailbox(memory, 0);
+    want(lanMb, 1); Atomics.store(lanMb.w, P.W_MODE, P.NET_MODE_LAN);
+    const link = attachNet(fakeGame(memory, { 7: lanMb }), { url: `ws://127.0.0.1:${port}/lan`, name: 'P', pingMs: 60_000 });
+    try {
+      const me = P.ipNum(await link.online);
+      const r1 = new Client(port, 'R1', '', null, { bundle: true }), r2 = new Client(port, 'R2', '', null, { bundle: true });
+      await r1.welcome(); await r2.welcome(); await sleep(100);
+      const pk = [Buffer.alloc(140), Buffer.alloc(140)];
+      pk.forEach((b, j) => { for (let i = 0; i < b.length; i++) b[i] = (i * 31 + 7 * j) & 255; });
+      const sent = [];
+      for (let i = 0; i < 90; i++) {
+        const j = i % 2, c = j ? r2 : r1;
+        let b = pk[j];
+        b[(i * 7) % b.length] = i; b[(i * 13 + 5) % b.length] ^= 0x5a; b.writeFloatLE(i * 1.5, 20);
+        if (i % 20 === 10) pk[j] = b = Buffer.concat([b, Buffer.from([i])]);
+        if (i % 20 === 15) pk[j] = b = b.subarray(0, b.length - 3);
+        const data = Buffer.concat([Buffer.from([0, 64, 0, 0, 0, 0, 0, 0]), b]);
+        const dport = i === 41 ? 6114 : 6113;
+        sent.push({ c, kind: 3, dst: me, sport: 6112, dport, data, f: frameOf(me, data, 3, 6112, dport) });
+        if (i % 9 === 4) {
+          const bc = Buffer.from([0, 64, 0, 0, 0, 0, 0, 0, 1, 2, 3, i]);
+          sent.push({ c, kind: 3, dst: P.NET_BROADCAST, sport: 6112, dport: 6112, data: bc, f: frameOf(P.NET_BROADCAST, bc, 3, 6112, 6112) });
+        }
+      }
+      for (let i = 0; i < sent.length; i += 6) {
+        const part = sent.slice(i, i + 6);
+        for (const c of [r1, r2]) { const mine = part.filter(x => x.c === c); if (mine.length) c.sendBundle(mine.map(({ f }) => ({ f }))); }
+        await until(() => Atomics.load(lanMb.w, P.W_RX_HEAD) - Atomics.load(lanMb.w, P.W_RX_TAIL) >= part.length);
+        const got = rxTakeRaw(memory, lanMb);
+        const key = g => `${g.src >>> 0}/${g.dst >>> 0}/${g.sport}/${g.dport}/${g.data.toString('hex')}`;
+        // (the two rivals' bundles may come in either order: each one's own in order)
+        for (const c of [r1, r2])
+          assert.deepEqual(got.filter(g => g.src >>> 0 === c.vip).map(key), part.filter(x => x.c === c).map(x => key({ ...x, src: c.vip })), `datagrams ${i} on`);
+      }
+      assert.ok(link.stats().deltaIn >= 70, `as deltas (${link.stats().deltaIn} of ${sent.length})`);
+      const mix = (await state(port)).info.mix;
+      console.log(`race datagrams: ${mix['LAN UDP'][1]}, ${(mix['LAN UDP'][0] / mix['LAN UDP'][1]).toFixed(1)} bytes each (plain ${5 + 4 + 8 + 141})`);
+      assert.ok(mix['LAN UDP'][0] / mix['LAN UDP'][1] < 60, `${(mix['LAN UDP'][0] / mix['LAN UDP'][1]).toFixed(1)} bytes a race datagram`);
+      await r1.close(); await r2.close();
+    } finally { link.close(); }
+  },
+
+  // its hello took friends' car states by their fields (nfsu2-lan fpred.rs, proto.ts fpredTake): each reaches the game
+  // rounded, as the switch rounded it, with a CRC that checks out; one of a layout that does not go so (three states)
+  // and a HELLO reach it as they were
+  async fpred([port]) {
+    const { attachNet } = await pageNet(port);
+    const memory = new WebAssembly.Memory({ initial: 10, maximum: 10, shared: true }), roam = mailbox(memory, 0);
+    want(roam, 1); Atomics.store(roam.w, P.W_MODE, P.NET_MODE_VLAN);
+    const link = attachNet(fakeGame(memory, { 4: roam }), { url: `ws://127.0.0.1:${port}/lan`, name: 'P', pingMs: 60_000 });
+    try {
+      const me = P.ipNum(await link.online);
+      const c = new Client(port, 'C', '', null, { bundle: true });
+      await c.welcome(); await sleep(100);
+      const sent = [];
+      let t = 4_294_000_000;
+      for (let k = 0; k < 120; k++) {
+        t = (t + 50_000 + (k % 7 === 0 ? 16_667 : 0)) >>> 0;
+        const a = k * 0.05, moving = k < 90;
+        const p = moving ? [1695.123 + 40 * Math.cos(a), -884.5 + 40 * Math.sin(a), 24.25 + 0.01 * k] : [1700.5, -880.25, 25.125];
+        const v = moving ? [-40 * Math.sin(a), 40 * Math.cos(a), 0.2] : [0, 0, 0];
+        sent.push(snapDatagram({ seq: k, t, p, v, k: moving ? k : 90, x: k % 10 === 5 ? 28 : k === 40 ? 0 : 16 }));
+        if (k === 60) {
+          const three = snapDatagram({ seq: k, t, p, v, k, x: 16 });
+          three[8 + 12] = 3;
+          three.writeUInt32LE(zlib.crc32(three.subarray(0, three.length - 4)), three.length - 4);
+          sent.push(three, roamDatagram(1, 40));
+        }
+      }
+      const expect = sent.map(d => d[5] === 3 && d[8 + 12] === 1 ? roundedDatagram(d) : d);
+      for (let i = 0; i < sent.length; i += 6) {
+        const part = sent.slice(i, i + 6);
+        c.sendBundle(part.map(d => ({ f: frameOf(me, d, 1, 47210, 47210) })));
+        await until(() => Atomics.load(roam.w, P.W_RX_HEAD) - Atomics.load(roam.w, P.W_RX_TAIL) >= part.length);
+        const got = rxTakeRaw(memory, roam);
+        assert.deepEqual(got.map(g => [g.src === c.vip, g.sport, g.dport, g.data.toString('hex')]),
+          expect.slice(i, i + 6).map(d => [true, 47210, 47210, d.toString('hex')]), `datagrams ${i} on`);
+        for (const g of got) assert.equal(g.data.readUInt32LE(g.data.length - 4), zlib.crc32(g.data.subarray(0, g.data.length - 4)), 'a CRC that checks out');
+      }
+      const info = (await state(port)).info;
+      assert.ok(info.fpredEntries >= 115 && info.fpredEntries <= info.snapEntries, `by their fields: ${info.fpredEntries} of ${info.snapEntries}`);
+      assert.ok(info.snapBytes / info.snapEntries < 40, `${(info.snapBytes / info.snapEntries).toFixed(1)} bytes a car state`);
+      await c.close();
     } finally { link.close(); }
   },
 };

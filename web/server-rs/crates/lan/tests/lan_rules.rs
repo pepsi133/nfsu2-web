@@ -1,5 +1,5 @@
 //! The switch's own tests, the second half (tests/lan.rs has the first): the audit's F2 (what one client can make the
-//! switch send, and whom it can get cut), the store, the 4000 addresses, LAN play's broadcasts, a page that lets go,
+//! switch send, and whom it can get cut), the store, the 7000 addresses, LAN play's broadcasts, a page that lets go,
 //! the breakdown, bundles, a player behind on its path (lag.rs).
 
 mod harness;
@@ -419,14 +419,58 @@ async fn with_a_store_a_restart_keeps_each_players_address_for_its_token() {
     sw2.close().await;
 }
 
-// addresses: 4000 on 10.77.0.0/20, handed out round its sixteen /24s; never .0, .1 or .252 and up; full past them
+// with a store, an address of before the restart that nobody came back for counts as a browser that left for the
+// hosts, once, when its reservation ends (the sweep, or the admission of a newcomer); one a departure reserved, they
+// heard of at the departure.  (The Online host keeps a race and its players' names until it hears they left.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn addresses_4000_round_the_sixteen_24s_full_past_them() {
+async fn with_a_store_an_address_nobody_came_back_for_is_gone_for_the_hosts() {
     let _s = serial().await;
-    let lan = LanSwitch::new(LanOptions { max_peers: 4000, ..LanOptions::default() }, "", None, None, None, None);
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("lan-addresses.json");
+    let o = LanOptions { reserve_ms: 400, ..opts() };
+    let kept = |n: u8| format!(r#"{{"v":"10.77.{n}.2","h":"{}"}}"#, nfsu2_util::js::base64url(&[n; 32]));
+    let (a, b) = (ip("10.77.0.2"), ip("10.77.1.2"));
+    let host = || {
+        let gone: Arc<Mutex<Vec<u32>>> = Default::default();
+        let h = FakeHost { vip: 0x0A4D_0001, name: "online".into(), listed: true, vips: Default::default(), gone: gone.clone() };
+        (Arc::new(h), gone)
+    };
+    // the sweep: the two addresses of before, once; Alice, who dropped after the start, at her departure only
+    std::fs::write(&store, format!("[{},{}]", kept(0), kept(1))).unwrap();
+    let (online, gone) = host();
+    let sw = start_full(o.clone(), "", Some(online), None, Some(store.clone())).await;
+    let mut alice = Client::connect(sw.port, "Alice").await;
+    alice.welcome().await;
+    assert!(![a, b].contains(&alice.vip), "a newcomer gets no address of before");
+    assert!(gone.lock().unwrap().is_empty(), "not before their time");
+    sw.lan.terminate_all();
+    wait_for(2000, || gone.lock().unwrap().len() == 1).await;
+    sleep(500).await;
+    sw.lan.keepalive();
+    sw.lan.keepalive();
+    assert_eq!(*gone.lock().unwrap(), [alice.vip, a, b]);
+    alice.closed().await;
+    sw.close().await;
+    // a newcomer's admission: the same, before its welcome
+    std::fs::write(&store, format!("[{},{}]", kept(0), kept(1))).unwrap();
+    let (online, gone) = host();
+    let sw = start_full(o, "", Some(online), None, Some(store.clone())).await;
+    sleep(500).await;
+    let mut carol = Client::connect(sw.port, "Carol").await;
+    carol.welcome().await;
+    assert_eq!(*gone.lock().unwrap(), [a, b]);
+    carol.close().await;
+    sw.close().await;
+}
+
+// addresses: 7000 on 10.77.0.0/19, handed out round twenty-eight of its /24s; never .0, .1 or .252 and up; full past them
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn addresses_7000_round_the_twenty_eight_24s_full_past_them() {
+    let _s = serial().await;
+    let lan = LanSwitch::new(LanOptions { max_peers: 7000, ..LanOptions::default() }, "", None, None, None, None);
     let mut got = Vec::new();
     let now = nfsu2_util::now_ms();
-    for i in 0..4000 {
+    for i in 0..7000 {
         let v = lan.allocate();
         assert!(v != 0, "address {i}");
         got.push(v);
@@ -434,10 +478,11 @@ async fn addresses_4000_round_the_sixteen_24s_full_past_them() {
     }
     let first: Vec<String> = got[..18].iter().map(|v| ip_str(*v)).collect();
     let mut want: Vec<String> = (0..16).map(|b| format!("10.77.{b}.2")).collect();
-    want.extend(["10.77.0.3".to_string(), "10.77.1.3".to_string()]);
+    want.extend(["10.77.16.2".to_string(), "10.77.17.2".to_string()]);
     assert_eq!(first, want);
-    assert_eq!(ip_str(got[3999]), "10.77.15.251");
-    assert_eq!(got.iter().collect::<HashSet<_>>().len(), 4000, "all distinct");
+    assert_eq!(ip_str(got[28]), "10.77.0.3");
+    assert_eq!(ip_str(got[6999]), "10.77.27.251");
+    assert_eq!(got.iter().collect::<HashSet<_>>().len(), 7000, "all distinct");
     let mut sorted = got.clone();
     sorted.sort();
     let mut all = all_vips();
@@ -455,20 +500,18 @@ async fn lan_plays_broadcasts_reach_only_the_browsers_with_lan_play_open() {
     let sw = start(opts()).await;
     let mut open = Client::with(sw.port, "Open", "", lan(1)).await;
     let mut shut = Client::with(sw.port, "Shut", "", lan(0)).await;
-    let mut old = Client::connect(sw.port, "Old").await;
     let mut later = Client::with(sw.port, "Later", "", lan(0)).await;
     let mut tx = Client::with(sw.port, "Host", "", lan(1)).await;
-    for c in [&mut open, &mut shut, &mut old, &mut later, &mut tx] {
+    for c in [&mut open, &mut shut, &mut later, &mut tx] {
         c.welcome().await;
     }
     // its hello is in
-    for c in [&open, &shut, &old, &later, &tx] {
+    for c in [&open, &shut, &later, &tx] {
         c.until_true(|g| g.count("peers") > 0).await;
     }
     tx.udp(BROADCAST, 9999, 9999, b"any LAN games?", 3, 0);
     tx.udp(BROADCAST, 47210, 47210, b"free roam", 1, 0);
     open.until_true(|g| g.frames.len() == 2).await;
-    old.until_true(|g| g.frames.len() == 2).await;
     shut.until_true(|g| g.frames.len() == 1).await;
     later.until_true(|g| g.frames.len() == 1).await;
     sleep(50).await;
@@ -478,7 +521,6 @@ async fn lan_plays_broadcasts_reach_only_the_browsers_with_lan_play_open() {
         k
     };
     assert_eq!(kinds(&shut), [1], "LAN play shut: free roam's broadcast only");
-    assert_eq!(kinds(&old), [1, 3], "a page of before (no lan in its hello): every broadcast, as before");
     // LAN play opens later ({"t":"lan"}), then shuts again
     later.text(r#"{"t":"lan","on":1}"#);
     sleep(50).await;
@@ -495,7 +537,7 @@ async fn lan_plays_broadcasts_reach_only_the_browsers_with_lan_play_open() {
     // unicast is not affected
     tx.udp(shut.vip, 9999, 9999, b"to you", 3, 0);
     shut.until_true(|g| g.frames.len() == 2).await;
-    for c in [&open, &shut, &old, &later, &tx] {
+    for c in [&open, &shut, &later, &tx] {
         c.close().await;
     }
     sw.close().await;
@@ -531,18 +573,18 @@ async fn a_page_that_lets_go_frees_its_address_at_once() {
 }
 
 // the server's console says what the players on the switch do (src/app/run.rs, every 5 minutes): each counted once
-// breakdown: Online mode, the LAN or Online screens, free roam, an older page, leaving or starting
+// breakdown: Online mode, the LAN or Online screens, free roam, leaving or starting
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn breakdown_online_lan_screens_free_roam_older_page_leaving_or_starting() {
+async fn breakdown_online_lan_screens_free_roam_leaving_or_starting() {
     let _s = serial().await;
     let in_online = Arc::new(Mutex::new(HashSet::new()));
     let in_roam = Arc::new(Mutex::new(HashSet::new()));
-    let online = Arc::new(FakeHost { vip: 0x0A4D_0001, name: "online".into(), listed: true, vips: in_online.clone() });
-    let roam = Arc::new(FakeHost { vip: 0x0A4D_00FD, name: String::new(), listed: false, vips: in_roam.clone() });
+    let online = Arc::new(FakeHost { vip: 0x0A4D_0001, name: "online".into(), listed: true, vips: in_online.clone(), gone: Default::default() });
+    let roam = Arc::new(FakeHost { vip: 0x0A4D_00FD, name: String::new(), listed: false, vips: in_roam.clone(), gone: Default::default() });
     let sw = start_full(opts(), "", Some(online), Some(roam), None).await;
     let mut all = Vec::new();
     for (name, l) in
-        [("Online", Some(1)), ("LanScreens", Some(1)), ("Roamer", Some(0)), ("OldRoamer", None), ("Old", None), ("Leaving", Some(0))]
+        [("Online", Some(1)), ("LanScreens", Some(1)), ("Roamer", Some(0)), ("Roamer2", Some(0)), ("Leaving", Some(0))]
     {
         let mut c = Client::with(sw.port, name, "", Opts { lan: l, ..Opts::default() }).await;
         c.welcome().await;
@@ -553,10 +595,11 @@ async fn breakdown_online_lan_screens_free_roam_older_page_leaving_or_starting()
     }
     in_online.lock().unwrap().insert(all[0].vip);
     in_roam.lock().unwrap().extend([all[2].vip, all[3].vip, all[0].vip]);
-    assert_eq!(
-        sw.lan.breakdown().await,
-        Breakdown { players: 6, online: 1, lan: 1, roam: 2, older: 1, other: 1, bundles: 0, ..Breakdown::default() }
-    );
+    // (what the pages were sent by kind left out: nothing yet, a count for each kind)
+    let mut b = sw.lan.breakdown().await;
+    assert!(b.mix.iter().all(|&n| n == 0));
+    b.mix.clear();
+    assert_eq!(b, Breakdown { players: 5, online: 1, lan: 1, roam: 2, other: 1, ..Breakdown::default() });
     // (the Online host is on the peer list, as { vip, name, server: true }; the hub is on none)
     let list = all[1].got().ctl.iter().rev().find(|m| m["t"] == "peers").cloned().unwrap();
     let last = list["peers"].as_array().unwrap().last().unwrap().clone();
@@ -570,7 +613,7 @@ async fn breakdown_online_lan_screens_free_roam_older_page_leaving_or_starting()
 // ---- bundles (kind 32): several frames in one message ----
 
 // bundles: each entry reaches its destinations as a frame of its own; a client that takes bundles gets one message a
-// turn, one that does not gets frames as before
+// turn, one that does not (a tool) gets frames
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bundles_each_entry_reaches_its_destinations_as_a_frame_of_its_own() {
     let _s = serial().await;
@@ -579,11 +622,10 @@ async fn bundles_each_entry_reaches_its_destinations_as_a_frame_of_its_own() {
     let mut b = Client::with(sw.port, "B", "", bundles()).await;
     let mut c = Client::connect(sw.port, "C").await;
     let mut d = Client::with(sw.port, "D", "", bundles()).await;
-    let wa = a.welcome().await;
+    a.welcome().await;
     for x in [&mut b, &mut c, &mut d] {
         x.welcome().await;
     }
-    assert_eq!(wa["bundle"], 1, "the welcome says the switch takes bundles");
     sleep(100).await;
     // a snapshot to three friends once, one frame to B alone, a LAN broadcast
     a.send_bundle(&[
@@ -618,7 +660,7 @@ async fn bundles_each_entry_reaches_its_destinations_as_a_frame_of_its_own() {
     }
     assert_eq!(b.frames(), 1, "B (takes bundles): one message for the three");
     assert_eq!(b.got().frames[0].0[0], 32);
-    assert_eq!(c.frames(), 2, "C (a client of before): two frames, as before");
+    assert_eq!(c.frames(), 2, "C (takes no bundles: a tool): two frames");
     assert!(c.got().frames.iter().all(|f| f.0[0] != 32));
     assert!(a.dgrams().is_empty(), "nothing back to the sender");
     let i = sw.info().await;
@@ -647,8 +689,9 @@ async fn bundles_each_entry_reaches_its_destinations_as_a_frame_of_its_own() {
 async fn bundles_lan_play_datagrams_do_not_wait_for_the_clock() {
     let _s = serial().await;
     // a fixed tick of 400 ms: 8 datagrams 50 ms apart that wait for it wait 350 ms or more, one of them at least (no
-    // probes: a ping wakes the writer, which takes the datagrams queued along)
-    let sw = start(LanOptions { bundle_ms: 400, bundle_max_ms: 400, probe_ms: 0, ..opts() }).await;
+    // probes: a ping wakes the writer, which takes the datagrams queued along; no jitter: a tick of 240 ms made the
+    // longest wait under 300 ms in about a quarter of the runs)
+    let sw = start(LanOptions { bundle_ms: 400, bundle_max_ms: 400, bundle_jitter: 0.0, probe_ms: 0, ..opts() }).await;
     let mut a = Client::connect(sw.port, "A").await;
     let mut b = Client::with(sw.port, "B", "", bundles()).await;
     a.welcome().await;
@@ -1014,5 +1057,116 @@ async fn a_frame_without_ports_reaches_a_compact_page_whole() {
     }
     s.close().await;
     small.close().await;
+    sw.close().await;
+}
+
+// the peer list follows LAN play: a page with it shut gets the server's own hosts only and no changes, the whole
+// list when it opens LAN play and the changes after that, none again once it shuts it
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_peer_list_goes_only_to_pages_with_lan_play_open() {
+    let _s = serial().await;
+    let sw = start(opts()).await;
+    let with = |on: u8| Opts { lan: Some(on), ..Opts::default() };
+    let mut shut = Client::with(sw.port, "Shut", "", with(0)).await;
+    shut.welcome().await;
+    let mut open = Client::with(sw.port, "Open", "", with(1)).await;
+    open.welcome().await;
+    open.until_true(|g| g.names() == "Open,Shut").await;
+    shut.until_true(|g| g.count("peers") == 1).await;
+    assert_eq!(shut.got().names(), "", "the hosts only (none on this switch)");
+    let mut late = Client::with(sw.port, "Late", "", with(1)).await;
+    late.welcome().await;
+    open.until_true(|g| g.names() == "Late,Open,Shut").await;
+    sleep(400).await;
+    {
+        let g = shut.got();
+        assert_eq!((g.count("delta"), g.names()), (0, String::new()), "no changes while LAN play is shut");
+    }
+    // LAN play opens: the whole list, then the changes
+    shut.text(r#"{"t":"lan","on":1}"#);
+    shut.until_true(|g| g.names() == "Late,Open,Shut").await;
+    let mut more = Client::with(sw.port, "More", "", with(0)).await;
+    more.welcome().await;
+    shut.until_true(|g| g.names() == "Late,More,Open,Shut").await;
+    // shut again: no more changes
+    shut.text(r#"{"t":"lan","on":0}"#);
+    sleep(100).await;
+    let deltas = shut.got().count("delta");
+    let mut last = Client::with(sw.port, "Last", "", with(1)).await;
+    last.welcome().await;
+    open.until_true(|g| g.names() == "Last,Late,More,Open,Shut").await;
+    sleep(400).await;
+    assert_eq!(shut.got().count("delta"), deltas);
+    sw.close().await;
+}
+
+// a player in free roam who is not driving (its own HELLO says a race): what its friends send it waits for the slow
+// clock, and of their car states it gets a share; a driver gets the same as ever, and a HELLO that says it drives again
+// ends it (away.rs)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_player_not_driving_gets_fewer_messages_and_a_driver_the_same_as_ever() {
+    let _s = serial().await;
+    let sw = start(unlimited()).await;
+    // (free roam alone: a page on the LAN screens is not counted as away)
+    let roamer = Opts { lan: Some(0), ..bundles() };
+    let mut racer = Client::with(sw.port, "Racer", "", roamer).await;
+    racer.welcome().await;
+    let mut driver = Client::with(sw.port, "Driver", "", roamer).await;
+    driver.welcome().await;
+    let mut s = Client::connect(sw.port, "Sender").await;
+    s.welcome().await;
+    // a HELLO of status st (after its 16-byte header: the core's version, the platform, the status), its CRC made again
+    let hello = |st: u8| {
+        let mut d = roam_datagram(1, 24);
+        d[19] = st;
+        let n = d.len() - 4;
+        let crc = crc32fast::hash(&d[..n]);
+        d[n..].copy_from_slice(&crc.to_le_bytes());
+        d
+    };
+    let (ping, snap) = (roam_datagram(6, 8), roam_datagram(3, 40));
+    // 2 s of a ping every 20 ms to each and 8 car states each tick: messages, and car states, each got
+    let burst = || async {
+        let (r0, d0) = (racer.frames(), driver.frames());
+        let (rs0, ds0) = (racer.dgrams().iter().filter(|g| g.buf.get(21) == Some(&3)).count(), driver.dgrams().iter().filter(|g| g.buf.get(21) == Some(&3)).count());
+        for _ in 0..100 {
+            for to in [racer.vip, driver.vip] {
+                s.udp(to, 47210, 47210, &ping, 1, 0);
+                for _ in 0..8 {
+                    s.udp(to, 47210, 47210, &snap, 1, 0);
+                }
+            }
+            sleep(20).await;
+        }
+        sleep(800).await;
+        let snaps = |c: &Client| c.dgrams().iter().filter(|g| g.buf.get(21) == Some(&3)).count();
+        (racer.frames() - r0, driver.frames() - d0, snaps(&racer) - rs0, snaps(&driver) - ds0)
+    };
+
+    racer.udp(s.vip, 47210, 47210, &hello(3), 1, 0);
+    until_breakdown(&sw, 3, "away", |b| b.away == 1).await;
+    let (rm, dm, rs, ds) = burst().await;
+    println!("in a race: racer {rm} messages, {rs} car states; driver {dm} messages, {ds} car states");
+    assert!(rm <= 10, "the racer's on the slow clock: {rm} messages in 2.8 s");
+    assert!(dm >= 25, "the driver's on the bundle clock: {dm} messages in 2 s");
+    assert!(rs > 0 && rs < 120, "a share of the 800 car states: {rs}");
+    assert_eq!(ds, 800, "every car state to the driver");
+
+    // LAN play's datagrams go at once, also to it
+    let n = racer.frames();
+    racer.udp(s.vip, 47210, 47210, &hello(3), 1, 0);
+    s.udp(racer.vip, 5000, 5000, b"race", 3, 0);
+    racer.until_ms(300, |g| (g.frames.len() > n).then_some(())).await;
+
+    // driving again: as the driver
+    racer.udp(s.vip, 47210, 47210, &hello(2), 1, 0);
+    until_breakdown(&sw, 3, "driving", |b| b.away == 0).await;
+    let (rm, dm, rs, ds) = burst().await;
+    println!("driving: racer {rm} messages, {rs} car states; driver {dm} messages, {ds} car states");
+    assert!(rm >= 25 && dm >= 25, "{rm} and {dm} messages");
+    assert_eq!((rs, ds), (800, 800));
+    racer.close().await;
+    driver.close().await;
+    s.close().await;
     sw.close().await;
 }

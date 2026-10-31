@@ -4,11 +4,22 @@
 //
 // navigator.getGamepads() exists on the page's main thread only, so the page
 // polls it every frame and publishes the pad into the HostMailbox under a
-// seqlock; the guest reads it when the game polls its device.  The first
-// connected controller with the standard mapping drives the pad (one that
-// connects later takes over only when it goes away), as gamepad.m does;
-// without a standard one the first controller is read as if it were.
-// Chrome exposes a controller only after a button press on the page.
+// seqlock; the guest reads it when the game polls its device.  Of the
+// controllers with the standard mapping and the steering wheels (wheel.ts:
+// the wheel, its pedals and buttons made the pad's, and the game offered a
+// driving device; an RC radio drives as one), the one the player last
+// pressed a button on drives the
+// pad, so a controller next to a wheel takes over with a press and the wheel
+// takes it back with one of its own.  Before any press, and when that one
+// goes away, the first connected of them drives (one that connects later
+// waits for a press), as gamepad.m does; without either the first
+// controller is read through its known layout (hidpad.ts: 8BitDo's), or else
+// as if it had the standard mapping, but for an axis resting at an end when
+// it showed up (a pedal, a throttle, a trigger), which is no stick.  Chrome
+// on Android gives every controller the standard mapping's places, called
+// standard or not (androidLayout): those are read as they come.  Chrome
+// exposes a controller only after a button press on the page, or a stick
+// pushed past half way.
 //
 // Rumble goes the other way: runtime/dinput_pad.c plays the game's
 // force-feedback effects as two motor levels in the mailbox, updated every
@@ -23,25 +34,34 @@
 // game.
 import {
   IM_OFF_PAD_NAME, IM_PAD_AXIS, IM_PAD_BUTTONS, IM_PAD_CONNECTED, IM_PAD_FAMILY, IM_PAD_GEN, IM_PAD_RUMBLE, IM_PAD_SEQ,
-  IM_RUMBLE_SEQ, IM_RUMBLE_STRONG, IM_RUMBLE_WEAK,
+  IM_PAD_WHEEL, IM_RUMBLE_SEQ, IM_RUMBLE_STRONG, IM_RUMBLE_WEAK,
   PAD_A, PAD_AXIS_LT, PAD_AXIS_LX, PAD_AXIS_LY, PAD_AXIS_RT, PAD_AXIS_RX, PAD_AXIS_RY, PAD_B, PAD_BACK, PAD_DDOWN,
   PAD_DLEFT, PAD_DRIGHT, PAD_DUP, PAD_HOME, PAD_LB, PAD_LS, PAD_RB, PAD_RS, PAD_START, PAD_X, PAD_Y,
   PADF_GENERIC, PADF_NINTENDO, PADF_PLAYSTATION, PADF_XBOX,
 } from './proto';
+import {
+  describeMap, findHat, guessMap, hatDirs, loadMap, loadShifter, readWheel, Shifter, shifterGear, usbIds, WHEEL_MAP_EVENT,
+  wheelOf, withSetUp, type ShifterMode, type WheelInfo, type WheelMap,
+} from './wheel';
+import { eightBitDoFace, HidPadReader } from './hidpad';
 
-export interface PadSnapshot { connected: boolean; buttons: number; axes: number[]; family: number; name: string; index: number }
+export interface PadSnapshot { connected: boolean; buttons: number; axes: number[]; family: number; name: string; index: number; wheel?: boolean }
 
 // standard mapping: buttons[i] -> PAD_* (6 and 7 are the analog triggers)
 const BUTTON_OF: (number | -1)[] = [PAD_A, PAD_B, PAD_X, PAD_Y, PAD_LB, PAD_RB, -1, -1, PAD_BACK, PAD_START,
   PAD_LS, PAD_RS, PAD_DUP, PAD_DDOWN, PAD_DLEFT, PAD_DRIGHT, PAD_HOME];
 
 /** the controller family and a display name from Gamepad.id: Chrome writes
- *  "Name (STANDARD GAMEPAD Vendor: 054c Product: 0ce6)", Firefox "054c-0ce6-Name" */
+ *  "Name (STANDARD GAMEPAD Vendor: 054c Product: 0ce6)", Firefox "054c-0ce6-Name"
+ *  (on Linux and macOS without the leading zeros: "54c-ce6-Name").
+ *  A wheel's family is its buttons' (a G29's are PlayStation's, a G920's Xbox's), an 8BitDo pad's its labels'. */
 export function familyOf(id: string): { family: number; name: string } {
-  const v = (/Vendor:\s*([0-9a-f]{4})/i.exec(id) ?? /^([0-9a-f]{4})-[0-9a-f]{4}-/i.exec(id))?.[1]?.toLowerCase();
-  let name = id.replace(/\s*\((?:STANDARD GAMEPAD\s*)?(?:Vendor:[^)]*)?\)\s*$/i, '').replace(/^[0-9a-f]{4}-[0-9a-f]{4}-/i, '').trim();
+  const v = usbIds(id)?.vendor;
+  let name = id.replace(/\s*\((?:STANDARD GAMEPAD\s*)?(?:Vendor:[^)]*)?\)\s*$/i, '').replace(/^[0-9a-f]{1,4}-[0-9a-f]{1,4}-/i, '').trim();
   if (!name) name = 'Game Controller';
-  const s = id.toLowerCase();
+  const s = id.toLowerCase(), w = wheelOf(id)?.layout, e = eightBitDoFace(id);
+  if (w === 'ps' || w === 'xbox') return { family: w === 'ps' ? PADF_PLAYSTATION : PADF_XBOX, name };
+  if (e) return { family: e === 'xbox' ? PADF_XBOX : PADF_NINTENDO, name };
   const family = v === '045e' || /xbox|xinput/.test(s) ? PADF_XBOX
     : v === '054c' || /dualsense|dualshock|playstation/.test(s) ? PADF_PLAYSTATION
     : v === '057e' || /pro controller|joy-con|nintendo/.test(s) ? PADF_NINTENDO : PADF_GENERIC;
@@ -49,20 +69,99 @@ export function familyOf(id: string): { family: number; name: string } {
 }
 
 /** a Gamepad in the standard mapping -> the virtual pad (sticks -1..1 with
- *  +y down, which is already the Gamepad API's direction; triggers 0..1) */
-export function mapStandard(g: Gamepad): PadSnapshot {
+ *  +y down, which is already the Gamepad API's direction; triggers 0..1).
+ *  notStick: axes read as 0 (a controller without the standard mapping: those
+ *  that rested at an end when it showed up) */
+export function mapStandard(g: Gamepad, notStick?: ReadonlySet<number>): PadSnapshot {
   let buttons = 0;
   for (let i = 0; i < BUTTON_OF.length && i < g.buttons.length; i++) {
     const b = BUTTON_OF[i], bt = g.buttons[i];
     if (b >= 0 && bt && (bt.pressed || bt.value > 0.5)) buttons |= 1 << b;
   }
-  const ax = (i: number) => { const v = g.axes[i]; return typeof v === 'number' && isFinite(v) ? Math.max(-1, Math.min(1, v)) : 0; };
+  const ax = (i: number) => {
+    const v = g.axes[i];
+    return typeof v === 'number' && isFinite(v) && !notStick?.has(i) ? Math.max(-1, Math.min(1, v)) : 0;
+  };
   const tr = (i: number) => { const b = g.buttons[i]; return b ? Math.max(0, Math.min(1, b.value || (b.pressed ? 1 : 0))) : 0; };
   const axes = [0, 0, 0, 0, 0, 0];
   axes[PAD_AXIS_LX] = ax(0); axes[PAD_AXIS_LY] = ax(1); axes[PAD_AXIS_RX] = ax(2); axes[PAD_AXIS_RY] = ax(3);
   axes[PAD_AXIS_LT] = tr(6); axes[PAD_AXIS_RT] = tr(7);
   const { family, name } = familyOf(g.id);
   return { connected: true, buttons, axes, family, name, index: g.index };
+}
+
+/** a steering wheel -> the virtual pad (wheel.ts): the wheel on LX, the brake and gas pedals on LT and RT; its
+ *  shifter's gears through shift (the lever's state, and what the player picked for it) */
+export function mapWheel(g: Gamepad, m: WheelMap, hat: number, shift?: { shifter: Shifter; mode: ShifterMode }): PadSnapshot {
+  const pressed = g.buttons.map(b => !!b && (b.pressed || b.value > 0.5));
+  const { buttons: own, axes } = readWheel(g.axes, pressed, m, hat);
+  const buttons = own | (shift && m.gears ? shift.shifter.buttons(shifterGear(pressed, m.gears), shift.mode, performance.now()) : 0);
+  const { family, name } = familyOf(g.id);
+  return { connected: true, buttons, axes, family, name, index: g.index, wheel: true };
+}
+
+/** an 8BitDo pad without the standard mapping -> the virtual pad (hidpad.ts) */
+export function mapHid(g: Gamepad, r: HidPadReader): PadSnapshot {
+  const { buttons, axes } = r.read(g.axes, g.buttons.map(b => !!b && (b.pressed || b.value > 0.5)));
+  const { family, name } = familyOf(g.id);
+  return { connected: true, buttons, axes, family, name, index: g.index };
+}
+
+/**
+ * Whether a controller without the standard mapping has its places all the same: Chrome on Android reads every
+ * controller through Android's key codes and puts its buttons and sticks where the standard mapping has them (the
+ * sticks on axes 0 to 3, the triggers buttons 6 and 7, the D-pad buttons 12 to 15), but calls one it knows no mapping
+ * for not standard ("8BitDo Ultimate 2 Wireless (Vendor: 2dc8 Product: 6012)", mapping "").  Read through the 8BitDo
+ * layout (hidpad.ts: its HID report's order) such a pad had only A and B in place and its D-pad opened the page's menu
+ * (a player's report: nothing worked from one day to the next).  Chrome on a big tablet asks for desktop websites and
+ * says Linux: there it shows by Chrome's id with Android's 16 buttons (17 with Home) on a touch screen.
+ */
+export function androidLayout(g: Gamepad): boolean {
+  if (g.mapping === 'standard') return false;
+  const ua = navigator.userAgent ?? '';
+  if (/Android/.test(ua)) return true;
+  return /X11; Linux/.test(ua) && (navigator.maxTouchPoints ?? 0) > 0 && /\(Vendor: [0-9a-f]{4} Product: [0-9a-f]{4}\)$/i.test(g.id) &&
+    (g.buttons.length === 16 || g.buttons.length === 17) && g.axes.length < 10;
+}
+
+/** the controller driving the game's pad (null: no game, or no controller); PAD_DRIVER_EVENT on the window when
+ *  another one does (the Controls sheet shows that one) */
+let driver: { index: number; id: string } | null = null;
+export const PAD_DRIVER_EVENT = 'nfsu2-pad-driver';
+/** whether a controller may drive the pad while others are connected: the standard mapping (Chrome on Android's
+ *  too), a steering wheel, or an 8BitDo pad (hidpad.ts) */
+export const mayDrive = (g: Gamepad | null) => !!g &&
+  (g.mapping === 'standard' || !!wheelOf(g.id) || !!eightBitDoFace(g.id) || androidLayout(g));
+export function drivingPad(): Gamepad | null {
+  if (!driver) return null;
+  try { const g = navigator.getGamepads?.()[driver.index]; return g?.connected && g.id === driver.id ? g : null; }
+  catch { return null; }
+}
+
+/** what the poller knows of the controller driving the pad: whether it has the standard mapping's places (std: its
+ *  own, or Chrome on Android's), its axes when it showed up; if it is a wheel, the model, how it makes the pad, the
+ *  axis of its D-pad, its shifter and what the player picked for that; if it is an 8BitDo pad without the standard
+ *  mapping, its reader */
+interface Seen {
+  index: number; id: string; std: boolean; axes0: number[]; ends: Set<number>; wheel: WheelInfo | null; map: WheelMap | null;
+  hat: number; shifter: Shifter; mode: ShifterMode; hid: HidPadReader | null;
+}
+
+/**
+ * Each controller's axes when it first drove the pad on this page, by Gamepad.id: a wheel's layout comes from them
+ * (a pedal let go rests at an end).  A wheel drives again after a controller did once a button is pressed on it,
+ * perhaps with a foot on the gas already, and its axes read anew then had the gas off its rest: no pedal of the
+ * model's, so the guess took the clutch for the gas until a reload (a player's report).  So a wheel keeps its first
+ * look, unless that gave only a guess and a later one gives the model's own layout.
+ */
+const firstAxes = new Map<string, number[]>();
+function axesWhenSeen(g: Gamepad, wheel: WheelInfo | null): number[] {
+  const now = Array.from(g.axes, v => typeof v === 'number' && isFinite(v) ? v : 0);
+  const first = firstAxes.get(g.id);
+  if (first && first.length === now.length &&
+      !(wheel && !guessMap(wheel, first, g.buttons.length).placed && guessMap(wheel, now, g.buttons.length).placed)) return first;
+  if (firstAxes.size < 16 || first) firstAxes.set(g.id, now);
+  return now;
 }
 
 /** what the page itself does with the controller */
@@ -73,6 +172,12 @@ export interface PadPage {
   dialog(): boolean;
   /** a button went down while dialog() (a PAD_* number; the left stick's directions come as the D-pad's) */
   press(button: number): void;
+  /** the right stick (x, y: -1..1, +y down) each time the controller is read while no dialog is open (quick chat's
+   *  picker); true: the page uses it now, the game gets it at rest */
+  stick?(x: number, y: number): boolean;
+  /** the whole controller each time it is read while no dialog is open (photo mode: runtime/photo.c), with the
+   *  buttons pressed since the last read; true: the page has it now, the game gets it at rest */
+  capture?(s: PadSnapshot, pressed: number): boolean;
 }
 
 /** the touch controls' share of the pad (web/src/app/touch.ts): PAD_* button bits and the left stick's x */
@@ -99,7 +204,6 @@ function stickDirs(x: number, y: number, prev: number): number {
 
 export class PadPoller {
   private order: number[] = [];            // controller indices in connection order
-  private active = -1;
   private last: PadSnapshot | null = null;
   private f32 = new Float32Array(1);
   private i32 = new Int32Array(this.f32.buffer);
@@ -124,6 +228,13 @@ export class PadPoller {
   // controller: when it last buzzed
   private touch: TouchPad | null = null;
   private buzzAt = 0;
+  // the controller driving the pad as it showed up (a wheel's layout comes from it)
+  private seen: Seen | null = null;
+  // each controller's buttons as last polled (a radio's axes too, where they last were its use), and the one a button
+  // was last pressed on (choose)
+  private down = new Map<number, { id: string; on: boolean[]; at?: number[] }>();
+  private chosen: { index: number; id: string } | null = null;
+  private polled = false;
   /** performance.now() of a real controller's last button press (0: none yet) */
   lastPress = 0;
   // views of the game's memory: dropped by dispose(), so nothing keeps an ended
@@ -138,6 +249,11 @@ export class PadPoller {
     this.log(`[pad] disconnected: ${e.gamepad.id}`);
     this.poll();
   };
+  // the player set up a wheel (or went back to the guess): read its layout again
+  private onWheelMap = () => {
+    if (this.seen) this.seen.map = null;
+    this.poll();
+  };
 
   /** onPress: a button went down; onUse: that, or a stick or trigger moved a quarter of its range; page: the page's
    *  menu and dialogs */
@@ -147,14 +263,17 @@ export class PadPoller {
     this.h = h; this.u8 = u8;
     addEventListener('gamepadconnected', this.onConnect);
     addEventListener('gamepaddisconnected', this.onDisconnect);
+    addEventListener(WHEEL_MAP_EVENT, this.onWheelMap);
   }
 
   /** stop for good: listeners removed, the mailbox views dropped */
   dispose() {
     removeEventListener('gamepadconnected', this.onConnect);
     removeEventListener('gamepaddisconnected', this.onDisconnect);
+    removeEventListener(WHEEL_MAP_EVENT, this.onWheelMap);
     this.rumble(null);
     this.h = null; this.u8 = null;
+    if (driver) { driver = null; dispatchEvent(new Event(PAD_DRIVER_EVENT)); }
   }
 
   /** the controller driving the pad, or null */
@@ -170,14 +289,18 @@ export class PadPoller {
     for (const g of pads) if (g && g.connected) { live.add(g.index); if (!this.order.includes(g.index)) this.order.push(g.index); }
     this.order = this.order.filter(i => live.has(i));
     const byIndex = (i: number) => pads[i] ?? null;
-    let pick = this.order.find(i => byIndex(i)?.mapping === 'standard');
+    this.choose(pads);
+    const c = this.chosen, cg = c && byIndex(c.index);
+    let pick = cg?.connected && cg.id === c!.id ? c!.index : undefined;
+    if (pick === undefined) { this.chosen = null; pick = this.order.find(i => mayDrive(byIndex(i))); }
     if (pick === undefined) pick = this.order[0];
     const g = pick === undefined ? null : byIndex(pick);
-    if ((pick ?? -1) !== this.active) {
-      this.active = pick ?? -1;
-      if (g && g.mapping !== 'standard') this.log(`[pad] ${g.id}: no standard mapping in this browser, read as if it had one`);
+    if (g?.index !== driver?.index || g?.id !== driver?.id) {
+      if (g && driver) this.log(`[pad] ${g.id} drives now${this.chosen ? ' (a button pressed on it)' : ''}`);
+      driver = g && { index: g.index, id: g.id };
+      dispatchEvent(new Event(PAD_DRIVER_EVENT));
     }
-    const s: PadSnapshot = g ? mapStandard(g) : { connected: false, buttons: 0, axes: [0, 0, 0, 0, 0, 0], family: PADF_GENERIC, name: '', index: -1 };
+    const s: PadSnapshot = g ? this.read(g) : { connected: false, buttons: 0, axes: [0, 0, 0, 0, 0, 0], family: PADF_GENERIC, name: '', index: -1 };
     this.rumble(g);
     const pressed = s.buttons & ~this.pressedBefore;
     this.pressedBefore = s.buttons;
@@ -189,6 +312,77 @@ export class PadPoller {
     if (this.same(out)) return;
     this.publish(out, !this.last || this.last.connected !== out.connected || this.last.index !== out.index || this.last.name !== out.name);
     this.last = out;
+  }
+
+  /** A button pressed on a controller that may drive the pad makes it the one that does (chosen).  One that shows up
+   *  with a button held was pressed (Chrome shows a controller on a press), but not one there at the first poll (a
+   *  wheel's shifter left in a gear).  A radio has few buttons or none: a stick or a switch of its moved half way
+   *  from where it was while it last drove (or showed up) counts as a press. */
+  private choose(pads: readonly (Gamepad | null)[]) {
+    const down = new Map<number, { id: string; on: boolean[]; at?: number[] }>();
+    for (const g of pads) {
+      if (!g?.connected) continue;
+      const on = g.buttons.map(b => !!b && (b.pressed || b.value > 0.5));
+      const was = this.down.get(g.index);
+      const before = was?.id === g.id ? was.on : this.polled ? [] : on;
+      let at: number[] | undefined;
+      if (wheelOf(g.id)?.layout === 'radio') {
+        const now = Array.from(g.axes, v => typeof v === 'number' && isFinite(v) ? v : 0), prev = was?.id === g.id ? was.at : undefined;
+        const moved = !!prev && now.some((v, i) => Math.abs(v - (prev[i] ?? v)) >= 0.5);
+        if (moved) this.chosen = { index: g.index, id: g.id };
+        at = !prev || moved || (driver?.index === g.index && driver.id === g.id) ? now : prev;
+      }
+      if (mayDrive(g) && on.some((v, i) => v && !before[i])) this.chosen = { index: g.index, id: g.id };
+      down.set(g.index, at ? { id: g.id, on, at } : { id: g.id, on });
+    }
+    this.down = down;
+    this.polled = true;
+  }
+
+  /** the controller driving the pad as the pad: a wheel through its layout (the model's, with the player's set-up
+   *  over it, or the guess from how it showed up) and its shifter, one in the standard mapping's places as it is, an
+   *  8BitDo pad through its known layout, any other as if it had the standard mapping, but for the axes that rested at
+   *  an end when it showed up, and with Chrome's hat switch as its D-pad.  The first two axes (the left stick, in
+   *  every browser's placement) are always a stick: Chrome shows a controller once a stick is pushed past half way,
+   *  so it may sit at an end then, and it steered nothing until a reload. */
+  private read(g: Gamepad): PadSnapshot {
+    let k = this.seen;
+    if (!k || k.index !== g.index || k.id !== g.id) {
+      const wheel = wheelOf(g.id), axes0 = axesWhenSeen(g, wheel), face = eightBitDoFace(g.id);
+      const std = g.mapping === 'standard' || (!wheel && androidLayout(g));
+      const ends = new Set<number>();
+      if (!std) axes0.forEach((v, i) => { if (i > 1 && Math.abs(v) >= 0.9 && Math.abs(v) <= 1.05) ends.add(i); });
+      const hid = !wheel && face && !std ? new HidPadReader(face, axes0) : null;
+      k = this.seen = { index: g.index, id: g.id, std, axes0, ends, wheel, map: null, hat: std ? -1 : findHat(axes0),
+        shifter: new Shifter(), mode: 'off', hid };
+      if (g.mapping !== 'standard') {
+        this.log(`[pad] ${g.id}: no standard mapping in this browser; ${g.axes.length} axes at ` +
+          `[${axes0.map(v => v.toFixed(2)).join(' ')}], ${g.buttons.length} buttons`);
+        if (hid) this.log(`[pad] read as ${hid.describe()}`);
+        else if (std) this.log('[pad] read as it is: Android put it in the standard mapping\'s places');
+        else if (!k.wheel) this.log(`[pad] read as if it had one${ends.size ? `, but for axes ${[...ends].join(', ')} (at an end: no stick)` : ''}` +
+          `${k.hat >= 0 ? `, the D-pad on axis ${k.hat}` : ''}`);
+      }
+    }
+    if (k.hid) return mapHid(g, k.hid);
+    if (k.hat < 0 && !k.std) {
+      k.hat = findHat(g.axes);
+      if (k.hat >= 0) this.log(`[pad] ${g.id}: the D-pad on axis ${k.hat}`);
+    }
+    if (k.wheel && g.mapping === 'standard') return { ...mapStandard(g), wheel: true };
+    if (k.wheel) {
+      if (!k.map) {
+        const guess = guessMap(k.wheel, k.axes0, g.buttons.length), kept = loadMap(g.id);
+        k.map = kept ? withSetUp(guess, kept) : guess;
+        k.mode = loadShifter(g.id);
+        this.log(`[pad] ${g.id}: ${k.wheel.layout === 'radio' ? 'an RC radio' : 'a steering wheel'}, ${describeMap(k.map, k.hat)}` +
+          `${k.map.gears ? `; the shifter: ${k.mode}` : ''}`);
+      }
+      return mapWheel(g, k.map, k.hat, k);
+    }
+    const s = mapStandard(g, k.std ? undefined : k.ends);
+    if (!k.std && k.hat >= 0) s.buttons |= hatDirs(g.axes[k.hat]);
+    return s;
   }
 
   /** The page's share of the controller: Home, or the second stick pressed in while the other is, opens or closes its
@@ -210,9 +404,15 @@ export class PadPoller {
     const tap = now < this.tapUntil ? this.tap : 0;
     const dirs = stickDirs(s.axes[PAD_AXIS_LX], s.axes[PAD_AXIS_LY], this.stick), turned = dirs & ~this.stick;
     this.stick = dirs;
+    if (!page.dialog() && !menu && page.capture?.(s, pressed)) {
+      this.held = s.buttons;
+      return { ...s, buttons: 0, axes: [0, 0, 0, 0, 0, 0] };
+    }
     if (!page.dialog()) {
       this.held &= s.buttons;
       const buttons = (s.buttons & ~this.held & ~wait) | tap;
+      const rs = s.connected && !!page.stick?.(s.axes[PAD_AXIS_RX], s.axes[PAD_AXIS_RY]);
+      if (rs) { const axes = [...s.axes]; axes[PAD_AXIS_RX] = axes[PAD_AXIS_RY] = 0; return { ...s, buttons, axes }; }
       return buttons === s.buttons ? s : { ...s, buttons };
     }
     this.held = s.buttons;
@@ -222,7 +422,7 @@ export class PadPoller {
 
   private same(s: PadSnapshot) {
     const l = this.last;
-    return !!l && l.connected === s.connected && l.buttons === s.buttons && l.index === s.index &&
+    return !!l && l.connected === s.connected && l.buttons === s.buttons && l.index === s.index && !!l.wheel === !!s.wheel &&
       l.axes.every((v, i) => v === s.axes[i]);
   }
 
@@ -236,6 +436,7 @@ export class PadPoller {
     Atomics.store(h, IM_PAD_CONNECTED, s.connected ? 1 : 0);
     Atomics.store(h, IM_PAD_FAMILY, s.family);
     Atomics.store(h, IM_PAD_BUTTONS, s.buttons);
+    Atomics.store(h, IM_PAD_WHEEL, s.connected && s.wheel ? 1 : 0);
     for (let i = 0; i < 6; i++) { this.f32[0] = s.axes[i]; Atomics.store(h, IM_PAD_AXIS + i, this.i32[0]); }
     if (newPad) {
       const name = s.name.replace(/[^\x20-\x7e]/g, '?').slice(0, 63);

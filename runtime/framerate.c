@@ -1,5 +1,6 @@
 /* framerate.c -- frame-rate modes, the host frame pacer, and the fixes that
- * make the game's frame-count-driven subsystems correct above 60 fps.
+ * make the game's frame-count-driven subsystems correct above 60 fps (and
+ * at 30).
  *
  * The game runs one simulation step and one render per main-loop iteration
  * (0x5811C0): dt is variable and the frame rate is the simulation rate.  Car
@@ -9,23 +10,31 @@
  *   (2) fix the handful of subsystems that count frames instead of time.
  *
  * Options (all read once):
- *   NFSU2_FPS = auto | 60 | 120 | 240 | uncapped | off
+ *   NFSU2_FPS = auto | 30 | 60 | 120 | 240 | uncapped | off
  *       auto (default): the window's screen maximumFramesPerSecond mapped to
  *       the best supported content rate (>= 239 Hz -> 240, >= 119 Hz -> 120,
- *       otherwise 60).  The game's own 30 fps requests in NIS cutscenes are
- *       kept (SetFrameRate 0x576CB0); its online/LAN cap 0x5FF67C is not
+ *       up to 31 Hz -> 30, otherwise 60).  30 Hz is a browser that halves its
+ *       animation frames (Safari in Low Power Mode, or on a Mac nobody has
+ *       touched for a minute; Chrome's Energy Saver): it shows only every
+ *       other frame of 60, so the game makes the half it shows.  The game's
+ *       own 30 fps requests in NIS cutscenes are kept (SetFrameRate
+ *       0x576CB0); its online/LAN cap 0x5FF67C is not
  *       (sub_005ff490 below).
+ *       30: for a machine that cannot hold 60 (a phone): steady frames at
+ *       half the rate, the game otherwise as at 60 (the fixes below).
  *       uncapped: no pacer, mailbox presenter, display sync off.  Benchmark
  *       only: dt follows the machine, so the physics substep varies.
  *       off: the game's own QPC limiter at 1/120 s (plus SPINSLEEP), no fix,
  *       i.e. the timing of the port before this file existed.
  *       Aliases: native = auto, vanilla = game = off, max = uncapped.
  *   NFSU2_HFR_FIX = default | all | none | comma list of
- *       ticks,timer,particles,trail,audio,rtf,rain; a '-' prefix removes one
- *       ("default,-audio").  default = all when the mode's content rate is
- *       above 60, none otherwise (60 stays the vanilla reference).  With
- *       auto the set follows the rate when the window moves to a screen
- *       with another refresh rate.
+ *       ticks,timer,particles,trail,audio,rtf,rain,spinners; a '-' prefix
+ *       removes one ("default,-audio").  default = all when the mode's
+ *       content rate is above 60, none at 60 (60 stays the vanilla
+ *       reference), and ticks,particles,rain,spinners at 30 (rtf and audio
+ *       do nothing there; timer and trail stay the game's own at that
+ *       rate).  With auto the set follows the rate when the window moves to
+ *       a screen with another refresh rate.
  *   NFSU2_LAN_TIMING = pc | exact
  *       pc (default): in a network race (World::IsOnline) ticks and timer
  *       are off, so the clocks run as on an unmodified Windows PC at the
@@ -36,7 +45,9 @@
  *                               every frame, menus too) and the exit report
  *   NFSU2_HFR_TRACE = <file>    per-frame CSV while racing (GameFlow 6),
  *                               read by tools/hfr_compare.py
- *   NFSU2_DISPLAY_HZ = <hz>     override the detected refresh rate (tests)
+ *   NFSU2_DISPLAY_HZ = <hz>     override the detected refresh rate (tests);
+ *                               on the web the page's measurement at Play,
+ *                               the rate until the renderer measures it
  *   NFSU2_PRESENT_MINDUR = 0    no presentDrawable:afterMinimumDuration: (A/B)
  *   NFSU2_NO_VSYNC_CLOCK = 1    (metal.m) no CADisplayLink: the slot grid uses
  *                               the nominal period and an arbitrary phase
@@ -46,13 +57,19 @@
  * Fixes (each one independent):
  *   ticks      exact host ticks: 1/3600 s tick base instead of 1/1800, the
  *              tick count primed from the pacer's slot count (F1)
- *   timer      fractional carry for RealTimer/WorldTimer (1/4000 s units)
- *   particles  "Acid" effects step = min(real dt, 1/60) instead of 1/60 (F2)
+ *   timer      RealTimer/WorldTimer (1/4000 s units) without the per-frame
+ *              rounding: RealTimer carries the fraction, WorldTimer follows
+ *              the game's own WorldTimeFrames clock (replays restore it)
+ *   particles  "Acid" effects step = min(real dt, 1/60) instead of 1/60; at
+ *              30 the real dt (F2)
  *   trail      NOS/streak trail sampled every frame, history resampled to
  *              1/60 s spacing (F3)
  *   audio      EAXSound::Update dt carried across its 15 ms gate (F4)
  *   rtf        RealTimeFrames without the forced minimum of 1 (F5)
- *   rain       Rain::Update on every frame, its per-call steps per time (F6)
+ *   rain       Rain::Update on every frame, its per-call steps per time; at
+ *              30 twice a frame (F6)
+ *   spinners   the front end's spinners turn by time, not a step per frame
+ *              (F7)
  */
 #include "cpu.h"
 #include <stdio.h>
@@ -68,8 +85,8 @@ void guest_sleep_frame_ns(int64_t ns);  /* win32_ext.c: sleeps with the GIL rele
 int  metal_display_hz(void);            /* metal.m: window's screen max fps, 0 = unknown */
 
 enum { FX_TICKS = 1, FX_TIMER = 2, FX_PARTICLES = 4, FX_TRAIL = 8, FX_AUDIO = 16, FX_RTF = 32,
-       FX_RAIN = 64, FX_ALL = 127 };
-static const char *const g_fx_name[] = { "ticks", "timer", "particles", "trail", "audio", "rtf", "rain" };
+       FX_RAIN = 64, FX_SPIN = 128, FX_ALL = 255, FX_N = 8 };
+static const char *const g_fx_name[FX_N] = { "ticks", "timer", "particles", "trail", "audio", "rtf", "rain", "spinners" };
 
 #define M_OFF      (-1)
 #define M_UNCAPPED (-2)
@@ -96,6 +113,8 @@ static const char *const g_fx_name[] = { "ticks", "timer", "particles", "trail",
 #define A_WORLDTIMER  0x0086518cu   /* WorldTimer, 1/4000 s */
 #define A_WORLD_S     0x007fb718u   /* WorldTimer in seconds (float) */
 #define A_WTF         0x007fb720u   /* WorldTimeFrames */
+#define A_WTF_REST    0x00865158u   /* WorldTimeFrames remainder (s) */
+#define A_FRAME60     0x007875bcu   /* 1/60 */
 #define A_U4000       0x00784268u   /* 1/4000 */
 #define A_FRAMECNT    0x00870818u   /* eFrameCounter (render) */
 #define A_STREAK_FC   0x008a44ecu   /* UpdateCarStreakingFlares: last frame */
@@ -114,22 +133,31 @@ static const char *const g_fx_name[] = { "ticks", "timer", "particles", "trail",
 /* ---- options ----------------------------------------------------------- */
 static int    g_mode = M_AUTO;      /* M_OFF, M_UNCAPPED, M_AUTO or a fixed rate */
 static int    g_fix = 0;            /* fixes in effect (fixes_follow_rate) */
-static int    g_fix_hi = 0, g_fix_lo = 0;   /* NFSU2_HFR_FIX above 60 fps, at 60 and below */
+static int    g_fix_hi = 0, g_fix_lo = 0, g_fix_30 = 0;   /* NFSU2_HFR_FIX above 60 fps, at 60, at 30 */
 static double g_trail_len = 1.0;
 static int    g_log = 0;
 static FILE  *g_trace = 0;
 static int    g_resolved = 0;
 static int    g_lan_pc = 1;         /* NFSU2_LAN_TIMING: 1 = pc, 0 = exact */
-static double g_rt_carry = 0, g_wt_carry = 0;   /* timer fix: RealTimer / WorldTimer fractions */
+static double g_rt_carry = 0;       /* timer fix: RealTimer's fraction */
 
 /* mach_absolute_time in ns: the clock of CADisplayLink / presentedTime */
 static uint64_t mono_ns(void){ return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
-/* NFSU2_DISPLAY_HZ, or the autotest "displayhz" command (a screen change) */
+/* NFSU2_DISPLAY_HZ, or the autotest "displayhz" command (a screen change).
+ * On the web NFSU2_DISPLAY_HZ is no override: the page sets it to what it
+ * measured at Play, and metal_display_hz (gpu_web.c) gives it until the
+ * renderer has measured the rate from requestAnimationFrame, then that rate as
+ * it changes.  As an override it had auto stay at the rate of the start, on a
+ * 30 Hz phase of Safari's or a move to another screen. */
 static _Atomic int g_hz_forced = -1;
 static int display_hz(void){
     int f = atomic_load(&g_hz_forced);
+#ifdef __wasm__
+    if (f < 0) f = 0;
+#else
     if (f < 0){ const char *e = getenv("NFSU2_DISPLAY_HZ"); f = e && *e ? atoi(e) : 0;
                 int un = -1; atomic_compare_exchange_strong(&g_hz_forced, &un, f); f = atomic_load(&g_hz_forced); }
+#endif
     return f > 0 ? f : metal_display_hz();
 }
 void hfr_set_display_hz(int hz){ atomic_store(&g_hz_forced, hz > 0 ? hz : 0); }
@@ -137,6 +165,7 @@ void hfr_set_display_hz(int hz){ atomic_store(&g_hz_forced, hz > 0 ? hz : 0); }
 static int rate_for_hz(int hz){
     if (hz >= 239) return 240;
     if (hz >= 119) return 120;
+    if (hz > 0 && hz <= 31) return 30;
     return 60;
 }
 static void parse_mode(void){
@@ -146,8 +175,8 @@ static void parse_mode(void){
     else if (!strcasecmp(e, "uncapped") || !strcasecmp(e, "max")) g_mode = M_UNCAPPED;
     else {
         int v = atoi(e);
-        if (v == 60 || v == 120 || v == 240) g_mode = v;
-        else { fprintf(stderr, "[hfr] NFSU2_FPS=%s not supported (60|120|240|auto|uncapped|off): auto\n", e);
+        if (v == 30 || v == 60 || v == 120 || v == 240) g_mode = v;
+        else { fprintf(stderr, "[hfr] NFSU2_FPS=%s not supported (30|60|120|240|auto|uncapped|off): auto\n", e);
                g_mode = M_AUTO; }
     }
 }
@@ -163,7 +192,8 @@ static const char *mode_name(void){
     return g_mode == M_OFF ? "off" : g_mode == M_UNCAPPED ? "uncapped" : g_mode == M_AUTO ? "auto" : "fixed";
 }
 /* the fix set for a mode rate above 60 (or uncapped) when def = FX_ALL,
- * for 60 and below when def = 0 */
+ * for 60 when def = 0, for 30 when def = FX_30 */
+#define FX_30 (FX_TICKS | FX_PARTICLES | FX_RAIN | FX_SPIN)
 static int parse_fix(int def, int warn){
     const char *e = getenv("NFSU2_HFR_FIX");
     if (!e || !*e) return def;
@@ -175,7 +205,7 @@ static int parse_fix(int def, int warn){
         if (!strcasecmp(t, "all")) bit = FX_ALL;
         else if (!strcasecmp(t, "none")) { f = 0; continue; }
         else if (!strcasecmp(t, "default")) bit = def;
-        else for (int i = 0; i < 7; i++) if (!strcasecmp(t, g_fx_name[i])) bit = 1 << i;
+        else for (int i = 0; i < FX_N; i++) if (!strcasecmp(t, g_fx_name[i])) bit = 1 << i;
         if (!bit && strcasecmp(t, "default")){
             if (warn) fprintf(stderr, "[hfr] NFSU2_HFR_FIX: unknown fix '%s'\n", t);
             continue; }
@@ -185,10 +215,11 @@ static int parse_fix(int def, int warn){
 }
 static void fix_str(int f, char *out, size_t n){
     out[0] = 0;
-    for (int i = 0; i < 7; i++) if (f & (1 << i)){
+    for (int i = 0; i < FX_N; i++) if (f & (1 << i)){
         size_t l = strlen(out); snprintf(out + l, n - l, "%s%s", l ? "," : "", g_fx_name[i]); }
     if (!out[0]) snprintf(out, n, "none");
 }
+static int fix_for_rate(int r){ return r > 60 || r == 0 ? g_fix_hi : r <= 30 ? g_fix_30 : g_fix_lo; }
 
 /* Tick base 1/3600 s: 30, 60, 120 and 240 fps are 120, 60, 30 and 15 whole
  * ticks, so every supported rate gets dt = exactly 1/rate and the car
@@ -208,7 +239,8 @@ static void resolve_once(void){
     parse_mode();
     g_fix_hi = g_mode == M_OFF ? 0 : parse_fix(FX_ALL, 1);
     g_fix_lo = g_mode == M_OFF ? 0 : parse_fix(0, 0);
-    { int r = mode_rate(); g_fix = r > 60 || r == 0 ? g_fix_hi : g_fix_lo; }
+    g_fix_30 = g_mode == M_OFF ? 0 : parse_fix(FX_30, 0);
+    g_fix = fix_for_rate(mode_rate());
     { const char *e = getenv("NFSU2_NOS_TRAIL_LEN"); if (e && *e) g_trail_len = atof(e);
       if (!(g_trail_len > 0.05 && g_trail_len < 20.0)) g_trail_len = 1.0; }
     { const char *e = getenv("NFSU2_HFR_LOG"); g_log = e && *e ? atoi(e) : 0; }
@@ -259,6 +291,14 @@ static int content_rate(void){
         if (req >= 10 && req < m) m = req;
     }
     return m;
+}
+/* fps = 30, or auto on a 30 Hz display, outside the game's own 30 fps
+ * requests (a cutscene runs at 30 in every mode and keeps the effects it has
+ * there at 60): a frame is two of 60, so effects stepped once a frame step
+ * for both (F2, F6) */
+static int at_30(void){
+    float cap = MRF32(A_CAP);
+    return mode_rate() == 30 && !(cap > 0.f && cap != MRF32(A_CAP_DEF));
 }
 /* frame-rate counter (fpscounter.m): the mode's name, its own rate (0 =
  * uncapped) and the content rate of the last frame (the game's 30 fps
@@ -399,6 +439,23 @@ int hfr_display_live(void){
     return tv && (int64_t)(mono_ns() - tv) < 250000000ll;
 }
 
+/* ---- input age -----------------------------------------------------------
+ * When the game last read each input device (dinput_kbd.c: the keyboard, at
+ * the start of a frame's update, after FrameTimeUpdate; dinput_pad.c: the
+ * pads, in 0x5d2850 after the previous frame's Present).  A frame simulates
+ * with the older of the two reads it was given; gpu_web.c hands that time to
+ * the page with the frame (GwLat), which logs how old the input is when the
+ * frame is submitted, done on the GPU and next shown.  A device not read in
+ * the last 100 ms (no pad) does not count. */
+static uint64_t g_in_read[2];
+void hfr_note_input_read(int pad){ g_in_read[!!pad] = mono_ns(); }
+double hfr_frame_input_ms(void){
+    uint64_t now = mono_ns(), t = 0;
+    for (int i = 0; i < 2; i++)
+        if (g_in_read[i] && now - g_in_read[i] < 100000000ull && (!t || g_in_read[i] < t)) t = g_in_read[i];
+    return t / 1e6;
+}
+
 /* ---- the pacer ----------------------------------------------------------
  * Slots of the content period (MW kit SlotPacer semantics): a frame that is
  * early sleeps to the start of the slot after its predecessor's and takes
@@ -417,20 +474,62 @@ static int64_t snap(int64_t t, int64_t origin, int64_t g){   /* nearest grid poi
     int64_t m = d >= 0 ? (d + g / 2) / g : -((-d + g / 2) / g);
     return origin + m * g;
 }
-static int pace(int rate, uint64_t *slept, uint64_t *missed){
-    int64_t now = (int64_t)mono_ns();
-    *slept = 0; *missed = 0;
+/* the slot grid for a content rate: period P, grid step g, origin; 1 when locked to the vsync clock */
+static int grid(int rate, int64_t *P, int64_t *g, int64_t *origin){
     double nominal = 1e9 / rate;
-    int64_t P = (int64_t)llround(nominal), g = P, origin = 0;
+    *P = (int64_t)llround(nominal); *g = *P; *origin = 0;
     uint64_t pv = atomic_load(&g_vs_period), tv = atomic_load(&g_vs_ts);
-    g_lock_n++;
     if (pv && tv){
         double k = floor(nominal / (double)pv + 0.5);
         if (k >= 1 && fabs(k * (double)pv - nominal) < 0.01 * nominal){
-            P = (int64_t)llround(k * (double)pv); g = (int64_t)pv; origin = (int64_t)tv + g / 2;
-            g_lock_ok++;
+            *P = (int64_t)llround(k * (double)pv); *g = (int64_t)pv; *origin = (int64_t)tv + *g / 2;
+            return 1;
         }
     }
+    return 0;
+}
+/* ---- the wait after Present ----------------------------------------------
+ * The game reads the pads right after Present, in the same call (0x5d2850:
+ * Present, then 0x5cfa10 polls them), and the next frame steers with what it
+ * read; the keyboard it reads at the start of that frame's update, after
+ * FrameTimeUpdate.  On Windows the wait for the display was inside Present,
+ * before the pads' read.  Here the pacer waited in FrameTimeUpdate, after
+ * it: a pad's input (the touch controls' too) was as old as that wait, up to
+ * a whole period older than a key's (13 ms at 60 fps, 29 ms at 30).  So a
+ * main-loop Present waits for the next slot itself, and FrameTimeUpdate
+ * finds the slot begun.  NFSU2_PACE_AT=frame: the wait in FrameTimeUpdate,
+ * as before (A/B). */
+static int     g_pace_rate = 0;     /* the rate FrameTimeUpdate paced the frame at (0: not paced) */
+static int64_t g_pre_target = 0;    /* the slot the wait after Present waited for */
+static uint64_t g_pre_slept = 0;    /* and how long it slept, ns */
+static int pace_at_present(void){
+    static int on = -1;
+    if (on < 0){ const char *e = getenv("NFSU2_PACE_AT"); on = !(e && !strcasecmp(e, "frame")); }
+    return on;
+}
+void hfr_after_present(void){
+    int rate = g_pace_rate;
+    g_pace_rate = 0;                 /* once a frame: a loading screen's Presents never wait */
+    if (rate <= 0 || !pace_at_present() || !g_last_slot) return;
+    int64_t P, g, origin;
+    grid(rate, &P, &g, &origin);
+    int64_t now = (int64_t)mono_ns();
+    if (now - g_last_slot > 4 * 1000000000ll) return;
+    int64_t target = snap(g_last_slot + P, origin, g);
+    if (target <= g_last_slot) target += g;
+    if (now >= target) return;
+    guest_sleep_frame_ns(target - now);
+    g_pre_target = target; g_pre_slept = (uint64_t)(target - now);
+}
+
+static int pace(int rate, uint64_t *slept, uint64_t *missed){
+    int64_t now = (int64_t)mono_ns();
+    *slept = 0; *missed = 0;
+    int64_t P, g, origin;
+    g_lock_n++;
+    if (grid(rate, &P, &g, &origin)) g_lock_ok++;
+    int64_t pre = g_pre_target;
+    g_pre_target = 0; g_pre_slept = 0;
     if (!g_last_slot || now - g_last_slot > 4 * 1000000000ll){     /* first frame, or after a load */
         int64_t s0 = snap(now, origin, g); if (s0 > now) s0 -= g;
         g_last_slot = s0;
@@ -438,9 +537,9 @@ static int pace(int rate, uint64_t *slept, uint64_t *missed){
     }
     int64_t target = snap(g_last_slot + P, origin, g);
     if (target <= g_last_slot) target += g;
-    if (now < target){
-        guest_sleep_frame_ns((int64_t)(target - now));
-        *slept = (uint64_t)(target - now);
+    if (now < target || (pre == target && now - target < P)){
+        /* early: sleep to the slot (or the wait after Present did) and take it */
+        if (now < target){ guest_sleep_frame_ns((int64_t)(target - now)); *slept = (uint64_t)(target - now); }
         int n = (int)((double)(target - g_last_slot) / (double)P + 0.5);
         g_last_slot = target;
         return n < 1 ? 1 : n;
@@ -637,7 +736,7 @@ void sub_005ff490(CPU *c){
  * sound and trails. */
 static void fixes_follow_rate(void){
     static int first = 1, net_prev = 0;
-    int r = mode_rate(), fx = r > 60 || r == 0 ? g_fix_hi : g_fix_lo;
+    int r = mode_rate(), fx = fix_for_rate(r);
     int net = g_lan_pc && net_race();
     if (net) fx &= ~(FX_TICKS | FX_TIMER);
     if (!first && net != net_prev){
@@ -652,9 +751,10 @@ static void fixes_follow_rate(void){
     net_prev = net;
     if (!first && fx == g_fix) return;
     if (first || ((fx ^ g_fix) & FX_TICKS)){ set_tick_base(fx & FX_TICKS); g_tick_acc = 0; }
-    if ((fx ^ g_fix) & FX_TIMER){ g_rt_carry = 0; g_wt_carry = 0; }
+    if ((fx ^ g_fix) & FX_TIMER) g_rt_carry = 0;
     g_fix = fx; first = 0;
 }
+static void fe_spinners(void);          /* F7 */
 void sub_0057ead0(CPU *c){
     resolve();
     if (g_mode == M_OFF){
@@ -671,7 +771,8 @@ void sub_0057ead0(CPU *c){
     }
     fixes_follow_rate();
     uint64_t t_in = mono_ns();
-    if (g_f.t) g_f.work = t_in - g_f.t;
+    uint64_t pre_slept = g_pre_slept;          /* the wait after Present: sleep, not work */
+    if (g_f.t) g_f.work = t_in - g_f.t - pre_slept;
 
     int rate = g_mode == M_UNCAPPED ? 0 : content_rate();
     atomic_store(&g_rate_now, rate);
@@ -688,6 +789,8 @@ void sub_0057ead0(CPU *c){
                      e = getenv("NFSU2_HFR_LOCKSTEP_WALL"); lsw = e ? atoi(e) : 0;
                      if (ls) fprintf(stderr, "[hfr] LOCKSTEP test pacing (wall %d fps)\n", lsw > 0 ? lsw : rate); }
         slots = pace(ls && lsw > 0 ? lsw : rate, &slept, &missed);
+        slept += pre_slept;
+        g_pace_rate = ls && lsw > 0 ? lsw : rate;
         if (ls){ slots = 1; missed = 0; }
         frame_s = (double)slots / rate;
     } else frame_s = g_f.t ? (t_in - g_f.t) / 1e9 : 1.0 / 120;
@@ -696,7 +799,7 @@ void sub_0057ead0(CPU *c){
     frame_close(now, slept, missed);
     frame_open(now, slots);
 
-    if (MR32(A_PLAYBACK)){ sub_0057ead0_orig(c); return; }
+    if (MR32(A_PLAYBACK)){ sub_0057ead0_orig(c); fe_spinners(); return; }
     float cap = MRF32(A_CAP);
     if (g_fix & FX_TICKS){
         g_tick_acc += frame_s * TICK_HZ;
@@ -716,6 +819,7 @@ void sub_0057ead0(CPU *c){
         sub_0057ead0_orig(c);
     }
     MRF32(A_CAP) = cap;
+    fe_spinners();
 }
 
 /* ---- F5 + timer: RealTimer advance 0x57A050 ------------------------------
@@ -744,18 +848,30 @@ void sub_0057a050(CPU *c){
     }
 }
 
-/* ---- timer: WorldTimer advance 0x57A0E0 (skipped while world dt == 0) -- */
+/* ---- timer: WorldTimer advance 0x57A0E0 (skipped while world dt == 0) --
+ * WorldTimer += round(dt x 4000) has no carry either: 15/3600 s -> 17 units
+ * (+2 %).  The same function keeps an exact world clock of its own:
+ * WorldTimeFrames ([0x7FB720], 60ths) and their remainder ([0x865158], s),
+ * n = trunc(60 (dt + remainder)).  The timer fix moves WorldTimer by that
+ * clock's change, rounded: no fraction of ours to carry.  A replay needs it
+ * so: it restores the race from a snapshot (the "WorldTime" block, 0x57BBA0,
+ * holds WorldTimer, WorldTimeFrames and the remainder, not a carry of ours),
+ * drives it again and checks every frame a checksum that includes WorldTimer
+ * (0x5FA770); with a carry of ours the timer ticked 17 16 17 where the race
+ * had ticked 16 17 17, and the game left the replay after a few frames. */
+static double world_clock(void){
+    return (double)(int32_t)MR32(A_WTF) * (double)MRF32(A_FRAME60) + (double)MRF32(A_WTF_REST);
+}
 void sub_0057a0e0_orig(CPU *c);
 void sub_0057a0e0(CPU *c){
     float wdt = MRF32(A_WORLDDT);
     uint32_t w0 = MR32(A_WORLDTIMER);
+    double x0 = world_clock();
     sub_0057a0e0_orig(c);
     if (wdt == 0.f) return;
     g_f.wdt += wdt; g_sim_ms += wdt * 1e3;
     if (g_fix & FX_TIMER){
-        double ex = (double)wdt * 4000.0 + g_wt_carry;
-        double u = floor(ex + 0.5);
-        g_wt_carry = ex - u;
+        double u = floor(world_clock() * 4000.0 + 0.5) - floor(x0 * 4000.0 + 0.5);
         MR32(A_WORLDTIMER) = w0 + (uint32_t)(int32_t)u;
         MRF32(A_WORLD_S) = (float)((double)(int32_t)MR32(A_WORLDTIMER) * (double)MRF32(A_U4000));
     }
@@ -766,14 +882,17 @@ void sub_0057a0e0(CPU *c){
  * constant 1/60 for the system at 0x835860 (0x5D2C0D) once per rendered
  * frame: smoke, sparks and flames age 2x at 120.  The step becomes the real
  * frame dt, but never more than the 1/60 of the original: at or below 60
- * fps (and in 30 fps NIS) the argument is untouched, bit for bit. */
+ * fps (and in 30 fps NIS) the argument is untouched, bit for bit.  At fps
+ * = 30 they would age at half speed: there the step is the real dt up to
+ * 1/30 (the emitters' countdowns take it as time too). */
 void sub_00492e10_orig(CPU *c);
 void sub_00492e10(CPU *c){
     if (MR32(c->esp) == 0x005d2c1cu && c->ecx == 0x00835860u){
         float k = MRF32(c->esp + 4u);
         if (g_fix & FX_PARTICLES){
-            float dt = MRF32(A_REALDT);
+            float dt = MRF32(A_REALDT), hi = at_30() ? 2.f * k : k;
             if (dt < k) MRF32(c->esp + 4u) = dt > 0.f ? dt : 0.f;
+            else MRF32(c->esp + 4u) = dt < hi ? dt : hi;
         }
         g_f.part += MRF32(c->esp + 4u);
     }
@@ -924,7 +1043,12 @@ void sub_00483b40(CPU *c){
  *   [0x7A67C0]/[0x7A67C4], read only here): 1 - (1 - f)^s.
  * A streak's direction comes from the last step, which the scaling keeps.
  * All of it is put back after the call (a drop value only if the call did
- * not write it again). */
+ * not write it again).
+ * At fps = 30 (s = 2) the rain would fall at half speed, and the camera's
+ * share cannot be scaled up past the game's cap: the update runs twice
+ * instead, each call a 60 fps frame with half the world dt (its own copy at
+ * 0x61F134 is the gate's and steps a timer at [0x8A1D50] and the easing of
+ * Rain+0x1F0). */
 void sub_0061f120_orig(CPU *c);
 #define A_RAIN_GATE   0x007a8734u   /* 0.009 s */
 #define A_RAIN_EASE   0x007a67c0u   /* cloud easing a call: towards clear, +4 towards overcast */
@@ -938,6 +1062,16 @@ void hfr_rain_update(CPU *c){
     double s = 60.0 * MRF32(A_WORLDDT);
     uint32_t view = rain && mem_is_committed(rain + RAIN_FALL + 0x9fu) ? MR32(rain + 0x1ecu) : 0;
     uint32_t cam = view && mem_is_committed(view + 0x43u) ? MR32(view + 0x40u) : 0;
+    if ((g_fix & FX_RAIN) && s > 1.5 && at_30()){
+        float wdt = MRF32(A_WORLDDT);
+        uint32_t ret = MR32(c->esp);                         /* popped by the call: pushed again for the second */
+        MRF32(A_WORLDDT) = wdt * 0.5f;
+        sub_0061f120_orig(c);
+        c->esp -= 4u; MR32(c->esp) = ret; c->ecx = rain;
+        sub_0061f120_orig(c);
+        MRF32(A_WORLDDT) = wdt;
+        return;
+    }
     if (!(g_fix & FX_RAIN) || !(s > 0.0 && s < 1.0) || !cam || !mem_is_committed(cam + 0x1ebu)){
         sub_0061f120_orig(c); return; }
     float gate = MRF32(A_RAIN_GATE), up = MRF32(A_RAIN_EASE), down = MRF32(A_RAIN_EASE + 4u);
@@ -963,6 +1097,23 @@ void hfr_rain_update(CPU *c){
     MRF32(rain + RAIN_STRETCH) = st < 0.f ? stretch : (float)fmin(st / s, 1.0);
     MRF32(A_RAIN_GATE) = gate; MRF32(A_RAIN_EASE) = up; MRF32(A_RAIN_EASE + 4u) = down;
     MRF32(A_RAIN_SLIDE) = slide;
+}
+
+/* ---- F7: the front end's spinners, 0x630DE0 ------------------------------
+ * The front end's car renderer (garage, shops, car lot: GameFlow not 6)
+ * turns its spinners by a constant 0.5 degree a call ([0x7A667C], read only
+ * there; the angle [0x8A44F8]), unless the front end is paused (0x510C30).
+ * It runs twice a rendered frame: 60 degrees a second at 60 fps, twice that
+ * at 120, four times at 240 (a player's report at 240: "way too fast").
+ * The world's spinners turn by time (0x5ECAC0).  After each FrameTimeUpdate
+ * the step becomes 0.5 x 60 x the frame's real dt: 60 degrees a second at
+ * every rate, the game's own 0.5 at 60 (tests/scripts/fe_spinners.txt). */
+#define A_FE_SPIN     0x007a667cu   /* 0.5: degrees a front-end spinner turns a frame */
+static void fe_spinners(void){
+    static float van = -1.f;
+    if (van < 0.f) van = MRF32(A_FE_SPIN);
+    float dt = MRF32(A_REALDT);
+    MRF32(A_FE_SPIN) = (g_fix & FX_SPIN) && dt > 0.f ? (float)(van * 60.0 * dt) : van;
 }
 
 /* ---- exit report -------------------------------------------------------- */

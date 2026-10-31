@@ -7,8 +7,9 @@
 //! deleting, the buddy login, and the limits.
 
 use super::world::{C, Opts, World, ip};
-use crate::aries::{Fields, V, encode_fields};
+use crate::aries::{Fields, V, encode_fields, encode_frame};
 use crate::lobby::Limits;
+use crate::stats::{Race, RacePlayer};
 use crate::vhost::{DATA, lan_frame};
 use crate::{PORT_BUDDY, PORT_HTTP, PORT_LOBBY, PORT_REDIRECTOR, VHOST_VIP};
 
@@ -131,6 +132,74 @@ fn rooms_and_chat() {
     w.send(a, "mesg", fields![("TEXT", "x".repeat(1000))]);
     w.send(b, "move", fields![("NAME", "")]);
     assert_eq!(w.c(a).l("+usr").g("T"), "1", "Bravo left the room");
+}
+
+// a line that reads as a slur reaches only its sender (three mute it), a blocked persona is not heard, and a
+// complaint logs what the player said where the complainer could hear it
+#[test]
+fn slurs_blocks_and_complaints() {
+    // a minute, not ten: a session says nothing for two at most
+    let limits = Limits { slur_window_ms: 60_000.0, slur_mute_ms: 60_000.0, said_ms: 60_000.0, ..Limits::default() };
+    let mut w = World::new(Opts { limits, ..Opts::default() });
+    let (a, _) = messenger(&mut w, "10.77.0.2", "Alpha");
+    let (b, bm) = messenger(&mut w, "10.77.0.3", "Bravo");
+    let (c, _) = messenger(&mut w, "10.77.0.4", "Charlie");
+    for x in [a, b, c] {
+        w.send(x, "move", fields![("NAME", "Lounge")]);
+    }
+    let heard = |w: &World, x: C, t: &str| w.c(x).msgs.iter().any(|m| m.kind == "+msg" && m.get("T") == Some(t));
+    // the sender sees its line as said; the room does not
+    w.send(a, "mesg", fields![("TEXT", "nate higgers")]);
+    assert!(heard(&w, a, "nate higgers") && !heard(&w, b, "nate higgers") && !heard(&w, c, "nate higgers"));
+    assert!(w.logged("\"Alpha\": a line with \"nate higgers\" in it, shown to no one else"));
+    // swearing goes through
+    w.advance(2000.0);
+    w.send(a, "mesg", fields![("TEXT", "merci kurwa")]);
+    assert!(heard(&w, b, "merci kurwa") && heard(&w, c, "merci kurwa"));
+    // private lines: one to Charlie, one to Bravo
+    w.advance(2000.0);
+    w.send(a, "mesg", fields![("TEXT", "psst charlie"), ("PRIV", "Charlie")]);
+    w.send(a, "mesg", fields![("TEXT", "psst bravo"), ("PRIV", "bravo")]);
+    assert!(heard(&w, c, "psst charlie") && heard(&w, b, "psst bravo"));
+    // the third line that reads as a slur in the window mutes the sender
+    w.advance(2000.0);
+    w.send(a, "mesg", fields![("TEXT", "n i g g e r")]);
+    assert!(!w.logged("muted for 60 s"));
+    w.advance(2000.0);
+    w.send(a, "mesg", fields![("TEXT", "SIEG HEIL")]);
+    assert!(w.logged("\"Alpha\": a line with \"SIEG HEIL\" in it, shown to no one else; muted for 60 s"));
+    w.advance(2000.0);
+    w.send(a, "mesg", fields![("TEXT", "hello?")]);
+    assert_eq!(w.c(a).l("mesg").code, "mute");
+    assert!(!heard(&w, b, "hello?"));
+    // Bravo blocks Charlie (EA Messenger): Charlie's lines reach Alpha, not Bravo
+    w.send(bm, "RADD", fields![("USER", "Charlie"), ("LIST", "I"), ("ID", 9)]);
+    w.send(c, "mesg", fields![("TEXT", "hi all")]);
+    assert!(heard(&w, a, "hi all") && !heard(&w, b, "hi all") && heard(&w, c, "hi all"));
+    w.advance(2000.0);
+    w.send(c, "mesg", fields![("TEXT", "hi bravo"), ("PRIV", "Bravo")]);
+    assert!(!heard(&w, b, "hi bravo"));
+    // ... until Bravo takes the block back
+    w.send(bm, "RDEL", fields![("USER", "Charlie"), ("LIST", "I"), ("ID", 10)]);
+    w.advance(2000.0);
+    w.send(c, "mesg", fields![("TEXT", "hi again")]);
+    assert!(heard(&w, b, "hi again") && !w.core.buddies.blocked("charlie"));
+    // Bravo's complaint about Alpha: its address, its last five lines but the private one to Charlie
+    w.send(b, "rept", fields![("PERS", "Alpha"), ("LANG", "EN"), ("TYPE", "0")]);
+    assert_eq!(w.c(b).l("rept").g("TEXT"), "Report complete");
+    let line = w.text().into_iter().find(|l| l.contains("a complaint about")).expect("the complaint's line");
+    assert_eq!(
+        line,
+        "[online] 10.77.0.3 \"Bravo\": a complaint about 10.77.0.2 \"Alpha\", who said: \"merci kurwa\" \"psst bravo\" \
+         \"n i g g e r\" (shown to no one) \"SIEG HEIL\" (shown to no one)"
+    );
+    // a minute on, nothing is kept, and Alpha may speak again
+    w.advance(61_000.0);
+    assert!(!w.core.lobby.said.contains_key("alpha"));
+    w.send(c, "rept", fields![("PERS", "Alpha")]);
+    assert!(w.logged("\"Charlie\": a complaint about 10.77.0.2 \"Alpha\" (no lines of its kept)"));
+    w.send(a, "mesg", fields![("TEXT", "sorry")]);
+    assert!(heard(&w, b, "sorry"));
 }
 
 // a game: create, list, join, ready, start; +ses names every player by virtual address
@@ -292,7 +361,8 @@ fn game_passwords_open() {
     }
 }
 
-// the game list: every open game but a private one, the Filter's games first
+// the game list: every open game but a private one, the Filter's games first; once the player set the Filter
+// (code "filt"), only those, unless it asks for its defaults
 #[test]
 fn the_game_list() {
     let mut w = world();
@@ -328,9 +398,55 @@ fn the_game_list() {
     s.extend(search().into_iter().skip(2));
     w.send(e, "gsea", s);
     assert_eq!(names(&mut w, "+gam"), ["no collision"]);
+    // ranked sprints: unset (the settings of a game made or joined) the others come after; set, only those; set to
+    // the defaults, all of them again
+    let sprint = || {
+        fields![("START", 0), ("COUNT", 20), ("CUSTFLAGS", 0x80000f3), ("CUSTMASK", 0x80001f3), ("SYSFLAGS", 1 << 18), ("SYSMASK", 0xc0000)]
+    };
+    w.send(e, "gsea", sprint());
+    assert_eq!(names(&mut w, "+gam"), ["ranked sprint", "no collision", "as asked"]);
+    w.send_raw(e, &encode_frame("gsea", "filt", &sprint()).unwrap());
+    assert_eq!(w.c(e).l("gsea").g("COUNT"), "1");
+    assert_eq!(names(&mut w, "+gam"), ["ranked sprint"]);
+    w.send_raw(e, &encode_frame("gsea", "filt", &search()).unwrap());
+    assert_eq!(names(&mut w, "+gam"), ["as asked", "no collision", "ranked sprint"]);
     // a private game's players come by invitation: by its name
     w.send(e, "gjoi", fields![("NAME", "private")]);
     assert_eq!(w.c(e).l("gjoi").code, "");
+}
+
+// the game list in one search: the config sets the game's page (GAMES_PER_UPDATE), its search asks for that many, and
+// gets every open game, oldest first; past the page, the next one
+#[test]
+fn the_game_list_in_one_search() {
+    let mut w = world();
+    let hosts: Vec<C> = (0..210)
+        .map(|i| {
+            let g = w.client(&format!("10.77.{}.{}", 1 + i / 200, 2 + i % 200));
+            w.login(g, &format!("Host{i}"))
+        })
+        .collect();
+    let g = w.client("10.77.0.2");
+    let e = w.login(g, "Looker");
+    assert_eq!(w.c(e).l("news").g("GAMES_PER_UPDATE"), "200");
+    for (i, &h) in hosts.iter().enumerate() {
+        w.send(h, "gcre", fields![("NAME", format!("{i}00.Host{i}")), ("CUSTFLAGS", 0x40000f3), ("PARAMS", "TRACK=4011")]);
+    }
+    let names = |w: &mut World| -> Vec<String> {
+        w.cm(e).take().iter().filter(|m| m.kind == "+gam").map(|m| m.g("NAME").to_string()).collect()
+    };
+    let search = |s: i32, n: i32| {
+        fields![("START", s), ("COUNT", n), ("CUSTFLAGS", 0x40000f3), ("CUSTMASK", 0x40001f3), ("SYSFLAGS", 0), ("SYSMASK", 0xc0000)]
+    };
+    let made = |r: std::ops::Range<usize>| -> Vec<String> { r.map(|i| format!("{i}00.Host{i}")).collect() };
+    w.cm(e).take();
+    w.send(e, "gsea", search(0, 200));
+    assert_eq!(w.c(e).l("gsea").g("COUNT"), "200");
+    assert_eq!(names(&mut w), made(0..200), "a page of 200, oldest first");
+    w.send(e, "gsea", search(200, 200));
+    assert_eq!(names(&mut w), made(200..210));
+    w.send(e, "gsea", search(0, 1000));
+    assert_eq!(w.c(e).l("gsea").g("COUNT"), "200", "never more than a page");
 }
 
 // six players: a game asked for 8 takes 6, the seventh finds it full; +ses names all six
@@ -528,6 +644,7 @@ fn results() {
     report(&mut w, b2, &auth);
     assert!(w.logged("not taken: a time the race has not had"));
     assert_eq!(w.core.stats.board(0, false).len(), 0);
+    assert!(w.core.stats.rec("Bravo", false).is_none(), "no records from a report not taken");
     // after the race: Bravo's report alone decides nothing (a report not taken was not his one report); Alpha's,
     // from another browser with the same places, makes the result
     w.advance(200_000.0);
@@ -555,6 +672,11 @@ fn results() {
     assert!(w.c(a2).msgs.iter().any(|m| m.kind == "user" && m.get("PERS") == Some("Alpha")));
     w.send(a2, "user", fields![("PERS", "Alpha")]);
     assert_eq!(stat_of(w.c(a2).l("user"))[8..13], [0, 0, 0, 0, 1]);
+    // the records (Top Speed Achieved in mm/s): each player's from its own entry in its own report (both sent the
+    // same one: Bravo is index 1, 42.126 m/s; Alpha index 0, 42.212 m/s)
+    assert_eq!(stat_of(w.c(a2).l("user"))[3..8], [42212, 0, 0, 0, 0]);
+    w.send(a2, "user", fields![("PERS", "Bravo")]);
+    assert_eq!(stat_of(w.c(a2).l("user"))[3..8], [42126, 0, 0, 0, 0]);
     // the rankings: the circuit board, and one's own row
     w.send(a2, "snap", fields![("INDEX", 4), ("CHAN", 6), ("START", 0), ("RANGE", 100)]);
     assert_eq!(w.c(a2).l("snap").g("COUNT"), "2");
@@ -566,6 +688,45 @@ fn results() {
     assert_eq!(w.c(a2).l("+snp").g("N"), "Alpha");
     w.send(a2, "snap", fields![("INDEX", 4), ("CHAN", 7), ("START", 0), ("RANGE", 100)]);
     assert_eq!(w.c(a2).l("snap").g("COUNT"), "0", "no sprint races yet");
+    // points in P are decimal, in S hex: 28 ranked wins, 2800 points (hex af0: the game read P "af0" as 0)
+    for _ in 0..28 {
+        let players = ["Alpha", "Bravo"].iter().enumerate().map(|(i, n)| RacePlayer { name: n.to_string(), place: i as u32 + 1, time: 60.0 });
+        w.core.stats.add_race(&Race { kind: 4, ranked: true, track: 4011, players: players.collect() });
+    }
+    w.send(a2, "snap", fields![("INDEX", 4), ("CHAN", 16), ("RANGE", 1), ("FIND", "$")]);
+    let row = w.c(a2).l("+snp");
+    assert_eq!([row.g("N"), row.g("R"), row.g("P"), row.g("S")], ["Alpha", "1", "2800", "af0,1c,0"]);
+}
+
+// the rankings: the screens' channels go in their own order, Drift before Drag (SPEED2.EXE 0x58ce30, 0x5826e0): the
+// overall boards 6..11, one's own row 12..17, the month's leaders 18..23; last month's (24..29) are empty
+#[test]
+fn rankings_channels() {
+    let mut w = world();
+    let g = w.client("10.77.0.2");
+    let a = w.login(g, "Alpha");
+    let add = |w: &mut World, kind: u32, names: [&str; 2]| {
+        let players = names.iter().enumerate().map(|(i, n)| RacePlayer { name: n.to_string(), place: i as u32 + 1, time: 60.0 });
+        w.core.stats.add_race(&Race { kind, ranked: true, track: 4011, players: players.collect() });
+    };
+    add(&mut w, 3, ["Alpha", "Drifter"]);
+    add(&mut w, 2, ["Dragger", "Other"]);
+    let rows = |w: &mut World, chan: i32, own: bool| -> Vec<String> {
+        let from = w.c(a).msgs.len();
+        let mut f = fields![("INDEX", 21), ("CHAN", chan), ("START", 0), ("RANGE", if own { 1 } else { 100 })];
+        if own {
+            f.extend(fields![("FIND", "$")]);
+        }
+        w.send(a, "snap", f);
+        w.c(a).msgs[from..].iter().filter(|m| m.kind == "+snp").map(|m| format!("{} {}", m.g("N"), m.g("P"))).collect()
+    };
+    assert_eq!(rows(&mut w, 8, false), ["Alpha 100", "Drifter 0"], "Drift: the drift board");
+    assert_eq!(rows(&mut w, 9, false), ["Dragger 100", "Other 0"], "Drag: the drag board");
+    assert_eq!(rows(&mut w, 14, true), ["Alpha 100"], "one's own Drift row");
+    assert!(rows(&mut w, 15, true).is_empty(), "no drag race of one's own");
+    assert_eq!(rows(&mut w, 20, false), ["Alpha 100", "Drifter 0"], "the month's drift leaders");
+    assert!(rows(&mut w, 26, false).is_empty(), "last month's leaders: none kept");
+    assert_eq!(w.c(a).l("snap").g("TOTAL"), "0");
 }
 
 // names: a name another browser holds comes with four digits (the same for one client); its own browser takes it
@@ -737,10 +898,10 @@ fn ea_messenger() {
     assert_eq!(w.c(b).l("GINV").g("USER"), "Alpha");
     assert_eq!(w.c(b).l("GINV").g("HOST"), "Alpha");
     assert_eq!(w.c(b).l("GINV").get("LKEY"), None);
-    // a friend request from Bravo, accepted by Alpha: both lists
+    // a friend request from Bravo (to Alpha: one that waits for Alpha's answer), accepted by Alpha: both lists
     w.send(b, "RADM", fields![("LRSC", "PC"), ("USER", "Alpha"), ("ID", 102), ("PRES", "Y")]);
     assert_eq!(w.c(a).l("RNOT").g("USER"), "Bravo");
-    assert_eq!(w.c(a).l("RNOT").g("ATTR"), 0x80000.to_string());
+    assert_eq!(w.c(a).l("RNOT").g("ATTR"), "R");
     w.send(a, "RRSP", fields![("LRSC", "PC"), ("USER", "Bravo"), ("ANSW", "Y"), ("ID", 7)]);
     assert_eq!(w.c(b).l("RNOT").g("USER"), "Alpha");
     assert_eq!(w.c(b).l("RNOT").g("CHNG"), "A");
@@ -779,6 +940,120 @@ fn ea_messenger() {
     assert_eq!(w.c(x).l("AUTH").code, "pass");
     w.send(x, "RGET", fields![("LIST", "B")]);
     assert_eq!(w.c(x).l("RGET").code, "auth");
+}
+
+/// a player in Online mode with EA Messenger logged in: (lobby session, Messenger)
+fn messenger(w: &mut World, vip: &str, name: &str) -> (C, C) {
+    let g = w.client(vip);
+    let l = w.login(g, name);
+    let k = w.lkey(l);
+    (l, w.buddy(g, &k))
+}
+
+/// the friends list as the game's login asks for it: (name, ATTR) of each ROST
+fn roster(w: &mut World, b: C) -> Vec<(String, String)> {
+    let n = w.c(b).msgs.len();
+    w.send(b, "RGET", fields![("LRSC", "PC"), ("LIST", "B"), ("PRES", "Y"), ("PEND", "Y"), ("ID", 1)]);
+    let rost = w.c(b).msgs[n..].iter().filter(|m| m.kind == "ROST");
+    rost.map(|m| (m.g("USER").to_string(), m.get("ATTR").unwrap_or("").to_string())).collect()
+}
+
+fn told(w: &World, c: C, user: &str, chng: &str) -> usize {
+    w.c(c).msgs.iter().filter(|m| m.kind == "RNOT" && m.get("USER") == Some(user) && m.get("CHNG") == Some(chng)).count()
+}
+
+// EA Messenger for players who are away: friend requests wait for their answer, over a restart too, and so do
+// friends' messages; requests declined, blocked and taken back, a friend taken off; what waits too long goes
+#[test]
+fn ea_messenger_away() {
+    let pair = |a: &str, b: &str| vec![(a.to_string(), b.to_string())];
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("online");
+    let mut w = World::new(Opts { state_dir: Some(dir.clone()), ..Default::default() });
+    let (_, a) = messenger(&mut w, "10.77.0.2", "Alpha");
+    // a request to a player who was never here waits; the asker's list shows it as its own
+    w.send(a, "RADM", fields![("LRSC", "PC"), ("USER", "Bravo"), ("ID", 5), ("PRES", "Y")]);
+    assert_eq!(w.c(a).l("RADM").code, "");
+    assert_eq!(roster(&mut w, a), pair("Bravo", "S"));
+    // Bravo comes: on its list, a request that waits for its answer, with the asker's presence
+    let (_, b) = messenger(&mut w, "10.77.0.3", "Bravo");
+    assert_eq!(roster(&mut w, b), pair("Alpha", "R"));
+    assert_eq!([w.c(b).l("PGET").g("USER"), w.c(b).l("PGET").g("SHOW")], ["Alpha", "CHAT"]);
+    // Alpha leaves, then Bravo accepts: friends on both lists
+    w.send(a, "DISC", vec![]);
+    w.send(b, "RRSP", fields![("LRSC", "PC"), ("USER", "Alpha"), ("ANSW", "Y"), ("ID", 6), ("PRES", "Y")]);
+    assert_eq!([w.c(b).l("RNOT").g("USER"), w.c(b).l("RNOT").g("ATTR")], ["Alpha", "0"]);
+    assert!(w.core.buddies.list("Alpha").unwrap().b.contains_key("bravo"));
+    // a message to Alpha, away: it waits, as Alpha has Bravo as a friend; a stranger's does not
+    let sent = w.t.get();
+    w.send(b, "SEND", fields![("USER", "Alpha"), ("BODY", "race me"), ("SUBJ", ""), ("TYPE", "C")]);
+    assert_eq!(w.c(b).l("SEND").code, "");
+    let (_, c) = messenger(&mut w, "10.77.0.4", "Charlie");
+    w.send(c, "SEND", fields![("USER", "Alpha"), ("BODY", "spam")]);
+    assert_eq!(w.core.buddies.list("Alpha").unwrap().m.len(), 1);
+    // over a restart: Alpha's list has Bravo as a friend, then, a moment later (the game files it under the friend's
+    // entry only then), the message comes, once
+    w.core.stop();
+    let mut w = World::new(Opts { state_dir: Some(dir.clone()), ..Default::default() });
+    let (_, a) = messenger(&mut w, "10.77.0.2", "Alpha");
+    assert_eq!(roster(&mut w, a), pair("Bravo", ""));
+    assert_eq!(w.c(a).count("RECV"), 0, "not with the list");
+    w.sleep(3000.0);
+    let m = w.c(a).l("RECV");
+    assert_eq!([m.g("USER"), m.g("BODY"), m.g("TYPE")], ["Bravo", "race me", "C"]);
+    assert_eq!(m.g("TIME"), ((sent / 1000.0).floor() as i64).to_string());
+    w.advance(1000.0);
+    roster(&mut w, a);
+    w.sleep(3000.0);
+    assert_eq!(w.c(a).count("RECV"), 1, "a message comes once");
+    // declined: Charlie's request goes, Charlie is told
+    let (_, b) = messenger(&mut w, "10.77.0.3", "Bravo");
+    let (_, c) = messenger(&mut w, "10.77.0.4", "Charlie");
+    w.send(c, "RADM", fields![("USER", "Alpha"), ("ID", 1)]);
+    assert_eq!([w.c(a).l("RNOT").g("USER"), w.c(a).l("RNOT").g("ATTR")], ["Charlie", "R"]);
+    w.send(a, "RRSP", fields![("USER", "Charlie"), ("ANSW", "N"), ("ID", 2)]);
+    assert_eq!(told(&w, c, "Alpha", "D"), 1);
+    // blocked: Delta's request makes no friend, Delta is blocked, a request again never arrives
+    let (_, d) = messenger(&mut w, "10.77.0.5", "Delta");
+    w.send(d, "RADM", fields![("USER", "Alpha"), ("ID", 1)]);
+    w.send(a, "RRSP", fields![("USER", "Delta"), ("ANSW", "B"), ("ID", 3)]);
+    assert!(w.core.buddies.blocks("alpha", "delta"));
+    assert!(!w.core.buddies.list("Alpha").unwrap().b.contains_key("delta"), "a request blocked makes no friend");
+    w.send(d, "RADM", fields![("USER", "Alpha"), ("ID", 2)]);
+    assert_eq!(told(&w, a, "Delta", "A"), 1, "Delta's second request");
+    // taken back: Echo's request comes and goes
+    let (_, e) = messenger(&mut w, "10.77.0.6", "Echo");
+    w.send(e, "RADM", fields![("USER", "Alpha"), ("ID", 1)]);
+    w.send(e, "RDEM", fields![("LRSC", "PC"), ("USER", "Alpha"), ("ID", 2)]);
+    assert_eq!(told(&w, a, "Echo", "D"), 1);
+    w.advance(1000.0);
+    assert_eq!(roster(&mut w, a), pair("Bravo", ""), "no request of Charlie's, Delta's or Echo's");
+    // a friend taken off (the game: RDEM, then RDEL with the same fields): off both lists, Bravo told once
+    for (kind, id) in [("RDEM", 7), ("RDEL", -1)] {
+        w.send(a, kind, fields![("LRSC", "PC"), ("LIST", "B"), ("PRES", "Y"), ("USER", "Bravo"), ("ID", id)]);
+    }
+    assert_eq!(told(&w, b, "Alpha", "D"), 1);
+    assert!(w.core.buddies.list("Alpha").unwrap().b.is_empty() && w.core.buddies.list("Bravo").unwrap().b.is_empty());
+    // what waits too long goes: a message after 7 days, a request after 30
+    w.send(b, "RADM", fields![("USER", "Alpha"), ("ID", 3)]);
+    w.send(a, "RRSP", fields![("USER", "Bravo"), ("ANSW", "Y"), ("ID", 4)]);
+    w.send(e, "RADM", fields![("USER", "Alpha"), ("ID", 3)]);
+    w.send(a, "DISC", vec![]);
+    w.send(b, "SEND", fields![("USER", "Alpha"), ("BODY", "old news")]);
+    assert_eq!(w.core.buddies.list("Alpha").unwrap().m.len(), 1);
+    w.advance(8.0 * 86_400_000.0);
+    let (_, a) = messenger(&mut w, "10.77.0.2", "Alpha");
+    let rows = roster(&mut w, a);
+    w.sleep(3000.0);
+    assert_eq!(w.c(a).count("RECV"), 0, "a message 8 days old");
+    assert!(rows.contains(&("Echo".to_string(), "R".to_string())), "a request 8 days old: {rows:?}");
+    w.send(a, "DISC", vec![]);
+    w.advance(23.0 * 86_400_000.0);
+    let (_, a) = messenger(&mut w, "10.77.0.2", "Alpha");
+    assert_eq!(roster(&mut w, a), pair("Bravo", ""), "a request 31 days old");
+    w.core.buddy_save();
+    let stored = std::fs::read_to_string(dir.join("buddies.json")).unwrap();
+    assert!(!stored.contains("old news") && !stored.contains("\"R\""), "{stored}");
 }
 
 // the count of players in Online mode (the server's /players): logged in, or racing until back

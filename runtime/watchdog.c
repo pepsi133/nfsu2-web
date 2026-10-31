@@ -19,7 +19,12 @@
  * sleeping) and since when, the guest call chain read from its stack, the
  * GIL holder, and the critical sections held with owner and recursion.  It
  * is printed once per stall; the next Present re-arms it.  The watchdog
- * only reads; it never changes what the game does. */
+ * only reads; it never changes what the game does.
+ *
+ * The web page's Download log asks too (watchdog_log_download): players
+ * download a frozen game's log before the limit (2026-10-24: 13 s after the
+ * last frame, no report), so the log gets how long ago the last frame was
+ * and, after 3 s or more, the report then. */
 #include "cpu.h"
 #include <pthread.h>
 #include <stdatomic.h>
@@ -48,13 +53,24 @@ static uint64_t wd_now_us(void){
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
 }
+/* Seconds from a stamp another thread took to now.  In the browser every
+ * thread is a worker with its own performance.timeOrigin + now() (and the
+ * guest threads' since_us come from nfsu2_now_ms, rounded another way): a
+ * stamp taken a moment ago can read a few microseconds ahead of this
+ * thread's now.  Unsigned, that was 2^64 us ("no Present for
+ * 18446744073709.6 s" once in ~60 runs); a stamp ahead counts as no time. */
+static double wd_since_s(uint64_t now, uint64_t then){
+    return now > then ? (double)(now - then) / 1e6 : 0.0;
+}
 /* com.c Present (guest thread). */
 void watchdog_on_present(void){
     atomic_store(&g_wd_present_us, wd_now_us());
     atomic_fetch_add(&g_wd_frames, 1);
 }
 
+static pthread_mutex_t g_wd_mx = PTHREAD_MUTEX_INITIALIZER;   /* the watchdog's thread and the page's input thread */
 static void wd_report(double stalled, uint32_t flow){
+    pthread_mutex_lock(&g_wd_mx);
     g_wd_reports++;
     uint64_t now = wd_now_us();
     fprintf(stderr, "\n[watchdog] no Present for %.1f s (game flow %u, %ld frames so far); guest threads:\n",
@@ -65,7 +81,7 @@ static void wd_report(double stalled, uint32_t flow){
         CPU *c = g_all_cpus[i];
         if (!c) continue;
         int w = g_tstate[i].what; uint32_t o = g_tstate[i].obj;
-        double for_s = g_tstate[i].since_us ? (now - g_tstate[i].since_us) / 1e6 : 0.0;
+        double for_s = g_tstate[i].since_us ? wd_since_s(now, g_tstate[i].since_us) : 0.0;
         char desc[96] = "";
         if (w == TS_WAIT || w == TS_WAITM) win32_obj_describe(o, desc, sizeof desc);
         else if (w == TS_CS) snprintf(desc, sizeof desc, "0x%08x", o);
@@ -81,6 +97,7 @@ static void wd_report(double stalled, uint32_t flow){
     for (int k = 0; k < n; k++)
         fprintf(stderr, "  critical section 0x%08x held by tid %u (depth %d)\n", key[k], owner[k], depth[k]);
     fprintf(stderr, "[watchdog] end of report\n\n");
+    pthread_mutex_unlock(&g_wd_mx);
 }
 
 /* lifecycle.c (app track) defines the real one: true while the game has been
@@ -89,6 +106,24 @@ static void wd_report(double stalled, uint32_t flow){
  * not parked (lifecycle_may_park): it keeps presenting, so the limit applies
  * as in the foreground.  Without lifecycle.c the game is never parked. */
 __attribute__((weak)) int lifecycle_game_parked(void){ return 0; }
+
+/* the page's Download log (runtime/web/input_web.c, on its input thread,
+ * which runs while the game's threads are stuck): how long ago the last
+ * frame was, the report after 3 s or more, then the line the page waits for
+ * before it makes the file.  Also with NFSU2_WATCHDOG=0. */
+void watchdog_log_download(void){
+    uint64_t last = atomic_load(&g_wd_present_us);
+    uint32_t flow = mem_is_committed(0x8654a4u) ? MR32(0x8654a4u) : 0u;
+    if (!last) fprintf(stderr, "[watchdog] log downloaded before the first frame (game flow %u)\n", flow);
+    else {
+        double ago = wd_since_s(wd_now_us(), last);
+        int parked = lifecycle_game_parked();
+        fprintf(stderr, "[watchdog] log downloaded: the last frame %.1f s ago (game flow %u, %ld frames so far%s)\n",
+                ago, flow, atomic_load(&g_wd_frames), parked ? ", parked in the background" : "");
+        if (ago >= 3.0 && !parked) wd_report(ago, flow);
+    }
+    fprintf(stderr, "[watchdog] log download ready\n");
+}
 
 static void *wd_main(void *arg){
     double lim = *(double *)arg;
@@ -101,7 +136,7 @@ static void *wd_main(void *arg){
         if (lifecycle_game_parked()){            /* parked in the background: not a stall; */
             atomic_store(&g_wd_present_us, wd_now_us());   /* the limit restarts on return */
             reported = 0; continue; }
-        double stalled = (wd_now_us() - last) / 1e6;
+        double stalled = wd_since_s(wd_now_us(), last);
         uint32_t flow = mem_is_committed(0x8654a4u) ? MR32(0x8654a4u) : 0u;
         double l = (flow == 3u || flow == 6u) ? lim : (lim > 20.0 ? lim : 20.0);
         if (stalled < l){ reported = 0; continue; }

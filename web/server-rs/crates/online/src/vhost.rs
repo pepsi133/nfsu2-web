@@ -49,8 +49,8 @@ const F_DATA: usize = 16;
 /// the most data one TCP frame carries (net_proto.h NET_MAX_PAYLOAD - NET_LAN_HDR)
 pub const TCP_CHUNK: usize = 1472 - LAN_HDR;
 
-/// The virtual host's limits.  max_conns: a player in the lobby holds two (the lobby and EA Messenger), so 2000 lobby
-/// sessions take 4000
+/// The virtual host's limits.  max_conns: a player in the lobby holds two (the lobby and EA Messenger), so 3500 lobby
+/// sessions take 7000
 #[derive(Clone, Copy, Debug)]
 pub struct VhostLimits {
     pub max_conns: usize,
@@ -59,7 +59,7 @@ pub struct VhostLimits {
 
 impl Default for VhostLimits {
     fn default() -> Self {
-        VhostLimits { max_conns: 8000, per_vip: 8 }
+        VhostLimits { max_conns: 14000, per_vip: 8 }
     }
 }
 
@@ -99,6 +99,8 @@ pub struct VConn {
     /// the client's ids (a test without a switch: the browser's own address stands for its client)
     pub group: Arc<str>,
     pub site: Option<Arc<str>>,
+    /// the keyphrase its page plays with (FrameCtx::owner, as of its first frame)
+    pub owner: Option<Arc<str>>,
     pub rx_fin: bool,
     pub tx_fin: bool,
     pub bytes_in: u64,
@@ -289,6 +291,7 @@ impl Core {
                         cid,
                         group: ctx.group.clone(),
                         site: ctx.site.clone(),
+                        owner: ctx.owner.clone(),
                         rx_fin: false,
                         tx_fin: false,
                         bytes_in: 0,
@@ -513,6 +516,11 @@ impl Core {
     /// the connection's peer address, group and site
     pub fn conn_ids(&self, id: ConnId) -> Option<ConnIds> {
         self.vh.conns.get(&id).map(|c| (c.vip, c.peer(), c.group.clone(), c.site.clone()))
+    }
+
+    /// the keyphrase the connection's page plays with (nfsu2-claims' owner), if it named one
+    pub fn conn_owner(&self, id: ConnId) -> Option<Arc<str>> {
+        self.vh.conns.get(&id).and_then(|c| c.owner.clone())
     }
 
     /// the connection is still there (not closed, reset or gone with its browser)

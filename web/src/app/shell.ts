@@ -15,38 +15,65 @@
 //   script=<url>     autotest input script (NFSU2_INPUT_SCRIPT)
 //   artifacts=<url>  where the autotest's frame dumps are PUT (the server's /artifacts/)
 //   dumpscale=<f>    their scale
+//   rendercheck=W,D  the render check's warm-up and verdict, in seconds of driving (rendercheck.ts)
 // While any of them is given, the start page says whether it is in effect.
 
 import registryDefaults from '../../../app/registry-defaults.txt';
-import { checkBrowser, checkGpu, checkIsolation, checkStorage, firefoxVersion, fmtBytes, type Check } from './checks';
+import { browserName, check, checkBrowser, checkGpu, checkIsolation, checkStorage, fmtBytes, type Check } from './checks';
+import { codeOf, dateLocale, language as pageLanguage, lastLanguage, LANGUAGES, listOf, live, LOCALE, N, NATIVE, onLanguage, setLanguage, t, T, tn, tvars, type Msg } from './i18n';
 import { loadGame, serverRev, type Loaded } from './loader';
 import { claimInstance } from './instance';
 import { LogRing, downloadBlob, stamp } from './logs';
-import { enterFullscreen, exitFullscreen, isFullscreen, keepScreenOn, measureRefresh, settledSize, trackCanvasSize } from './display';
-import { deviceDefaults, markTouch, padSeen, touchFirst } from './device';
+import { LastGameKeeper, lastGameEnd, lastGameLine, lastGameToOffer, type LastGame } from './lastgame';
+import { browserBrief, deviceBrief } from './devicelog';
+import { canFullscreen, enterFullscreen, exitFullscreen, fromHomeScreen, homeScreenInstead, isFullscreen, keepScreenOn, measureRefresh, settledSize, trackCanvasSize } from './display';
+import { deviceDefaults, isPhone, markTouch, noPinchZoom, padSeen, phoneScreen, touchFirst } from './device';
+import { phoneSeed, phoneUpgrade } from './phonegraphics';
 import { markPad, padPress, pageDialog } from './padnav';
+import { controlsSheet, type ControlsSheet, type Tab } from './controls';
 import { TouchControls } from './touch';
+import { TextField } from './textentry';
+import { PauseHint } from './pausehint';
+import { DriftPanel } from './drift';
+import { PhotoMode } from './photo';
 import type { PadPage } from '../input/gamepad';
-import { checkSetting, HOST_FIXED, pageOnly, resolveEnv, settingsUpgrade, TEMPLATE, type Resolved } from './settings';
+import type { NetQueue, NetRemoved } from '../net';
+import { blockList, checkSetting, HOST_FIXED, pageOnly, resolveEnv, settingsUpgrade, TEMPLATE, type Resolved } from './settings';
 import { exists, filesOf, listProfiles, PROFILES_DIR, readText, removeSaveDir, writeFile } from './savefs';
 import { turnOnAutosave } from './profile';
-import { putKey, SettingsPanel } from './settings-ui';
-import { serverAnswers, watchPlayers, type PlayerCounts } from './players';
-import { SavesPanel } from './saves-ui';
+import { crewControl, putKey, SettingsPanel, showCrewCounts } from './settings-ui';
+import { askCrews, queueText, roomHash, roomText, serverAnswers, watchPlayers, type PlayerCounts, type Reach } from './players';
+import { CREW_MAX, crewList, crewsOf, crewsValue, freeColour, rgbsValue, rgbWords, type Crew } from './crews';
+import { checkInvite, inviteLink, readInvite, sameName, type Invite } from './invite';
+import { privacy, SCRUB_NOTE } from './privacy';
+import { exportSaves, SavesPanel } from './saves-ui';
 import { saveScreenshot } from './shots';
-import { forgetLink, VaultPanel } from './vault-ui';
+import { forgetLink, OFFER_TIMES, VaultPanel } from './vault-ui';
+import { Radio, MODES, radioWasOn, type Mode } from '../radio';
+import { canPickMusic, pickMusic } from '../radio-folder';
+import { RadioLink } from './radio-link';
 import { FpsOverlay, FPS_MODES, type FpsMode } from './overlay';
 import { LobbyPanel } from './lobby';
+import { ICON as CHAT_ICON, QuickChat } from './quickchat';
+import { groupsOf, phrasesOf } from './phrases';
 import { GameSession } from './game';
 import { AwayCheck, AWAY_LIMITS, type AwayLimits } from './away';
+import { playedMs, PlayTime, SMS_AFTER_MS } from './playtime';
+import { canKeep } from './pwkeep';
+import { keepPageId, PAGE_ID_FILE, pageId, seen } from './page-id';
+import { NameClaims, onlineName } from './claim';
+import { claimQuietly, NameRow, quietCheck, settleName, type PlayNameDeps } from './claim-ui';
+import { RenderCheck, RENDER_CHECK_TIMES, type RenderCheckTimes } from './rendercheck';
 import { moviesKept, Predownload } from './predownload';
+import { movieCodec } from '../host/movie';
+import { texSplit } from '../gpu/index';
 
 type Phase = 'boot' | 'ready' | 'error' | 'waiting' | 'starting' | 'playing' | 'exited';
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector<T>(sel)!;
 
 // the page address's test aids, once boot knows whether the server is a development server
-const TEST_PARAMS = ['env', 'save', 'fresh', 'reg', 'script', 'artifacts', 'dumpscale', 'away'];
+const TEST_PARAMS = ['env', 'save', 'fresh', 'reg', 'script', 'artifacts', 'dumpscale', 'away', 'rendercheck', 'playtime'];
 const addr = new URLSearchParams(location.search);
 let q = new URLSearchParams();
 let SAVE = 'save';
@@ -56,9 +83,9 @@ function takeParams(dev: boolean): string[] {
   const given = TEST_PARAMS.filter(k => addr.has(k));
   if (!given.length || !dev) return given;
   q = addr;
-  // never the game data's own OPFS folder (savefs keeps names to one segment)
+  // never the game data's own OPFS folder, nor the page id's file (savefs keeps names to one segment)
   const save = (q.get('save') || 'save').replace(/[^A-Za-z0-9._-]/g, '_');
-  SAVE = save === 'cache' || /^\.+$/.test(save) ? 'save-test' : save;
+  SAVE = save === 'cache' || save === PAGE_ID_FILE || /^\.+$/.test(save) ? 'save-test' : save;
   ENVIRONMENT = Object.fromEntries(q.getAll('env').filter(e => e.includes('='))
     .map(e => [e.slice(0, e.indexOf('=')), e.slice(e.indexOf('=') + 1)])
     // the mounts and the save overlay's own files stay the page's (settings.ts HOST_FIXED, PATH_VARS)
@@ -75,6 +102,7 @@ async function devServer(): Promise<boolean> {
 }
 
 const log = new LogRing(8 << 20);
+log.onLine = s => { privacy.learn(s); };    // the names a downloaded log must not carry (privacy.ts)
 let phase: Phase = 'boot';
 let loaded: Loaded | null = null;
 let displayHz = 60;
@@ -83,23 +111,49 @@ let displayHz = 60;
 let refreshMeasured: Promise<void> = Promise.resolve();
 let session: GameSession | null = null;
 let hudWide = true;                      // the running game's HUD is edge-anchored (hud = wide), not 4:3
+let solidCars: boolean | null = null;    // the running game's free roam has solid cars (null: no free roam)
+let roamCrews: Crew[] | null = null;     // the running game's crews: as it started, then as the menu changed them (null: no free roam)
+let roamRoom: string | null = null;      // the running game's room: as it started, then as an invite link changed it ('': none; null: no free roam)
+let crewDraft = '';                      // the crew name being typed in the menu
+let popCounts = new Map<number, number>();   // how many are in free roam in each of those crews, by hash (askPopCounts)
+let popAsk = 0;                          // the popup's questions so far: only the newest one's answer shows
 let away: AwayCheck | null = null;
+let playTime: PlayTime | null = null;
+let renderCheck: RenderCheck | null = null;
 let lastExit: { code: number; seconds: number } | null = null;
+let keeper: LastGameKeeper;              // the running game's log, copied where a page Safari stops cannot lose it
+let lastGame: LastGame | null = null;    // the last game's copy, when that game did not get to its end (lastgame.ts)
+let hiddenAt = 0;                        // when the page was hidden during a game (0: shown)
 const checks = new Map<string, Check>();
 let instance: ReturnType<typeof claimInstance>;
 let settingsText: string | null = null;
 let starting = false;                    // Play pressed, the session not there yet
-let fatal: string | null = null;         // why the running game had to be stopped
+let fatal: { what: string; code?: string } | null = null;   // why the running game had to be stopped (English, for t())
+// the last game lost its graphics (GPU-LOST): Safari's WebGPU gives this page no adapter any more, so Play reloads it
+let gpuGone = false;
 let fps: FpsOverlay;
+let statusAt: { memory: WebAssembly.Memory; ptr: number } | null = null;   // the running game's status block
+let radioLink: RadioLink | null = null;  // the radio's words of the running game, once the game says it has them
+const radioPort = () => radioLink ??= statusAt ? RadioLink.open(statusAt.memory, statusAt.ptr) : null;
+let radio: Radio | null = null;          // made at the first click on Radio: a player who never uses it runs none of it
+const theRadio = () => radio ??= new Radio(radioPort, l => log.add(`[radio] ${l}`));
 let lobbyPanel: LobbyPanel;
+let quickChat: QuickChat;                // free roam's fixed phrases (quickchat.ts)
 let settings: SettingsPanel;
-let players: { now(): void; last(): PlayerCounts | null } | null = null;
+let players: { now(): void; last(): PlayerCounts | null; fresh(ms: number): Promise<PlayerCounts | null> } | null = null;
 let saves: SavesPanel;
 let vault: VaultPanel;
+/** the claimed names (claim.ts), and the line under Your name (claim-ui.ts) */
+let claims: NameClaims;
+let nameRow: NameRow;
 let download: Predownload;
 /** the server does not answer: the page and the module came from this browser's copies (sw.ts), and a game
  *  runs from the game data on this PC */
 let offline = false;
+/** why the page is offline ('ok' while it is not): what it says (reachText) */
+let reach: Reach = 'ok';
+/** the server's misses in a row, and whether it answered since the page started (setReach) */
+let misses = 0, answered = false;
 /** the profile the running (or last) game saved last, when, and how often it saved one */
 let saved: { name: string; at: number; count: number } | null = null;
 
@@ -111,12 +165,19 @@ function setProgress(f: number) {
 }
 
 // --------------------------------------------------------------- status --
-function setPhase(p: Phase, title: string, sub: string) {
+/** the headline and the line under it (in the page's language, again when it changes); code: a problem's */
+function setPhase(p: Phase, title: Msg, sub: Msg, code?: string) {
   phase = p;
   document.body.dataset.phase = p;
-  $('#status').textContent = title;
-  $('#status-sub').textContent = sub;
+  live($('#status'), title);
+  setSub(sub, code);
   updatePlay();
+}
+/** the line under the headline alone; subSeq counts what it showed (an answer that comes later may add to it) */
+let subSeq = 0;
+function setSub(sub: Msg, code?: string) {
+  subSeq++;
+  live($('#status-sub'), sub, code);
 }
 function setCheck(c: Check) {
   checks.set(c.id, c);
@@ -125,25 +186,44 @@ function setCheck(c: Check) {
 }
 const ORDER = ['browser', 'isolation', 'gpu', 'storage', 'module'];
 let problemsShown = '';
-/** Only what is wrong (a failed check) or worth knowing (another browser, a GPU without BC); the storage warning goes with the saves. */
+const problemsLogged = new Set<string>();
+/** a check's label and detail in the page's language */
+const label = (c: Check) => tvars(c.tl ?? c.label, c.v), detail = (c: Check) => tvars(c.td ?? c.detail, c.v);
+/** Only what is wrong (a failed check) or worth knowing (another browser, a GPU without BC); the storage warning goes with
+ *  the saves.  Each with its code, and in the log once, in English. */
 function renderProblems() {
   const shown = ORDER.map(id => checks.get(id))
     .filter((c): c is Check => !!c && (c.state === 'fail' || (c.state === 'warn' && (c.id === 'browser' || c.id === 'gpu'))));
-  const key = shown.map(c => `${c.id}:${c.state}:${c.detail}`).join('|');
+  const key = pageLanguage() + '|' + shown.map(c => `${c.id}:${c.state}:${c.detail}`).join('|');
   if (key !== problemsShown) {          // the list is a live region: rebuilt only when it changes
     problemsShown = key;
     $('#problems').replaceChildren(...shown.map(c => {
       const li = document.createElement('li'); li.dataset.id = c.id; li.className = c.state;
-      const t = document.createElement('strong'); t.textContent = c.label;
-      const p = document.createElement('p'); p.textContent = c.detail;
-      li.append(t, p);
+      const s = document.createElement('strong'); s.textContent = label(c);
+      const p = document.createElement('p'); p.textContent = detail(c);
+      if (c.code) p.append(codeOf(c.code));
+      li.append(s, p);
       return li;
     }));
   }
   const st = checks.get('storage');
+  for (const c of [...shown, ...(st?.state === 'warn' ? [st] : [])]) {
+    const k = `${c.id}:${c.state}:${c.detail}`;
+    if (!problemsLogged.has(k)) { problemsLogged.add(k); log.add(`[app] ${c.state === 'fail' ? 'problem' : 'warning'} ${c.code ?? c.id}: ${c.label}: ${c.detail}`); }
+  }
   const note = $('#storage-note');
   note.hidden = st?.state !== 'warn';
-  note.textContent = st?.state === 'warn' ? st.detail : '';
+  if (st?.state === 'warn') live(note, () => detail(st), st.code); else live(note, () => '');
+}
+/** No graphics since the last game's went (GPU-ADAPTER-AFTER-LOST): asked again every 10 s while the page shows, as the
+ *  browser may give them back after a while (Chrome: two minutes); the log says when they came back. */
+function recheckGpu(since = performance.now()) {
+  setTimeout(async () => {
+    const c = document.visibilityState === 'visible' ? await checkGpu(true) : null;
+    if (!c || c.code === 'GPU-ADAPTER-AFTER-LOST') { recheckGpu(since); return; }
+    log.add(`[app] the graphics are back after ${((performance.now() - since) / 1000).toFixed(0)} s`);
+    setCheck(c);
+  }, 10_000);
 }
 function blocking(): Check | undefined { return ORDER.map(id => checks.get(id)).find(c => c?.state === 'fail'); }
 
@@ -152,23 +232,23 @@ function evaluate() {
   if (phase === 'starting' || phase === 'playing') return;
   const bad = blocking();
   if (bad) {
-    setPhase('error', 'Not ready', bad.id === 'module' ? 'The game did not load. It is tried again by itself, or press Retry.' : 'Fix the problem below, then reload this page.');
+    setPhase('error', T('Not ready'), bad.id === 'module' ? T('The game didn\'t load. It retries by itself, or press Retry.') : T('Fix the problem below, then reload this page.'));
     return;
   }
   if (!instance.owner) {
-    setPhase('waiting', 'Open elsewhere', 'This browser is already running the game in another tab. Switch to that tab, or close it: this page takes over when it does.');
+    setPhase('waiting', T('Open elsewhere'), T('The game is running in another tab. Switch to it, or close it and this page takes over.'));
     return;
   }
   const pending = ORDER.map(id => checks.get(id)).find(c => c?.state === 'pending');
   if (!loaded) {
     // downloading (again, after a failure): the headline says so, the progress fills in the line below
-    if (pending?.id === 'module' && phase !== 'boot' && phase !== 'exited') setPhase('boot', 'Loading', 'Loading the game.');
+    if (pending?.id === 'module' && phase !== 'boot' && phase !== 'exited') setPhase('boot', T('Loading'), T('Loading the game.'));
     return;
   }
-  if (pending) { if (phase !== 'exited') setPhase('boot', 'Loading', `${pending.label}: ${pending.detail}`); return; }
+  if (pending) { if (phase !== 'exited') setPhase('boot', T('Loading'), () => `${label(pending)}: ${detail(pending)}`); return; }
   if (phase === 'exited') { updatePlay(); return; }
-  const press = touchFirst() ? 'Press Play to start.' : 'Press Play or Enter to start.';
-  setPhase('ready', 'Ready', offline ? `Offline: the game runs from this PC, without free roam or Online. ${press}` : press);
+  const press = N('Press Play to start.');
+  setPhase('ready', T('Ready'), offline ? () => t('No connection to the server: you can play, but not with others. {press}', { press: t(press) }) : T(press));
 }
 
 function updatePlay() {
@@ -189,6 +269,8 @@ async function loadSettings(): Promise<string | null> {
     if (up) { text = up.text; await writeFile(SAVE, 'settings.ini', text); log.add(`[app] settings: added the new options ${up.added.join(', ')} to /save/settings.ini (commented out, defaults unchanged)`); }
   }
   settingsText = text;
+  // who plays on this server, asked again with this file's room and crews (the first question went without them)
+  players?.now();
   return text;
 }
 /** this device's own defaults (a phone's: device.ts), below settings.ini and the page address */
@@ -196,13 +278,15 @@ const DEVICE = deviceDefaults();
 function resolved(host: Record<string, string> = {}): Resolved { return resolveEnv(settingsText, ENVIRONMENT, host, DEVICE); }
 /** the game's language (runtime/language.c): which language pack the page fetches ahead and counts */
 const language = (r: Resolved = resolved()) => (r.env.NFSU2_LANGUAGE ?? 'english').toLowerCase();
+/** the texture pack picked (runtime/web/texrep_web.c), '' for none: the one the page fetches ahead and counts */
+const texpack = (r: Resolved = resolved()) => { const v = (r.env.NFSU2_UI_TEXTURES ?? '').toLowerCase(); return v === 'original' ? '' : v; };
 
 // ----------------------------------------------------------------- play --
 function stageCanvas(): HTMLCanvasElement {
   const stage = $('#stage');
   stage.querySelector('canvas')?.remove();
   const c = document.createElement('canvas');
-  c.id = 'game'; c.tabIndex = 0; c.setAttribute('aria-label', 'The game');
+  c.id = 'game'; c.tabIndex = 0; c.setAttribute('aria-label', t('The game'));
   stage.prepend(c);
   return c;
 }
@@ -216,33 +300,41 @@ let untrack: (() => void) | null = null;
  * (the address's test settings), offline or with network = off.  The name shows only when there is one (Your
  * name, else the newest career profile's): a new player has none yet, the game asks for it before free roam.
  * While the server's free roam is busy (its newest /players says roamBusy: fewer links a player) it is not asked
- * and nothing is written, so a later Play asks once free roam has room again.
+ * and nothing is written, so a later Play asks once free roam has room again.  While the server is full it is asked,
+ * and says that with it on the game waits in line for a place (and plays alone until then).  True: it was asked.
  * ASK_ROAM false: never asked, and free roam stays off until the player turns it on under Online.
  */
 const ASK_ROAM = true;
-async function askRoam() {
+async function askRoam(): Promise<boolean> {
   const r = resolved();
-  if (!ASK_ROAM || r.source.NFSU2_ROAM || TEST_PARAMS.some(k => q.has(k)) || offline || /^(off|0|none)$/i.test(r.env.NFSU2_NET?.trim() ?? '')) return;
-  if (players?.last()?.roamBusy === true) { log.add('[app] free roam with others: not asked, the server\'s free roam is busy (asked at a later Play)'); return; }
+  if (!ASK_ROAM || r.source.NFSU2_ROAM || TEST_PARAMS.some(k => q.has(k)) || offline || /^(off|0|none)$/i.test(r.env.NFSU2_NET?.trim() ?? '')) return false;
+  if (players?.last()?.roamBusy === true) { log.add('[app] free roam with others: not asked, the server\'s free roam is busy (asked at a later Play)'); return false; }
   const name = (r.source.NFSU2_ROAM_NAME === 'settings.ini' ? r.env.NFSU2_ROAM_NAME : '') || (await newestProfile())?.name || '';
   const p = (text: string) => Object.assign(document.createElement('p'), { textContent: text });
   const body = document.createElement('div');
-  body.append(p('Other players on this server can drive in your career\'s free roam with you. You see their cars with their names over them, they see yours, and you can challenge each other to outruns. Races, traffic and money stay your own.'),
-    p('With this on, everyone on this server sees your picked name and whether you\'re driving or in the menus. Players near you also see your car and where it is.'));
+  body.append(p(t('Drive in your career\'s free roam with other players and challenge each other to outruns. Races, traffic and money stay your own.')),
+    p(t('Everyone on this server sees your name and whether you\'re driving or in the menus; players near you also see your car.')));
+  const c = players?.last();
+  if (c?.full === true) {
+    const n = Number.isInteger(c.queue) && c.queue! > 0 ? c.queue! : 0;
+    const turn = t('You wait in line too, driving alone until it\'s your turn.');
+    body.append(p(`${n ? tn(n, 'The server is full: {n} player is in line.', 'The server is full: {n} players are in line.')
+      : t('The server is full.')} ${turn}`));
+  }
   let field: HTMLInputElement | null = null;
   if (name) {
     const row = document.createElement('p'); row.className = 'dlg-field';
-    const label = Object.assign(document.createElement('label'), { className: 'set-label', htmlFor: 'roam-ask-name', textContent: 'Your name' });
+    const label = Object.assign(document.createElement('label'), { className: 'set-label', htmlFor: 'roam-ask-name', textContent: t('Your name') });
     const f = field = Object.assign(document.createElement('input'), { type: 'text', id: 'roam-ask-name', value: name, maxLength: 24, autocomplete: 'off', spellcheck: false });
     // a name the setting refuses keeps the question open (Not now and Esc still close it)
-    f.oninput = () => { const v = f.value.trim(), c = v ? checkSetting('roam_name', v) : null; f.setCustomValidity(c && !c.ok ? `${c.reason}.` : ''); };
+    f.oninput = () => { const v = f.value.trim(), c = v ? checkSetting('roam_name', v) : null; f.setCustomValidity(c && !c.ok ? t('{Error}.', { Error: tvars(c.why, c.v) }) : ''); };
     // Enter in the field turns it on (the form's first button, which Enter would press, is Not now)
     f.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); $<HTMLButtonElement>('#confirm-ok').click(); } };
     row.append(label, f);
     body.append(row);
   }
-  body.append(p('You can change this any time under Online on the start page.'));
-  const answer = confirmBox('Free roam with others?', body, 'Turn on', false, '', 'Not now');
+  body.append(p(t('You can change this under Online on the start page.')));
+  const answer = confirmBox(t('Free roam with others?'), body, t('Turn on'), false, '', t('Not now'));
   $<HTMLButtonElement>('#confirm-ok').focus();
   const on = await answer;
   let text = putKey(settingsText ?? TEMPLATE, 'roam', on ? 'on' : 'off').text;
@@ -251,12 +343,158 @@ async function askRoam() {
   await writeFile(SAVE, 'settings.ini', text);
   settingsText = text;
   void settings.refresh();
-  log.add(`[app] free roam with others: ${on ? 'on' : 'off'} (asked at the first Play)${on && typed !== name ? `, name ${typed || '(the profile\'s)'}` : ''}`);
+  log.add(`[app] free roam with others: ${on ? 'on' : 'off'} (asked at the first Play${c?.full === true ? ', the server full' : ''})${on && typed !== name ? `, name ${typed || '(the profile\'s)'}` : ''}`);
+  return true;
+}
+
+/**
+ * Play asks a player with a profile here and no cloud saves to turn them on: the saves live only in this browser, and
+ * browsers clear a site's data now and then.  First at the first Play with a profile here (a new player's second: the
+ * first asks about free roam, and the next one asks), then a week after each Not now (or Esc), three times in all
+ * (vault-ui.ts offerable; before 2026-10-31 once, at the fifth Play).  It shows what is at stake (the profiles, their
+ * money, the hours played here) and downloads the backup for a player who would rather keep a file.  Not on a test
+ * page, offline, or where the server keeps no cloud saves.  Turned on, the keyphrase is shown to keep (copy, download)
+ * before the game starts; it failed, the reason.
+ */
+async function askCloud() {
+  if (testPage() || offline || !vault.offerable() || !await newestProfile()) return;
+  const times = vault.offered();
+  const p = (text: string) => Object.assign(document.createElement('p'), { textContent: text });
+  const body = document.createElement('div');
+  body.append(p(t('Your career is saved only in this browser, and browsers sometimes clear site data (low disk space, cleared history).')),
+    await vault.stake(playedMs()),
+    p(t('Cloud saves keep a copy on this server under a passphrase only you have, so you can get your saves back here or in another browser.')));
+  // the name, when it is free to claim: the new keyphrase claims it at once, and its popup says so
+  const name = onlineName(await typedName());
+  const info = name ? await claims.check(name) : null;
+  if (name && info?.state === 'free' && !info.mine) body.append(p(t('It also claims your name {name}, so no one else can play under it.', { name })));
+  body.append(p(t('You can change this under Cloud saves on the start page.')));
+  // or a file of them, kept where the player likes (Saves, Download backup)
+  const backup = Object.assign(document.createElement('button'), { type: 'button', className: 'text-btn', textContent: t('Download backup') });
+  const said = Object.assign(document.createElement('p'), { className: 'hint', hidden: true });
+  backup.onclick = async () => {
+    try {
+      const e = await exportSaves(SAVE);
+      downloadBlob(e.zip as BlobPart, e.name, 'application/zip');
+      said.textContent = tn(e.files, 'Downloaded {name}: {n} file, {size}.', 'Downloaded {name}: {n} files, {size}.', { name: e.name, size: fmtBytes(e.zip.length) });
+      log.add('[app] cloud saves: a backup downloaded from Play\'s question');
+    } catch (err) { said.textContent = t('The backup failed: {error}', { error: String(err) }); }
+    said.hidden = false;
+  };
+  const row = document.createElement('div'); row.className = 'row keyphrase-do';
+  row.append(backup);
+  body.append(row, said);
+  const answer = confirmBox(t('Turn on cloud saves?'), body, t('Turn on'), false, '', t('Not now'));
+  $<HTMLButtonElement>('#confirm-ok').focus();
+  const on = await answer;
+  log.add(`[app] cloud saves: ${on ? 'turned on' : 'not now'} (asked at Play, ${times} of ${OFFER_TIMES})`);
+  if (!on) return;
+  const phrase = await enableCloud();
+  if (!phrase) return;
+  const claimed = name && info?.state === 'free' && !info.mine ? await claimQuietly(playDeps(), name, info, quietCheck) : null;
+  await showPassphrase(phrase, claimed?.name ?? null);
+}
+
+/** Cloud saves turned on (Play's question, or Claim under Your name without a keyphrase): the keyphrase made, or
+ *  null, after a box that says why not.  `showPassphrase` then shows it to keep. */
+async function enableCloud(): Promise<string | null> {
+  const got = await vault.enable();
+  if ('why' in got) {
+    await confirmBox(t('Cloud saves are not on'), got.why ? t('They could not be turned on: {error}. Try again under Cloud saves on the start page.', { error: got.why })
+      : t('They could not be turned on. Try again under Cloud saves on the start page.'), t('Continue'), false, '', '');
+    return null;
+  }
+  return got.phrase;
+}
+
+/** A keyphrase just made, shown whole to keep (copy, download): for the saves, and for the name it claimed (null:
+ *  none), which it is the only way back to as well */
+async function showPassphrase(phrase: string, claimed: string | null) {
+  const p = (text: string) => Object.assign(document.createElement('p'), { textContent: text });
+  const box = Object.assign(document.createElement('p'), { className: 'keyphrase', textContent: phrase });
+  const copy = Object.assign(document.createElement('button'), { type: 'button', className: 'text-btn', textContent: t('Copy') });
+  copy.onclick = async () => {
+    try { await navigator.clipboard.writeText(phrase); copy.textContent = t('Copied.'); }
+    catch { getSelection()?.selectAllChildren(box); }
+  };
+  const file = Object.assign(document.createElement('button'), { type: 'button', className: 'text-btn', textContent: t('Download passphrase') });
+  file.onclick = () => vault.download();
+  const row = document.createElement('div'); row.className = 'row keyphrase-do';
+  row.append(copy, file);
+  const kept = document.createElement('div');
+  if (claimed) {
+    kept.append(p(t('{name} is yours, held by this passphrase. Cloud saves are on too.', { name: claimed })),
+      p(t('Keep it safe: it\'s the only way to get {name} and your saves back, here or in another browser.', { name: claimed })),
+      box, row, p(t('To use it in another browser, enter it under Cloud saves on the start page.')));
+  } else {
+    kept.append(p(t('Passphrase made. Keep it safe: it is the only way back to these saves.')), box, row,
+      p(t('To load your saves, enter it under Cloud saves on the start page.')));
+  }
+  // its "Save password?" (vault-ui.ts asked it as the keyphrase was made)
+  if (canKeep()) kept.append(p(t('Your browser may also offer to save it with your passwords: choose Save.')));
+  const shown = confirmBox(t('Your passphrase'), kept, t('Continue'), false, '', '');
+  $<HTMLButtonElement>('#confirm-ok').focus();
+  await shown;
+}
+
+/** what Play's questions about the name need (claim-ui.ts) */
+function playDeps(): PlayNameDeps {
+  return {
+    claims, seed: pageId, linked: () => vault.linked(), log: logLine,
+    choose: (title, body, ok, cancel) => choiceBox(title, body, ok, cancel),
+    save: n => settings.putName(n),
+  };
+}
+
+/** Your name as settings.ini has it, else the newest profile's (what the game goes by) */
+async function typedName(): Promise<string> {
+  const r = resolved();
+  return (r.source.NFSU2_ROAM_NAME === 'settings.ini' ? r.env.NFSU2_ROAM_NAME?.trim() : '') || (await newestProfile())?.name || '';
+}
+
+/**
+ * The name this game plays under, by the claims (claim-ui.ts settleName): NAME and another player's claimed name get
+ * this browser's digits (asked about once), a free name with a keyphrase here is claimed.  null: as it is.  Only
+ * where the game meets other players (the network on, free roam or Online mode), and not offline or on a test page.
+ */
+async function playName(): Promise<string | null> {
+  const r = resolved();
+  if (testPage() || offline || /^(off|0|none)$/i.test(r.env.NFSU2_NET?.trim() ?? '')) return null;
+  if (r.env.NFSU2_ROAM !== '1' && r.env.NFSU2_ONLINE === '0') return null;
+  const typed = await typedName();
+  const name = await settleName(playDeps(), typed, SAVE, quietCheck);
+  if (name && name !== onlineName(typed)) log.add('[app] your name: this game plays under another (digits, or one picked)');
+  return name;
+}
+
+/**
+ * A full server (the newest /players, asked again at Play): a game that takes a place at once (free roam on) waits in
+ * line for it.  The player picks: wait in line (the game starts, alone until it is their turn; the default, also for
+ * Esc), or play offline (this game only, without free roam or Online; settings.ini stays as it is).  True: offline.
+ * Not asked when the game would not take a place at once (free roam off: the LAN and Online screens wait in line
+ * themselves, the line over the game says where), offline mode, network = off or a test page, nor right after the
+ * free-roam question (askRoam), which says the server is full itself.
+ */
+async function askFull(c: PlayerCounts | null): Promise<boolean> {
+  const r = resolved();
+  if (!c?.full || offline || TEST_PARAMS.some(k => q.has(k)) || r.env.NFSU2_ROAM !== '1' || /^(off|0|none)$/i.test(r.env.NFSU2_NET?.trim() ?? '')) return false;
+  const n = Number.isInteger(c.queue) && c.queue! > 0 ? c.queue! : 0;
+  const p = (text: string) => Object.assign(document.createElement('p'), { textContent: text });
+  const body = document.createElement('div');
+  if (n) body.append(p(tn(n, '{n} player is waiting in line.', '{n} players are waiting in line.')));
+  body.append(p(t('Wait in line: play alone now and join the others when it\'s your turn. The top of the screen shows your place.')),
+    p(t('Play offline: no free roam with others or Online this time.')));
+  const answer = choiceBox(t('The server is full'), body, t('Wait in line'), t('Play offline'));
+  $<HTMLButtonElement>('#confirm-ok').focus();
+  const alone = await answer === 'cancel';
+  log.add(`[app] the server is full${n ? ` (${n} in line)` : ''}: ${alone ? 'this game plays offline' : 'the game waits in line for a place'} (asked at Play)`);
+  return alone;
 }
 
 async function play() {
   if ($<HTMLButtonElement>('#play').disabled || session || starting) return;
   if (byPlay()) { await reloadFor(newer!, 'Play', false); return; }
+  if (gpuGone) { log.add('[app] the last game lost its graphics: reloading the page (Play)'); await reload(); return; }
   if (updated) { updated = false; showNewer(); }
   starting = true; updatePlay();
   try { await startGame(); } finally { starting = false; updatePlay(); }
@@ -268,9 +506,10 @@ async function startGame() {
   // user activation, which full screen needs (after the free-roam question, its
   // button's click is the activation).  Beside it the server's version once more
   // (a deploy since the page last asked): no game starts on a version it replaced.
-  const [, rev] = await Promise.all([
+  const [, rev, counts] = await Promise.all([
     Promise.race([loadSettings().catch(e => log.add(`[app] settings.ini not read again: ${e}`)), new Promise(r => setTimeout(r, 1000))]),
     offline || testPage() ? null : serverRev(1000),
+    offline || testPage() ? null : players?.fresh(1000) ?? null,
   ]);
   if (rev && rev !== loaded!.info.rev && rev !== tried) {
     newer = rev; updated = false;
@@ -280,7 +519,17 @@ async function startGame() {
     showNewer();
     return;
   }
-  await askRoam();
+  // a cloud-saves conflict waiting (nothing syncs until it is settled): settled first, or no game; before the questions
+  // that write settings.ini, which the cloud's saves would replace
+  const cloud = await vault.askAtPlay();
+  if (cloud === 'stop') return;
+  if (cloud === 'taken') await loadSettings().catch(e => log.add(`[app] settings.ini not read again: ${e}`));
+  // (the free-roam question says when the server is full: answered, it is not asked again what to do about that)
+  const roamAsked = await askRoam();
+  if (!roamAsked) await askCloud();
+  const alone = !roamAsked && await askFull(counts);
+  // the name this game plays under, by the claims: before full screen, for its questions
+  const playAs = alone ? null : await playName();
   const pre = resolved();
   // inside the click: things that need a user gesture.  The context runs at the
   // mixer's own rate (44.1 kHz), so the worklet does not resample.
@@ -299,12 +548,14 @@ async function startGame() {
   untrack = trackCanvasSize(canvas);
   awake = keepScreenOn(logLine);
   $('#stage-menu').hidden = !touchFirst();
-  setPhase('starting', 'Starting', full ? 'Going full screen and starting the game.' : 'Starting the game.');
+  setPhase('starting', T('Starting'), full && canFullscreen() ? T('Going full screen and starting the game.') : T('Starting the game.'));
   let fsNote = '';
-  if (full) {
+  // an iPhone has no full screen for the page (from the Home Screen it has no browser bars to hide)
+  if (full && homeScreenInstead()) fsNote = t(HOME_SCREEN);
+  else if (full && canFullscreen()) {
     const fs = await enterFullscreen(stage);
-    if (!fs.ok) fsNote = `Full screen was not allowed here; ${menuName()} has it.`;
-    else if (!fs.locked && !touchFirst()) fsNote = 'Esc leaves full screen in this browser (no keyboard lock).';
+    if (!fs.ok) fsNote = t('Full screen was not allowed here; {menu} has it.', { menu: menuName() });
+    else if (!fs.locked && !touchFirst()) fsNote = t('Esc leaves full screen in this browser (no keyboard lock).');
   }
   const size = await settledSize(canvas);
   await Promise.race([refreshMeasured, new Promise(r => setTimeout(r, 2000))]);
@@ -320,23 +571,35 @@ async function startGame() {
     NFSU2_WIDTH: String(size.w & ~1), NFSU2_HEIGHT: String(size.h & ~1), NFSU2_DISPLAY_HZ: String(displayHz),
   };
   const r = resolved(host);
+  if (playAs) r.env.NFSU2_ROAM_NAME = playAs;
+  // the room and crews in Unicode's composed form, as the page hashes them (players.ts roomText): one "é" whichever way
+  for (const k of ['NFSU2_ROAM_ROOM', 'NFSU2_ROAM_CREW'] as const) if (r.env[k]) r.env[k] = roomText(r.env[k]);
+  // the names this game goes by, for the log as it leaves the browser (privacy.ts)
+  privacy.name(r.env.NFSU2_ROAM_NAME, 'you');
+  for (const c of crewList(r.env.NFSU2_ROAM_CREW ?? '')) privacy.name(c, 'crew');
+  privacy.name(r.env.NFSU2_ROAM_ROOM, 'room');
+  for (const p of await listProfiles(SAVE).catch(() => [])) privacy.name(p.name, 'profile');
   // offline mode: the server does not answer.  The movies stream from it, so unless every one of them is in this
   // browser they are off for this game (a movie the game could not read would stop it).
   setReach(await serverAnswers(2000));
+  // the movies in AV1 where this browser decodes it, else in VP6 (host/movie.ts; settings.ini NFSU2_MOVIE_CODEC)
+  r.env.NFSU2_MOVIE_CODEC = await movieCodec(r.env);
   let offlineNote = '';
   if (offline) {
     log.add('[app] offline: the server does not answer, the game runs from this PC (no free roam or Online)');
-    if (r.env.NOMOVIES !== '1' && !await moviesKept(language(r)).catch(() => false)) {
+    if (r.env.NOMOVIES !== '1' && !await moviesKept(language(r), r.env.NFSU2_MOVIE_CODEC === 'av1').catch(() => false)) {
       r.env.NOMOVIES = '1';
       log.add('[app] offline: not every movie is on this PC, so the movies are off for this game');
-      offlineNote = 'Offline: the movies are off for this game. ';
+      offlineNote = t('No connection to the server: the movies are off for this game.') + ' ';
     }
   }
   // the log is for sharing when asking for help: it names neither the server (a private server's address) nor
   // more of this browser than its major version and system (the audit's PRIV-5).  These session lines stay when
   // a long game fills the log (logs.ts keep).
   log.keep(`=== NFSU2 web, ${new Date().toISOString()}, game ${loaded!.info.rev}, server ${serverKind()} ===`);
-  log.keep(`[app] save folder: OPFS ${SAVE} (/save); canvas ${size.w}x${size.h} device pixels, display ${displayHz} Hz; ${browserBrief()}`);
+  log.keep(`[app] save folder: OPFS ${SAVE} (/save); canvas ${size.w}x${size.h} device pixels, display ${displayHz} Hz; ${browserBrief(navigator.userAgent, navigator.maxTouchPoints, phoneScreen(navigator.maxTouchPoints))}; ${checks.get('gpu')?.label ?? 'WebGPU'}; movies in ${r.env.NFSU2_MOVIE_CODEC === 'av1' ? 'AV1' : 'VP6'}`);
+  log.keep(`[app] device: ${deviceBrief({ screenW: screen.width, screenH: screen.height, dpr: devicePixelRatio, cores: navigator.hardwareConcurrency,
+    memoryGB: (navigator as { deviceMemory?: number }).deviceMemory, touchPoints: navigator.maxTouchPoints, homeScreen: fromHomeScreen(), displayHz })}`);
   for (const n of r.notes) log.keep(`[app] ${n}`);
   const reg = r.env.NFSU2_REGFILE.replace(/^\/save\//, '');
   if (q.get('reg')) {
@@ -344,7 +607,18 @@ async function startGame() {
     log.add(`[app] registry seeded from ${q.get('reg')} (page address)`);
   } else if (!await exists(SAVE, reg)) {
     if (r.env.NFSU2_SEED_REGISTRY === '0') log.add('[app] no registry yet, the game will run its first-run check');
+    else if (isPhone()) { await writeFile(SAVE, reg, phoneSeed(registryDefaults)); log.add(`[app] first launch, registry seeded with the built-in defaults and a phone's graphics (/save/${reg})`); }
     else { await writeFile(SAVE, reg, registryDefaults); log.add(`[app] first launch, registry seeded with the built-in defaults (/save/${reg})`); }
+  } else if (isPhone()) {
+    // a phone that started before the phone graphics (phonegraphics.ts): once
+    const text = await readText(SAVE, reg);        // null: not read (it is there), left as it is for the next start
+    const up = text === null ? null : phoneUpgrade(text, registryDefaults);
+    if (text === null) log.add(`[app] phone graphics: /save/${reg} could not be read, left as it is`);
+    else if (up) {
+      await writeFile(SAVE, reg, up.text);
+      log.add(up.lowered ? '[app] phone graphics: the graphics options still had the built-in defaults, now a phone\'s'
+        : '[app] phone graphics: the graphics options were changed in this browser, they stay');
+    }
   }
   // the game's Save option at Autosave, once per profile (settings.ini autosave, profile.ts); an input script
   // plays the game as it was recorded (on the Mac, where nothing changes the profiles) unless the page address
@@ -369,9 +643,14 @@ async function startGame() {
   await download.pause();
   // the server's virtual LAN: the game's own LAN races and Online mode (network = on, the default) and free
   // roam all need it; only network = off stays off it (the game then shows its own network error)
-  const net = !/^(off|0|none)$/i.test(r.env.NFSU2_NET?.trim() ?? '');
+  // (and a full server's player who chose to play offline: askFull)
+  const net = !/^(off|0|none)$/i.test(r.env.NFSU2_NET?.trim() ?? '') && !alone;
   const netName = net ? (r.env.NFSU2_ROAM_NAME?.trim() || 'Player') : null;
   hudWide = !/^(43|4:3)$/i.test(r.env.NFSU2_HUD?.trim() ?? '');
+  solidCars = net && r.env.NFSU2_ROAM === '1' ? r.env.NFSU2_ROAM_COLLIDE !== '0' : null;
+  roamCrews = net && r.env.NFSU2_ROAM === '1' ? crewsOf(r.env.NFSU2_ROAM_CREW ?? '', r.env.NFSU2_ROAM_CREW_RGB ?? '') : null;
+  roamRoom = net && r.env.NFSU2_ROAM === '1' ? r.env.NFSU2_ROAM_ROOM ?? '' : null;
+  crewDraft = ''; popCounts = new Map();
   fatal = null;
   quitAt = null;
   saved = null;
@@ -380,31 +659,57 @@ async function startGame() {
     // session's subsystems keep them (some, like a closed AudioContext, a little
     // longer than the game), and a closure from this function would keep its
     // scope, and with it this game, reachable
+    const ids = net ? await keepPageId() : null;
     session = await GameSession.start({
-      module: loaded!.module, info: loaded!.info, saveDir: SAVE, env: r.env, canvas, stage, audio, displayHz, netName, notice, lobby, netBack, onSaved,
+      module: loaded!.module, info: loaded!.info, saveDir: SAVE, env: r.env, canvas, stage, audio, displayHz, netName, notice, lobby, say, marks,
+      netBack, netQueue, onSaved,
+      netId: ids?.id, netWas: ids?.was, netClaim: net ? await vault.token().catch(() => null) ?? undefined : undefined, netRemoved,
+      netBlock: net && r.env.NFSU2_ROAM === '1' ? blockList(r.env.NFSU2_ROAM_BLOCK ?? '') : undefined,
       artifacts: q.get('artifacts') ?? undefined, dumpScale: q.get('dumpscale') ? +q.get('dumpscale')! : undefined,
-      toggleFullscreen, padPage: PAD_PAGE, log: logLine, onFatal: stopFatal,
+      toggleFullscreen, padPage: PAD_PAGE, log: logLine, onFatal: stopFatal, onOtherBuild: otherBuild,
     });
   } catch (e) {
     log.add(`[app] the game could not start: ${e}`);
     void audio?.close().catch(() => {});
     endStage();
-    setPhase('exited', 'Did not start', `The game could not start: ${e}`);
+    setPhase('exited', T('Did not start'), T('The game could not start: {error}', { error: String(e) }), 'GAME-START');
     $('#log-btn').hidden = $('#report').hidden = false;
     download.resume();
     return;
   }
-  setPhase('playing', 'Playing', '');
+  setPhase('playing', T('Playing'), () => '');
+  if (!offline && !testPage()) seen('play');   // counted for the server's day (page-id.ts)
+  keeper.start(loaded!.info.rev, gameHeld);
+  $('#lastgame').hidden = true;           // about the game before this one
   document.body.dataset.phase = 'playing';
   away = new AwayCheck(session, awayLimits(), awayLine, logLine);
-  touch.start(session);
+  playTime = new PlayTime(session, playTimeLimit(), logLine);
+  // a phone's render scale (device.ts): whether it has room for all its pixels, for its next game
+  if (r.source.NFSU2_RENDER === 'device') renderCheck = new RenderCheck(session, r.env.NFSU2_RENDER, renderCheckTimes(), logLine);
+  touch.start(session, r.env.NFSU2_FF !== '0');   // Rumble off: no tick under a finger either
+  textField.start(session);
+  pauseHint.start(session);
+  driftPanel.start(session);
+  photo.start(session);
+  quickChat.start(session, net && r.env.NFSU2_ROAM === '1' && r.env.NFSU2_ROAM_SAY !== '0',
+    phrasesOf(r.env.NFSU2_ROAM_SAY_PHRASES), groupsOf(r.env.NFSU2_ROAM_SAY_GROUPS));
   fps.memory = session.proc.memory;
   const st = session;
-  const waitStatus = setInterval(() => { if (st.status) { fps.reader = st.status; clearInterval(waitStatus); } }, 100);
+  let tries = 0;
+  const waitStatus = setInterval(() => {
+    if (!st.status) return;
+    if (!fps.reader) { fps.reader = st.status; if (session === st) statusAt = { memory: st.proc.memory, ptr: st.status.ptr }; }
+    if (session === st && radioPort()) {
+      $('.menu-radio').hidden = !canPickMusic();   // the menu may have been opened before the game's status block was known
+      if (radioWasOn()) void theRadio().resume();
+    }
+    if (radioLink || ++tries > 50) clearInterval(waitStatus);
+  }, 100);
   fps.set((r.env.NFSU2_FPS_COUNTER as FpsMode) in { off: 1, on: 1, detailed: 1 } ? r.env.NFSU2_FPS_COUNTER as FpsMode : 'off');
-  const opens = `${cap(menuKey())} opens the menu`;
-  const hint = offlineNote + (fsNote || (full ? (touchFirst() ? `${opens}.` : `${opens}. Hold Esc to leave full screen.`) : `${opens}: full screen, controls, quit.`));
-  if (autosaved.length) toast(`Autosave is now on for ${autosaved.join(', ')}: the game saves by itself (Options, Gameplay, Save). ${hint}`, 9000);
+  const key = cap(menuKey());
+  const hint = offlineNote + (fsNote || (full ? (touchFirst() ? t('{key} opens the menu.', { key }) : t('{key} opens the menu. Hold Esc to leave full screen.', { key }))
+    : t('{key} opens the menu: full screen, controls, quit.', { key })));
+  if (autosaved.length) toast(t('Autosave is now on for {names} (Options, Gameplay, Save). {hint}', { names: listOf(autosaved), hint }), 9000);
   else toast(hint, 6000);
   void st.exited.then(code => { clearInterval(waitStatus); onExit(st, code); });
   // Chrome may keep the sound off until a click or a key press (its autoplay
@@ -412,22 +717,42 @@ async function startGame() {
   setTimeout(() => {
     if (session !== st || !st.audio || st.audio.state() === 'running' || r.env.NOSOUND === '1') return;
     log.add(`[app] the AudioContext is ${st.audio.state()} after Play`);
-    toast(touchFirst() ? 'No sound yet: tap the game to turn it on (a controller button cannot).'
-      : 'No sound yet: click the game or press a key to turn it on (a controller button cannot).', 8000);
+    toast(touchFirst() ? t('No sound yet: tap the game (a controller button can\'t turn it on).')
+      : t('No sound yet: click the game or press a key (a controller button can\'t turn it on).'), 8000);
   }, 3000);
 }
 
 function logLine(s: string) { log.add(s); }
-/** whether the server answered (the start page's /players, or the check at Play): offline mode when not */
-function setReach(ok: boolean) {
-  if (offline === !ok) return;
-  offline = !ok;
-  log.add(ok ? '[app] the server answers again' : '[app] the server does not answer: offline');
-  if (!ok) settings.setStatus('Not connected to the server: free roam and Online need it.');
+/** whether the server answered (the start page's /players, or the check at Play): offline mode when not.  One miss
+ *  after it answered is not offline yet (an answer that was slow, a phone's network gone for a moment): the next
+ *  question decides, 15 s later on the start page, or the check at Play. */
+function setReach(r: Reach) {
+  misses = r === 'ok' ? 0 : misses + 1;
+  if (r === 'ok') answered = true;
+  else if (answered && misses < 2 && r !== 'no-network') { log.add(`[app] the server did not answer once (${REACH_LOG[r]})`); return; }
+  if (r === reach) return;
+  reach = r;
+  offline = r !== 'ok';
+  log.add(offline ? `[app] the server does not answer: offline (${REACH_LOG[r]})` : '[app] the server answers again');
+  if (offline) settings.setStatus(REACH_TEXT[r]);
   evaluate();
+  if (offline) return;
   // the page may have started from offline mode's copies while the server was away (a deploy restarts it)
-  if (ok) void checkNewer();
+  void checkNewer();
+  void vault.start();                 // the cloud saves, when the server did not answer as the page started
+  players?.now();                     // the Online section's line again (offline's, after the check at Play)
 }
+const REACH_LOG: Record<Reach, string> = {
+  ok: '', down: 'a 5xx: the server is down or restarting', unreachable: 'no answer: blocked on the way, or too slow',
+  'no-network': 'the browser says this device has no network',
+};
+/** the Online section's line while offline, by why */
+const REACH_TEXT: Record<Reach, Msg> = {
+  ok: () => '',
+  down: T('The server isn\'t answering: it may be restarting. Checking again every 15 seconds.'),
+  unreachable: T('This device can\'t reach the server. If other sites work, your network may be blocking it: try mobile data or another Wi-Fi, or turn off a VPN, ad blocker or private DNS. Checking again every 15 seconds.'),
+  'no-network': T('No internet connection.'),
+};
 /** Offline mode (sw.ts) keeps the page, its scripts, the module and the list of game files in this browser.  Asked
  *  for once the module has loaded, so a first visit downloads the module once (the copy is the HTTP cache's). */
 function keepForOffline() {
@@ -441,36 +766,72 @@ function serverKind(): string {
   if (h.endsWith('.local') || /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|f[cd]|fe80:)/.test(h)) return 'on the LAN';
   return 'remote';
 }
-/** "Chrome 155 on macOS": enough to tell what ran, nothing more */
-function browserBrief(): string {
-  const ua = navigator.userAgent;
-  const c = /(?:Chrome|Chromium)\/(\d+)/.exec(ua), f = firefoxVersion();
-  const os = /CrOS/.test(ua) ? 'ChromeOS' : /Windows/.test(ua) ? 'Windows' : /Mac OS X|Macintosh/.test(ua) ? 'macOS' : /Android/.test(ua) ? 'Android' : /Linux/.test(ua) ? 'Linux' : 'another system';
-  return `${f !== null ? `Firefox ${f}` : c ? `Chrome ${c[1]}` : 'another browser'} on ${os}`;
-}
-/** a subsystem the game cannot do without failed: the running game is stopped */
-function stopFatal(what: string) {
+/** a subsystem the game cannot do without failed: the running game is stopped (what: English, for t(); code: its name) */
+function stopFatal(what: string, code?: string) {
   const s = session;
   if (!s || s.ended) return;
-  fatal = what;
+  fatal = { what, code };
   log.add(`[app] ${what}: stopping the game`);
   s.terminate();
 }
+/** The renderer is of another build than the game module (game.ts onOtherBuild): this page came from offline mode's
+ *  copies (sw.ts) and the module from the server, or from a server swapping its module.  The game is stopped and the
+ *  page loaded again from the server: once a tab and module, while the server answers; else as any renderer that
+ *  did not start. */
+const OTHER_KEY = 'nfsu2-other-build';
+let reloadAtExit = false;
+function otherBuild(why: string) {
+  const s = session, rev = loaded!.info.rev;
+  if (!s || s.ended) return;
+  let again = true;
+  try { again = sessionStorage.getItem(OTHER_KEY) === rev; if (!again) sessionStorage.setItem(OTHER_KEY, rev); } catch { /* no storage: no reload that could repeat */ }
+  if (again || offline) {
+    log.add(`[app] this page is of another build than game ${rev} (${why}), ${offline ? 'and the server does not answer' : 'after a reload for that too'}`);
+    stopFatal(N('the graphics could not start'), 'GPU-RENDERER');
+    return;
+  }
+  log.add(`[app] this page is of another build than game ${rev} (${why}): stopping the game, then the page again from the server`);
+  reloadAtExit = true;
+  s.terminate();
+}
 
+/** what to do on an iPhone, whose browsers have no full screen for a page */
+const HOME_SCREEN = N('For full screen on iPhone, add this page to the Home Screen (Share menu) and play from its icon.');
 function toggleFullscreen() {
   if (isFullscreen()) exitFullscreen();
-  else void enterFullscreen($('#stage')).then(r => { if (!r.ok) toast('Full screen was not allowed.', 4000); });
+  else if (homeScreenInstead()) toast(t(HOME_SCREEN), 8000);
+  else void enterFullscreen($('#stage')).then(r => { if (!r.ok) toast(t('Full screen was not allowed.'), 4000); });
 }
 
 /** how the page's menu opens here, for the hints: F9, the ☰ button on a touch screen, Home on a controller */
 function menuKey(): string {
-  return (touchFirst() ? 'the ☰ button' : 'F9') + (padSeen() ? ' or Home on the controller' : '');
+  if (touchFirst()) return padSeen() ? t('the ☰ button or Home on the controller') : t('the ☰ button');
+  return padSeen() ? t('F9 or Home on the controller') : 'F9';
 }
 /** "the menu (F9)", with what opens it here */
 function menuName(): string {
-  return `the menu (${touchFirst() ? '☰' : 'F9'}${padSeen() ? ', or Home on the controller' : ''})`;
+  const key = touchFirst() ? '☰' : 'F9';
+  return padSeen() ? t('the menu ({key}, or Home on the controller)', { key }) : t('the menu ({key})', { key });
 }
 const cap = (s: string) => s[0].toUpperCase() + s.slice(1);
+
+/** The page in the game's language (settings.ini language, the page address's on a development server): English until
+ *  the player picks another, in Settings or in the list at the top.  A tab that does not own the saves follows the file. */
+function applyLanguage() {
+  void setLanguage(language(resolveEnv(settingsText ?? settings.text, ENVIRONMENT, {}, DEVICE)), logLine);
+  syncPicker();
+}
+/** the list at the top shows the language the file asks for (disabled where another tab owns the saves) */
+function syncPicker() {
+  const pick = $<HTMLSelectElement>('#lang-pick');
+  pick.value = language(resolveEnv(settingsText ?? settings.text, ENVIRONMENT, {}, DEVICE));
+  pick.disabled = !instance.owner;
+  // as wide as the name shown (CSS field-sizing where the browser has it; Firefox measures it here)
+  if (!CSS.supports?.('field-sizing', 'content')) {
+    const g = document.createElement('canvas').getContext('2d'), cs = getComputedStyle(pick);
+    if (g) { g.font = cs.font; pick.style.width = `${Math.ceil(g.measureText(pick.selectedOptions[0]?.textContent ?? '').width) + 80}px`; }
+  }
+}
 
 /** the controller's share of the page while a game runs (gamepad.ts): Home, or both sticks pressed in, opens or
  *  closes the menu (not over another dialog), and an open dialog of the page takes the controller (padnav.ts) */
@@ -484,20 +845,37 @@ const PAD_PAGE: PadPage = {
   },
   dialog: () => !!pageDialog(),
   press: padPress,
+  stick: (x, y) => quickChat.stick(x, y),
+  capture: (s, pressed) => photo.pad(s, pressed),
 };
 
 let awake: (() => void) | null = null;   // the running game's Wake Lock (display.ts keepScreenOn)
 let touch: TouchControls;                // the controls on the game while a finger drives (touch.ts)
+let textField: TextField;               // the field for a phone's keyboard while the game asks for text (textentry.ts)
+let pauseHint: PauseHint;               // the line to the page's menu under the game's pause menu (pausehint.ts)
+let driftPanel: DriftPanel;             // free roam's drift mode: its score under the game's Bank panel, a note at F2 (drift.ts)
+let photo: PhotoMode;                   // photo mode: F12 in the world, its panel and its keys (photo.ts)
 
 function endStage() {
   touch.stop();
+  textField.stop();
+  pauseHint.stop();
+  driftPanel.stop();
+  photo.stop();
+  quickChat.stop();
   awake?.(); awake = null;
   away?.stop(); away = null;
+  playTime?.stop(); playTime = null;
+  hideRemoved();
+  renderCheck?.stop(); renderCheck = null;
+  Object.assign(DEVICE, deviceDefaults());      // its verdict, for the next game without a reload
   exitFullscreen();
   untrack?.(); untrack = null;
   fps.stop(); fps.reader = null; fps.memory = null;
+  radio?.stop('the game closed');
+  radioLink = null; statusAt = null;
   lobbyPanel.clear();
-  const menu = $<HTMLDialogElement>('#menu'); if (menu.open) menu.close();
+  for (const id of ['#crews-pop', '#menu']) { const d = $<HTMLDialogElement>(id); if (d.open) d.close(); }
   // a Quit question still open belongs to the game that ended (its answer would
   // do nothing, and the open question would keep that game reachable)
   const ask = $<HTMLDialogElement>('#confirm'); if (ask.open && ask.dataset.about === 'quit') ask.close();
@@ -510,6 +888,7 @@ function onExit(s: GameSession, code: number) {
   if (session !== s) return;
   const seconds = (performance.now() - s.started) / 1000;
   log.add(`[app] the game exited with code ${code} after ${seconds.toFixed(1)} s`);
+  keeper.end(code, fatal?.code ?? 'exit');
   s.terminate();
   session = null;
   quitAt = null;
@@ -517,23 +896,30 @@ function onExit(s: GameSession, code: number) {
   endStage();
   players?.now();
   download.resume();
+  if (reloadAtExit) { reloadAtExit = false; setPhase('boot', T('Loading'), T('Loading the game.')); void reloadFromServer(); return; }
   $('#log-btn').hidden = false;
   // a crash, or a game stopped for want of a subsystem: where to send the log (not a normal close or a Stop)
   $('#report').hidden = !fatal && (code === 0 || code === -1);
-  const mins = seconds >= 120 ? `${Math.floor(seconds / 60)} min` : `${seconds.toFixed(0)} s`;
-  if (fatal) setPhase('exited', 'Did not start', `The game was stopped: ${fatal}. Download the log to see why; ` +
-    (firefoxVersion() !== null ? 'about:support, Graphics, shows what Firefox thinks of the graphics.' : 'chrome://gpu shows what Chrome thinks of the graphics.'));
+  const mins = () => seconds >= 120 ? t('{n} min', { n: Math.floor(seconds / 60) }) : t('{n} s', { n: seconds.toFixed(0) });
+  const f = fatal;
+  gpuGone = f?.code === 'GPU-LOST';
+  // the graphics lost on the way: a reload starts them again (Safari: only a reload), at Play
+  if (gpuGone) setPhase('exited', T('Stopped'), () => t('The game was stopped: {what}. Play reloads the page; then press Play again. Your saves and settings stay.',
+    { what: t(f!.what) }) + ' ' + t('Download the log first if you want to keep it: the reload clears it.'), f!.code);
+  // the graphics: a restart of the browser, then a newer driver (where to send the log is under it)
+  else if (f) setPhase('exited', s.renderer ? T('Stopped') : T('Did not start'), () => t('The game was stopped: {what}. Restart {browser}, then press Play. If it happens again, update the graphics driver.',
+    { what: t(f.what), browser: t(browserName()) }), f.code);
   else {
-    const base = code === 0 ? `The game closed normally after ${mins}.` : code === -1 ? `The game was stopped after ${mins}.`
-      : `The game stopped with error code ${code} after ${mins}.`;
+    const base = () => code === 0 ? t('The game closed normally after {time}.', { time: mins() }) : code === -1 ? t('The game was stopped after {time}.', { time: mins() })
+      : t('The game stopped with error code {code} after {time}.', { code, time: mins() });
     // what is kept: the game's last profile save, never a claim it did not make
     const sv = saved;
-    setPhase('exited', code === 0 ? 'See you' : 'Stopped', !sv ? base : code === 0 ? `${base} Progress saved in this browser at ${when(sv.at)} (${sv.name}).`
-      : `${base} Your progress up to the last save, at ${when(sv.at)} (${sv.name}), is kept.`);
+    setPhase('exited', code === 0 ? T('See you') : T('Stopped'), !sv ? base : code === 0 ? () => t('{base} Progress saved in this browser at {when} ({name}).', { base: base(), when: when(sv.at), name: sv.name })
+      : () => t('{base} Your progress up to the last save, at {when} ({name}), is kept.', { base: base(), when: when(sv.at), name: sv.name }));
+    const seq = subSeq;
     if (!sv) void newestProfile().then(p => {
-      const sub = $('#status-sub');
-      if (phase === 'exited' && !session && sub.textContent === base)
-        sub.textContent = `${base} ${p ? `Nothing was saved during this game; the last save is from ${when(p.mtime)} (${p.name}).` : 'No profile is saved in this browser yet.'}`;
+      if (phase === 'exited' && !session && subSeq === seq)
+        setSub(() => `${base()} ${p ? t('Nothing was saved during this game; the last save is from {when} ({name}).', { when: when(p.mtime), name: p.name }) : t('No profile is saved in this browser yet.')}`);
     });
   }
   void saves.refresh();               // new or changed profiles
@@ -548,31 +934,39 @@ function onSaved(path: string) {
   if (p.length !== 3 || p[0] !== PROFILES_DIR || p[2].toLowerCase() !== p[1].toLowerCase()) return;
   saved = { name: p[1], at: Date.now(), count: (saved?.count ?? 0) + 1 };
   log.add(`[app] the game saved profile ${p[1]} (${saved.count} this game)`);
-  if (session) toast(`Progress saved (${p[1]}).`, 2500);
+  if (session) toast(t('Progress saved ({name}).', { name: p[1] }), 2500);
   vault.saved();
-  if ($<HTMLDialogElement>('#menu').open) $('#menu-save').textContent = `Last saved at ${when(saved.at)} (${saved.name}).`;
+  if ($<HTMLDialogElement>('#menu').open) $('#menu-save').textContent = t('Last saved at {when} ({name}).', { when: when(saved.at), name: saved.name });
 }
 /** the newest profile in this browser (listProfiles sorts by time), or null */
 async function newestProfile() { return (await listProfiles(SAVE).catch(() => []))[0] ?? null; }
 /** a save's time: the clock today, the day too before today */
-function when(t: number): string {
-  const d = new Date(t), time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  return d.toDateString() === new Date().toDateString() ? time : `${d.toLocaleDateString([], { day: 'numeric', month: 'short' })}, ${time}`;
+function when(at: number): string {
+  const d = new Date(at), time = d.toLocaleTimeString(dateLocale(), { hour: '2-digit', minute: '2-digit' });
+  return d.toDateString() === new Date().toDateString() ? time : `${d.toLocaleDateString(dateLocale(), { day: 'numeric', month: 'short' })}, ${time}`;
 }
 
-/** a short message at the bottom of the start page (a status region: read out too) */
+/** a short message at the bottom of the start page (a status region: read out too); a Msg is drawn again in the
+ *  page's language when that changes (a message about the change itself) */
 let pageToastTimer: ReturnType<typeof setTimeout> | undefined;
-function pageToast(msg: string) {
-  const t = $('#page-toast');
-  t.textContent = msg;
+function pageToast(msg: string | Msg) {
+  const el = $('#page-toast');
+  live(el, typeof msg === 'string' ? () => msg : msg);
   clearTimeout(pageToastTimer);
-  pageToastTimer = setTimeout(() => { t.textContent = ''; }, 5000);
+  pageToastTimer = setTimeout(() => live(el, () => ''), 5000);
 }
 
-/** the controls sheet of the start page, in a dialog (F9, Controls, while the game runs) */
-function openHelp() {
+/** the controls sheet of the start page, in a dialog (F9, Controls, while the game runs), at the page's tab (or the
+ *  one asked for: the touch controls' steering button held opens the touch settings) and button names */
+let keySheet: ControlsSheet, helpSheet: ControlsSheet | null = null;
+function openHelp(tab?: Tab) {
   const body = $('#help-body');
-  if (!body.firstChild) body.append(...[...$('#keys').childNodes].map(n => n.cloneNode(true)));
+  if (!helpSheet) {
+    body.append(...[...$('#keys').childNodes].map(n => n.cloneNode(true)));
+    helpSheet = controlsSheet(body, 'help');
+  }
+  helpSheet.show(tab ?? keySheet.tab);
+  helpSheet.family(keySheet.fam);
   $<HTMLDialogElement>('#help').showModal();
 }
 
@@ -581,15 +975,33 @@ function openHelp() {
  *  on the server they came too often */
 const FRIEND_NOTICES = false;
 function notice(text: string, who?: string) {
+  privacy.name(who, 'player');
   log.add(`[notice] ${text}`);
   if (who && !FRIEND_NOTICES) return;
   const box = $('#notices'), line = document.createElement('div');
   if (who && text.startsWith(who)) { const b = document.createElement('b'); b.textContent = who; line.append(b, text.slice(who.length)); }
-  else line.textContent = text;
+  else line.textContent = t(text);                 // the page's own (net/index.ts), English in the log
   placeNotices();
   box.append(line);
   while (box.childElementCount > 4) box.firstElementChild!.remove();
   setTimeout(() => line.remove(), 5000);
+}
+/** free roam: quick chat (quickchat.ts), a phrase said, from the game; and the lines over the cars in each frame */
+function say(json: string) {
+  placeNotices();
+  quickChat.said(json);
+}
+function marks(n: number, m: Float32Array, ids: Uint32Array) { quickChat.marks(n, m, ids); }
+/** quick chat's line in the log: a speech balloon, the name, the phrase; in the notices' box, for 8 s */
+function chatLine(name: string, text: string, me: boolean) {
+  const box = $('#notices'), line = document.createElement('div'), b = document.createElement('b');
+  line.className = 'chat' + (me ? ' me' : '');
+  line.innerHTML = CHAT_ICON;
+  b.textContent = name;
+  line.append(b, ` ${text}`);
+  box.append(line);
+  while (box.childElementCount > 4) box.firstElementChild!.remove();
+  setTimeout(() => line.remove(), 8000);
 }
 /** free roam: the race lobby's panel, or the cover over the trip to the race and back (lobby.ts) */
 function lobby(json: string) {
@@ -610,12 +1022,46 @@ function placeNotices() {
   if (!v || !v.w || !v.h) return;
   const u = Math.min(v.w / 640, v.h / 480), e169 = 320 * (16 / 9 * 0.75 - 1);
   const out = hudWide ? Math.min(Math.max(320 * (v.w / v.h * 0.75 - 1), 0), e169) * 109 / e169 : 0;
-  const s = $('#notices').style;
-  s.left = `${v.x + v.w / 2 - (301 + out) * u}px`;
-  s.top = `${v.y + v.h / 2 - 72 * u}px`;
+  const s = $('#notices').style, left = v.x + v.w / 2 - (301 + out) * u, top = v.y + v.h / 2 - 72 * u;
+  s.left = `${left}px`;
+  s.top = `${top}px`;
   s.setProperty('--u', `${u}px`);
+  quickChat.place(left, top, u);               // its picker opens there
 }
 
+/** a full server: the game's place in line for one, over the game until it is in (null: not in line); the page menu
+ *  offers to stop waiting meanwhile */
+let inLine = false;
+function netQueue(q: NetQueue | null) {
+  inLine = q !== null;
+  $<HTMLButtonElement>('#menu [data-act="offline"]').hidden = !inLine;
+  const t = $('#queue');
+  t.hidden = q === null;
+  t.textContent = q ? queueText(q) : '';
+}
+/** the operator removed the player from playing with others (net/index.ts: a kick or a ban): why, over the game, until
+ *  the player plays on (an input REMOVED_MS after it came up) */
+const REMOVED_MS = 8000;
+let removedTimer: ReturnType<typeof setInterval> | null = null;
+function netRemoved(r: NetRemoved) {
+  const why = r.msg ? `: ${r.msg}${/[.!?]$/.test(r.msg) ? '' : '.'}` : '.';
+  const head = !r.ban ? 'You were removed from playing with others'
+    : r.until ? `You can't play with others until ${new Date(r.until).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}`
+    : "You can't play with others any more";
+  const t = $('#removed');
+  t.textContent = `${head}${why} You can keep playing on your own.`;
+  t.hidden = false;
+  const from = performance.now() + REMOVED_MS;
+  if (removedTimer) clearInterval(removedTimer);
+  removedTimer = setInterval(() => {
+    const last = session?.input?.lastInput?.() ?? null;
+    if (last !== null && last > from) hideRemoved();
+  }, 500);
+}
+function hideRemoved() {
+  if (removedTimer) { clearInterval(removedTimer); removedTimer = null; }
+  $('#removed').hidden = true;
+}
 /** the away check's message over the game (away.ts), null: none */
 function awayLine(text: string | null) {
   const t = $('#away');
@@ -628,6 +1074,18 @@ function awayLimits(): AwayLimits {
   const ms = (s: number, d: number) => Number.isFinite(s) && s > 0 ? s * 1000 : d;
   return { inputMs: ms(inputS, AWAY_LIMITS.inputMs), hiddenMs: ms(hiddenS, AWAY_LIMITS.hiddenMs), warnMs: ms(warnS, AWAY_LIMITS.warnMs) };
 }
+/** the play before our message on the game's phone (playtime.ts); a test page's address may give it in seconds
+ *  (playtime=seconds) */
+function playTimeLimit(): number {
+  const s = Number(q.get('playtime'));
+  return Number.isFinite(s) && s > 0 ? s * 1000 : SMS_AFTER_MS;
+}
+/** the render check's times; a test page's address may give them in seconds of driving (rendercheck=warmup,verdict) */
+function renderCheckTimes(): RenderCheckTimes {
+  const [warmS, decideS] = (q.get('rendercheck') ?? '').split(',').map(Number);
+  const ms = (s: number, d: number) => Number.isFinite(s) && s > 0 ? s * 1000 : d;
+  return { warmupMs: ms(warmS, RENDER_CHECK_TIMES.warmupMs), decideMs: ms(decideS, RENDER_CHECK_TIMES.decideMs) };
+}
 
 function toast(msg: string, ms: number) {
   const t = $('#toast');
@@ -636,39 +1094,292 @@ function toast(msg: string, ms: number) {
   (toast as any).timer = setTimeout(() => { t.hidden = true; }, ms);
 }
 
-/** F12: the next frame the renderer draws, as a PNG beside the saves (Saves on the start page shows it) */
+/** F12 (photo.ts: photo mode's picture, or where it cannot open): the next frame the renderer draws, as a PNG beside the
+ *  saves (Saves on the start page shows it) */
 async function screenshot() {
   const r = session?.renderer;
-  if (!r?.dump) { toast('No screenshot: the picture is not there yet.', 2500); return; }
+  if (!r?.dump) { toast(t('No screenshot: nothing on screen yet.'), 2500); return; }
   try {
     const png = await r.dump('screenshot');
     if (!png.size) throw new Error('the game ended first');
     const name = await saveScreenshot(SAVE, png);
     log.add(`[app] screenshot ${name}, ${fmtBytes(png.size)}`);
-    toast('Screenshot saved: Saves on the start page shows it.', 2500);
+    toast(t('Screenshot saved (see Saves on the start page).'), 2500);
   } catch (e) {
     log.add(`[app] the screenshot failed: ${e}`);
-    toast(`The screenshot failed: ${e instanceof Error ? e.message : e}`, 4000);
+    toast(t('The screenshot failed: {error}', { error: e instanceof Error ? e.message : String(e) }), 4000);
   }
 }
 
 // ----------------------------------------------------------- page menu --
 function openMenu() {
   const m = $<HTMLDialogElement>('#menu');
-  if (m.open) { m.close(); return; }
-  m.querySelector<HTMLButtonElement>('[data-act="fullscreen"]')!.textContent = isFullscreen() ? 'Leave full screen' : 'Full screen';
-  m.querySelector<HTMLButtonElement>('[data-act="fps"]')!.textContent = `Frame-rate counter: ${fps.mode}`;
+  if (m.open) { $<HTMLDialogElement>('#playlist').close(); m.close(); return; }                // (its Crews popup too: the menu's close)
+  const fsButton = m.querySelector<HTMLButtonElement>('[data-act="fullscreen"]')!;
+  fsButton.textContent = isFullscreen() ? t('Leave full screen') : t('Full screen');
+  fsButton.hidden = !canFullscreen() && fromHomeScreen();         // from an iPhone's Home Screen: already without bars
+  m.querySelector<HTMLButtonElement>('[data-act="fps"]')!.textContent = fpsLabel(fps.mode);
+  const solid = m.querySelector<HTMLButtonElement>('[data-act="solid"]')!;
+  solid.hidden = solidCars === null || !session?.net?.solid;
+  solid.textContent = ghostLabel();
+  const crews = m.querySelector<HTMLButtonElement>('[data-act="crews"]')!;
+  crews.hidden = roamCrews === null || !session?.net?.crews;
+  crews.textContent = crewsLabel();
   m.querySelector<HTMLButtonElement>('[data-act="quit"]')!.textContent = quitLabel();
+  showRadio(m);
   const line = $('#menu-save');
-  if (saved) line.textContent = `Last saved at ${when(saved.at)} (${saved.name}).`;
+  if (saved) line.textContent = t('Last saved at {when} ({name}).', { when: when(saved.at), name: saved.name });
   else {
-    line.textContent = 'Nothing saved during this game yet.';
+    line.textContent = t('Nothing saved during this game yet.');
     void newestProfile().then(p => {
-      if (!saved && m.open) line.textContent = p ? `Nothing saved during this game yet. Last save: ${when(p.mtime)} (${p.name}).` : 'No profile is saved in this browser yet.';
+      if (!saved && m.open) line.textContent = p ? t('Nothing saved during this game yet. Last save: {when} ({name}).', { when: when(p.mtime), name: p.name }) : t('No profile is saved in this browser yet.');
     });
   }
   $('#stage').classList.add('cursor');
   m.showModal();
+}
+/** the menu's frame-rate counter and Ghost mode buttons, with what they are at now */
+const fpsLabel = (mode: string) => t('Frame-rate counter: {mode}', { mode: t(mode === 'on' ? N('on') : mode === 'detailed' ? N('detailed') : N('off')) });
+const ghostLabel = () => solidCars ? t('Ghost mode: off') : t('Ghost mode: on');
+const crewsLabel = () => roamCrews?.length ? t('Crews: {n}', { n: roamCrews.length }) : t('Crews: none');
+/** The menu's Crews popup (free roam only), over the menu: the Crews row's control, which changes the game's crews at
+ *  once.  Done, Esc or a controller's B closes it, back to the menu on its Crews button; an Esc in a crew's palette
+ *  closes only the palette. */
+function openCrews() {
+  const pop = $<HTMLDialogElement>('#crews-pop');
+  if (roamCrews === null || !session?.net?.crews || pop.open) return;
+  drawPopCrews();
+  pop.showModal();
+  ($('#crews-pop-box').querySelector<HTMLElement>('input:enabled') ?? $('#crews-pop-box').querySelector<HTMLElement>('.crew-dot'))?.focus();
+  void askPopCounts();
+}
+/** The popup's counts, asked of the server once (the page does not ask while a game runs), after ms: a Join reaches
+ *  the server's hub with the game's next HELLO.  As the server counts them: the player too, once in free roam in that
+ *  crew.  Shown while the popup is open; the newest question's only. */
+async function askPopCounts(ms = 0) {
+  const n = ++popAsk;
+  if (ms) await new Promise(r => setTimeout(r, ms));
+  if (n !== popAsk || offline || !roamCrews?.length) return;
+  const counts = await askCrews(roamCrews.map(c => roomHash(c.name)), 5000);
+  if (!counts || n !== popAsk) return;
+  popCounts = counts;
+  if ($<HTMLDialogElement>('#crews-pop').open) showCrewCounts($('#crews-pop-box'), counts);
+}
+/** the popup's control, drawn again after each change; focus: where the keyboard (or controller) goes then, if it was
+ *  in there */
+function drawPopCrews(focus?: (root: HTMLElement) => Element | null | undefined) {
+  const box = $('#crews-pop-box'), had = box.contains(document.activeElement);
+  box.replaceChildren();
+  crewControl({ list: roamCrews ?? [], id: 'crews-pop-input', labelId: 'crews-pop-title', placeholder: N('Crew name'), counts: popCounts, draft: crewDraft,
+    onDraft: v => { crewDraft = v; }, change: (list, f) => void menuCrews(list, f),
+    // with the room the game is in (crew-mates meet within one room); what the copy did goes in the popup's note
+    link: name => inviteLink(location.origin, { crew: name, room: roamRoom ?? '' }) }, box).setAttribute('aria-labelledby', 'crews-pop-title');
+  if (had && focus) ((focus(box) ?? box.querySelector('input:enabled')) as HTMLElement | null)?.focus({ focusVisible: true } as FocusOptions);
+}
+/** a Leave, Join or colour in the popup: the game takes the crews and their colours at once (its HELLO again to the
+ *  hub), and settings.ini keeps them for the next game, as Settings, Online, Crews would */
+async function menuCrews(list: Crew[], focus: (root: HTMLElement) => Element | null | undefined) {
+  if (roamCrews === null || !session?.net?.crews) return;
+  roamCrews = list;
+  session.net.crews(list.map(c => roomHash(c.name)), rgbWords(list));
+  drawPopCrews(focus);
+  void askPopCounts(1500);
+  $('#menu [data-act="crews"]').textContent = crewsLabel();
+  let text = putKey(settingsText ?? TEMPLATE, 'roam_crew', list.length ? crewsValue(list.map(c => c.name)) : null).text;
+  text = putKey(text, 'roam_crew_colours', list.length ? rgbsValue(list) : null).text;
+  try { await writeFile(SAVE, 'settings.ini', text); settingsText = text; void settings.refresh(); }
+  catch (e) { log.add(`[app] settings.ini not written: ${e}`); }
+  log.add(`[app] crews: ${list.length ? list.map(c => `${c.name} (${c.rgb})`).join(', ') : 'none'} (the page menu)`);
+}
+
+// --------------------------------------------------------- invite links --
+// A link's room or crew (invite.ts), offered to the player and joined only on Join.  The tab that owns the saves joins
+// it: in settings.ini for the next Play, and with a game in free roam in that game at once (a crew as the menu's
+// Crews joins one, a room through net setRoom).  A tab that does not own them (the link
+// opened a new tab while the game runs in another) asks that one to over INVITE_CHANNEL and says what it did; when it
+// does not answer (a page of before), this tab joins once it owns the saves.
+type Joined = 'live' | 'next' | 'full' | 'none';
+const INVITE_CHANNEL = `nfsu2-invite:${SAVE}`;
+/** the room, free roam and the crews as a settings.ini has them */
+interface InviteNow { room: string; roam: boolean; crews: Crew[] }
+function inviteNow(text: string | null): InviteNow {
+  const e = resolveEnv(text, {}, {}, DEVICE).env;
+  return { room: e.NFSU2_ROAM_ROOM ?? '', roam: e.NFSU2_ROAM === '1', crews: crewsOf(e.NFSU2_ROAM_CREW ?? '', e.NFSU2_ROAM_CREW_RGB ?? '') };
+}
+/** what inv changes there: the room, a crew it is not in yet (full: with 4 already), free roam off to on; and game:
+ *  the running game's free roam is not in them yet (a Room changed on the page during the game: the file has it) */
+function inviteDiff(inv: Invite, now: InviteNow) {
+  const crew = !!inv.crew && !now.crews.some(c => sameName(c.name, inv.crew!));
+  const game = !!session && roamCrews !== null && ((inv.room !== undefined && !sameName(inv.room, roamRoom ?? ''))
+    || (!!inv.crew && !roamCrews.some(c => sameName(c.name, inv.crew!))));
+  return { room: inv.room !== undefined && !sameName(inv.room, now.room), crew, roam: !now.roam, full: crew && now.crews.length >= CREW_MAX, game };
+}
+/** inv changes nothing: the file and the running game have it all */
+const inviteNone = (d: ReturnType<typeof inviteDiff>) => !d.room && !d.crew && !d.roam && !d.game;
+/** a line for the player: over the game while one runs, else on the page */
+const tell = (msg: string) => session ? toast(msg, 6000) : pageToast(msg);
+const JOINED_NOW = N('Your game switches to it now.'), JOINED_NEXT = N('Applies the next time you press Play.');
+const CREWS_FULL = N('You are in 4 crews already: leave one under Online, Crews, then open the link again.');
+function joinedText(how: Joined): string {
+  if (how === 'full') return t(CREWS_FULL);
+  return how === 'none' ? t('Joined.') : `${t('Joined.')} ${t(how === 'live' ? JOINED_NOW : JOINED_NEXT)}`;
+}
+/** whether the running game takes inv at once: it runs free roam (whatever the file says now) */
+function inviteLive(): boolean {
+  return !!session && roamCrews !== null;
+}
+
+/** Join inv here (this tab owns the saves): settings.ini, then the running game where it can. */
+async function applyInvite(inv: Invite): Promise<Joined> {
+  const was = await readText(SAVE, 'settings.ini').catch(() => null) ?? settingsText ?? TEMPLATE;
+  const now = inviteNow(was), d = inviteDiff(inv, now);
+  if (d.full) return 'full';
+  if (inviteNone(d)) return 'none';
+  let text = was, crews = now.crews;
+  if (d.roam) text = putKey(text, 'roam', 'on').text;
+  if (d.room) text = putKey(text, 'roam_room', inv.room || null).text;
+  if (d.crew) {
+    crews = [...crews, { name: inv.crew!, rgb: freeColour(crews) }];
+    text = putKey(text, 'roam_crew', crewsValue(crews.map(c => c.name))).text;
+    text = putKey(text, 'roam_crew_colours', rgbsValue(crews)).text;
+  }
+  if (text !== was) {
+    await writeFile(SAVE, 'settings.ini', text);
+    settingsText = text; void settings.refresh(); players?.now(); vault?.changed();
+  }
+  // (the names, for the log as it leaves the browser: privacy.ts)
+  privacy.name(inv.room, 'room'); if (inv.crew) privacy.name(inv.crew, 'crew');
+  const live = inviteLive();
+  if (live && session?.net && roamCrews && inv.crew && !roamCrews.some(c => sameName(c.name, inv.crew!)) && roamCrews.length < CREW_MAX) {
+    roamCrews = [...roamCrews, { name: inv.crew, rgb: freeColour(roamCrews) }];
+    session.net.crews?.(roamCrews.map(c => roomHash(c.name)), rgbWords(roamCrews));
+  }
+  if (live && inv.room !== undefined && !sameName(inv.room, roamRoom ?? '') && session?.net?.room?.(roomText(inv.room))) roamRoom = inv.room;
+  log.add(`[app] invite link: joined${d.room ? ` room "${inv.room}"` : ''}${d.crew ? ` crew "${inv.crew}"` : ''}${d.roam ? ', free roam on' : ''}` +
+    ` (${live ? 'the game takes it now' : 'from the next Play'})`);
+  return live ? 'live' : 'next';
+}
+
+/** Join inv in the tab that owns the saves; null: no answer within 3 s (no such tab, or a page of before). */
+function relayInvite(inv: Invite): Promise<Joined | null> {
+  return new Promise(res => {
+    const ch = new BroadcastChannel(INVITE_CHANNEL), id = crypto.randomUUID();
+    const done = (v: Joined | null) => { clearTimeout(timer); ch.close(); res(v); };
+    const timer = setTimeout(() => done(null), 3000);
+    ch.onmessage = e => { if (e.data?.t === 'joined' && e.data.id === id) done(e.data.how as Joined); };
+    ch.postMessage({ t: 'join', id, inv });
+  });
+}
+/** The owner's side of relayInvite: a join another tab of this browser asked for (its player said Join there). */
+function hearInvites() {
+  const ch = new BroadcastChannel(INVITE_CHANNEL);
+  ch.onmessage = async e => {
+    const m = e.data;
+    if (m?.t !== 'join' || typeof m.id !== 'string' || !instance.owner) return;
+    const inv: Invite = {};
+    if (typeof m.inv?.room === 'string') inv.room = m.inv.room;
+    if (typeof m.inv?.crew === 'string') inv.crew = m.inv.crew;
+    if ((!inv.room && !inv.crew) || !checkInvite(inv).ok) return;
+    const how = await applyInvite(inv);
+    ch.postMessage({ t: 'joined', id: m.id, how });
+    tell(joinedText(how));
+  };
+}
+
+/** An invite link opened (the page's address, or a new one pasted while it is open): the question, then the join. */
+async function offerInvite(inv: Invite) {
+  // once this tab knows whether it owns the saves, has read them, and shows no other question
+  await Promise.race([instance.whenOwner, new Promise(r => setTimeout(r, 500))]);
+  if (instance.owner && settingsText === null) await loadSettings().catch(() => null);
+  while (document.querySelector('dialog[open]')) await new Promise(r => setTimeout(r, 500));
+  const ok = checkInvite(inv);
+  if (!ok.ok) {
+    log.add(`[app] invite link refused: ${ok.why}`);
+    tell(t('This invite link cannot be used: {why}.', { why: tvars(ok.why, ok.v).replace(/[.。]$/, '') }));
+    return;
+  }
+  const owner = instance.owner;
+  const now = inviteNow(owner ? settingsText : await readText(SAVE, 'settings.ini').catch(() => null)), d = inviteDiff(inv, now);
+  const v = { room: inv.room ?? '', crew: inv.crew ?? '', old: now.room };
+  // (as the player's own settings spell it)
+  if (inviteNone(d)) {
+    tell(inv.crew ? t('You are in crew "{crew}" already.', { crew: now.crews.find(c => sameName(c.name, inv.crew!))?.name ?? inv.crew })
+      : t('You are in room "{room}" already.', { room: now.room || inv.room! }));
+    return;
+  }
+  const title = !inv.crew ? t('Join room "{room}"?', v) : inv.room ? t('Join crew "{crew}" in room "{room}"?', v) : t('Join crew "{crew}"?', v);
+  const body = document.createElement('div');
+  const p = (text: string, cls = '') => { body.append(Object.assign(document.createElement('p'), { textContent: text, className: cls })); };
+  if (d.full) { p(t(CREWS_FULL)); await choiceBox(title, body, t('OK'), ''); return; }
+  if (inv.room) p(t('Free roam then shows only the players in room "{room}".', v) + (d.room && now.room ? ' ' + t('You leave room "{old}".', v) : ''));
+  else if (d.room) p(t('You leave room "{old}", so free roam shows everyone again.', v));
+  if (inv.crew) p(t('Crew-mates always see each other in free roam, with names and map arrows in the crew\'s colour.'));
+  if (d.roam) p(t('This turns on Free roam with others: everyone on this server sees your name, and whether you\'re driving or in the menus.'));
+  p(!owner ? t('The game is open in another tab of this browser: it joins there.') : t(inviteLive() ? JOINED_NOW : JOINED_NEXT), 'hint');
+  if (session) $('#stage').classList.add('cursor');
+  const yes = await confirmBox(title, body, t('Join'), false, '', t('Not now'));
+  if (session && !$<HTMLDialogElement>('#menu').open) { $('#stage').classList.remove('cursor'); $('#stage').querySelector('canvas')?.focus(); }
+  if (!yes) { log.add('[app] invite link: not now'); return; }
+  if (instance.owner) { tell(joinedText(await applyInvite(inv))); return; }
+  const how = await relayInvite(inv);
+  if (how) { tell(how === 'full' || how === 'none' ? joinedText(how) : `${t('Joined in the other tab.')} ${t(how === 'live' ? JOINED_NOW : JOINED_NEXT)}`); return; }
+  tell(t('The other tab did not answer. Close it: this tab joins when it takes over.'));
+  void instance.whenOwner.then(async () => { await loadSettings().catch(() => null); tell(joinedText(await applyInvite(inv))); });
+}
+/** the invite in the page's address, if any, taken out of it (a reload does not ask again), and offered */
+function takeInvite() {
+  const inv = readInvite(location.hash);
+  if (!inv) return;
+  history.replaceState(history.state, '', location.pathname + location.search);
+  void offerInvite(inv);
+}
+
+function showRadio(m: HTMLElement) {
+  const button = m.querySelector<HTMLButtonElement>('[data-act="radio"]')!, on = radio?.on ?? false;
+  m.querySelector<HTMLElement>('.menu-radio')!.hidden = !radioPort() || !canPickMusic();    // a game without the radio's words (an older build) has no Radio row
+  button.classList.toggle('selected', on);
+  button.setAttribute('aria-pressed', String(on));
+  $('#radio-label').textContent = t('Radio: {mode}', { mode: on ? t(N('on')) : t(N('off')) }) + (radio?.folder ? ` · ${radio.folder}` : '');
+}
+async function radioClick(act: 'radio' | 'radio-folder') {
+  const r = theRadio();
+  try { await (act === 'radio-folder' ? r.chooseFolder(pickMusic) : r.on ? r.turnOff() : r.turnOn(pickMusic)); } catch (e) { log.add(`[radio] ${act}: ${e}`); }
+}
+const MODE_WORDS: Record<Mode, string> = { menu: N('Menu'), racing: N('Race'), all: N('All'), off: N('Off') };
+/** The Playlist window lists the folder's tracks with their modes; drawn once for a folder, one change listener for all rows. */
+let playlistDrawn: readonly string[] | null = null;
+function openPlaylist() {
+  const body = $('#playlist-body'), paths = radio?.trackPaths ?? [], make = (tag: string, props: object) => Object.assign(document.createElement(tag), props);
+  if (playlistDrawn !== paths) {
+    playlistDrawn = paths;
+    const rows = document.createDocumentFragment();
+    let folder = '';
+    paths.forEach((name, i) => {
+      const at = name.lastIndexOf('/'), dir = name.slice(0, Math.max(0, at));
+      if (dir !== folder) rows.append(make('div', { className: 'track-folder', textContent: folder = dir }));
+      const seg = make('div', { className: 'seg' });
+      seg.setAttribute('role', 'radiogroup'); seg.setAttribute('aria-label', name);
+      for (const m of MODES) {
+        const opt = make('label', { className: 'opt' }), input = make('input', { type: 'radio', name: `mode${i}`, value: m, checked: radio?.mode(name) === m });
+        input.dataset.track = String(i);
+        opt.append(input, t(MODE_WORDS[m]));
+        seg.append(opt);
+      }
+      const row = make('div', { className: 'track' });
+      row.append(make('span', { textContent: name.slice(at + 1), title: name }), seg);
+      rows.append(row);
+    });
+    body.replaceChildren(rows);
+    if (!paths.length) body.textContent = t('No music yet: pick a folder first.');
+  }
+  $('#playlist-shuffle').hidden = !paths.length;
+  $<HTMLInputElement>('#playlist-shuffle input').checked = radio?.shuffle ?? false;
+  $<HTMLDialogElement>('#playlist').showModal();
+}
+const setShuffle = (e: Event) => radio?.setShuffle((e.target as HTMLInputElement).checked);
+function setTrackMode(e: Event) {
+  const r = e.target as HTMLInputElement, name = playlistDrawn?.[Number(r.dataset.track)];
+  if (name !== undefined) radio?.setMode(name, r.value as Mode);
 }
 async function menuAction(act: string) {
   const m = $<HTMLDialogElement>('#menu');
@@ -678,8 +1389,29 @@ async function menuAction(act: string) {
       m.close();
       toggleFullscreen();
       break;
-    case 'fps': fps.cycle(); m.querySelector<HTMLButtonElement>('[data-act="fps"]')!.textContent = `Frame-rate counter: ${fps.mode}`; break;
+    case 'fps': fps.cycle(); m.querySelector<HTMLButtonElement>('[data-act="fps"]')!.textContent = fpsLabel(fps.mode); break;
+    case 'solid': {
+      if (solidCars === null || !session?.net?.solid) break;
+      solidCars = !solidCars;
+      session.net.solid(solidCars);
+      m.querySelector<HTMLButtonElement>('[data-act="solid"]')!.textContent = ghostLabel();
+      // and in settings.ini for the next game, as Settings, Online, Ghost mode would
+      const text = putKey(settingsText ?? TEMPLATE, 'roam_collide', solidCars ? 'on' : 'off').text;
+      try { await writeFile(SAVE, 'settings.ini', text); settingsText = text; void settings.refresh(); }
+      catch (e) { log.add(`[app] settings.ini not written: ${e}`); }
+      log.add(`[app] solid cars ${solidCars ? 'on' : 'off'} (the page menu)`);
+      break;
+    }
+    case 'crews': openCrews(); break;
+    case 'radio-folder': case 'radio': await radioClick(act); showRadio(m); break;
+    case 'playlist': openPlaylist(); break;
     case 'help': m.close(); openHelp(); break;
+    case 'offline':
+      m.close();
+      if (!inLine || !session?.net?.offline) break;
+      session.net.offline();
+      toast(t('Playing offline: you left the line until the next game.'), 5000);
+      break;
     case 'log': downloadLog(); break;
     case 'quit': {
       m.close();
@@ -687,17 +1419,17 @@ async function menuAction(act: string) {
       if (!s) break;
       const stage = quitStage(s);
       if (stage === 0) {
-        if (s.requestQuit()) { quitAt = { s, t: performance.now(), forced: false }; toast('Quitting: the game saves and closes.', 5000); break; }
+        if (s.requestQuit()) { quitAt = { s, t: performance.now(), forced: false }; toast(t('Quitting: the game saves and closes.'), 5000); break; }
       } else if (stage === 1) {
         // the game's own second-request rule: open save files are finished, then it exits
-        if (await confirmBox('Close the game now?', 'The game has not closed yet (a loading screen ignores Quit). Closing now finishes any save in progress first.', 'Close now', true, 'quit') && session === s) {
-          if (s.requestQuit()) { quitAt = { s, t: performance.now(), forced: true }; toast('Closing the game.', 4000); break; }
+        if (await confirmBox(t('Close the game now?'), t('The game has not closed yet (a loading screen ignores Quit). Closing now finishes any save in progress first.'), t('Close now'), true, 'quit') && session === s) {
+          if (s.requestQuit()) { quitAt = { s, t: performance.now(), forced: true }; toast(t('Closing the game.'), 4000); break; }
         } else break;
       }
       // the game cannot be asked (any more), or it did not close when asked twice
-      if (await confirmBox('Stop the game now?', s.canQuit()
-          ? 'The game did not close when asked. Stopping it ends it at once: progress since it last saved is lost.'
-          : 'The game cannot be asked to quit, so it is stopped at once. Progress since it last saved is lost.', 'Stop the game', true, 'quit') && session === s) s.terminate();
+      if (await confirmBox(t('Stop the game now?'), s.canQuit()
+          ? t('The game did not close when asked. Stopping it ends it at once: progress since it last saved is lost.')
+          : t('The game cannot be asked to quit, so it is stopped at once. Progress since it last saved is lost.'), t('Stop the game'), true, 'quit') && session === s) s.terminate();
       break;
     }
   }
@@ -719,23 +1451,46 @@ function quitStage(s: GameSession): 0 | 1 | 2 {
   return quitAt.forced && performance.now() - quitAt.t > STOP_AFTER_MS ? 2 : 1;
 }
 function quitLabel(): string {
-  if (!session) return 'Quit game';
-  return ['Quit game', 'Close the game now', 'Stop the game'][quitStage(session)];
+  if (!session) return t('Quit game');
+  return [t('Quit game'), t('Close the game now'), t('Stop the game')][quitStage(session)];
 }
 
 // ------------------------------------------------------------- helpers --
-function confirmBox(title: string, body: Node | string, ok: string, danger = false, about = '', cancel = 'Cancel'): Promise<boolean> {
+function confirmBox(title: string, body: Node | string, ok: string, danger = false, about = '', cancel = t('Cancel')): Promise<boolean> {
+  return choiceBox(title, body, ok, cancel, danger, about).then(v => v === 'ok');
+}
+/** the same, with which way it closed: 'ok', 'cancel' (the cancel button, none when cancel is ''), '' (Esc) */
+function choiceBox(title: string, body: Node | string, ok: string, cancel: string, danger = false, about = ''): Promise<string> {
   const d = $<HTMLDialogElement>('#confirm');
   d.dataset.about = about;            // 'quit': closed when the game ends (endStage)
   $('#confirm-title').textContent = title;
   const b = $('#confirm-body'); b.replaceChildren(typeof body === 'string' ? Object.assign(document.createElement('p'), { textContent: body }) : body);
   const okb = $<HTMLButtonElement>('#confirm-ok'); okb.textContent = ok; okb.className = danger ? 'btn danger' : 'btn selected';
-  $('#confirm-cancel').textContent = cancel;
+  const cb = $('#confirm-cancel'); cb.textContent = cancel; cb.hidden = !cancel;     // '': the one button
   d.returnValue = '';
   d.showModal();
-  return new Promise(res => d.addEventListener('close', () => res(d.returnValue === 'ok'), { once: true }));
+  return new Promise(res => d.addEventListener('close', () => res(d.returnValue), { once: true }));
 }
-function downloadLog() { downloadBlob(log.text(), `nfsu2-${stamp()}.log`, 'text/plain'); }
+// A frozen game's log: players download it before the stall report's 15 s (2026-10-24: 13 s, no report), so the
+// game is asked first: how long ago its last frame was and, after 3 s or more, what every thread is doing
+// (runtime/watchdog.c).  No answer in 2 s, or a game that cannot be asked: the log as it is.
+async function downloadLog() {
+  if (session?.logReport()) await log.waitFor('[watchdog] log download ready', 2000);
+  // the last game's copy first, when that game did not get to its end (lastgame.ts)
+  // as it may leave the browser (privacy.ts): no names, no addresses; a copy from a page before that scrubbed nothing
+  const kept = lastGame ? (lastGame.scrubbed ? lastGame.log : privacy.scrub(lastGame.log)) : '';
+  const prev = lastGame ? `=== the last game's log, as the page kept it while it ran ===\n${kept}=== this page's log ===\n` : '';
+  downloadBlob(`${SCRUB_NOTE}\n${prev}${privacy.scrub(log.text())}`, `nfsu2-${stamp()}.log`, 'text/plain');
+}
+/** what the running game holds now, for each copy of its log (lastgame.ts): what fills a phone's memory as it plays */
+function gameHeld(): string {
+  const parts: string[] = [];
+  const tx = session?.renderer?.textures?.(), MB = (b: number) => (b / 1048576).toFixed(0);
+  if (tx) parts.push(`textures ${MB(tx.bytes)} MB${texSplit(tx.unpacked, tx.astc)}`);
+  const st = session?.status?.read(), cars = st?.get('roam_cars') ?? 0, friends = st?.get('roam_friends') ?? 0;
+  if (cars || friends) parts.push(`${cars} friends' cars in the game, ${friends} friends connected`);
+  return parts.join(', ');
+}
 
 // --------------------------------------------------------- game module --
 // A failed download (Wi-Fi drop, the server restarting, the module not built
@@ -746,17 +1501,18 @@ async function loadModule() {
   clearTimeout(moduleTimer);
   if (moduleLoading || loaded) return;
   moduleLoading = true;
-  setCheck({ id: 'module', label: 'Game module', state: 'pending', detail: moduleFails ? `Loading again (attempt ${moduleFails + 1}).` : 'Loading.' });
+  setCheck(moduleFails ? check('module', N('Game module'), 'pending', N('Loading again (attempt {n}).'), undefined, { n: moduleFails + 1 })
+    : check('module', N('Game module'), 'pending', N('Loading.')));
   try {
     loaded = await loadGame((got, total) => {
       setProgress(total ? got / total : 0);
-      if (phase === 'boot') $('#status-sub').textContent = `Loading the game: ${fmtBytes(got)} of ${fmtBytes(total)}.`;
+      if (phase === 'boot') setSub(T('Loading the game: {got} of {total}.', { got: fmtBytes(got), total: fmtBytes(total) }));
     });
     setProgress(1);
     log.add(`[app] game module ${loaded.info.rev}: ${fmtBytes(loaded.info.size)} in ${loaded.ms.toFixed(0)} ms, ${loaded.transferred} bytes transferred${moduleFails ? `, after ${moduleFails} failed attempts` : ''}`);
     moduleFails = 0;
     moduleLoading = false;
-    setCheck({ id: 'module', label: `Game module ${loaded.info.rev}`, state: 'ok', detail: `${fmtBytes(loaded.info.size)}, ready.` });
+    setCheck(check('module', N('Game module {rev}'), 'ok', N('{size}, ready.'), undefined, { rev: loaded.info.rev, size: fmtBytes(loaded.info.size) }));
     keepForOffline();
     afterUpdate();
     void checkNewer();
@@ -766,7 +1522,7 @@ async function loadModule() {
     log.add(`[app] the game module did not load (attempt ${moduleFails}): ${e}; next try in ${wait} s`);
     moduleLoading = false;
     setProgress(0);
-    setCheck({ id: 'module', label: 'Game module', state: 'fail', detail: `The game did not load (${e}). Trying again in ${wait} s, or press Retry.` });
+    setCheck(check('module', N('Game module'), 'fail', N('The game did not load ({error}). Trying again in {n} s, or press Retry.'), 'MODULE-LOAD', { error: String(e), n: wait }));
     moduleTimer = setTimeout(() => void loadModule(), wait * 1000);
   }
 }
@@ -815,7 +1571,7 @@ async function checkNewer() {
   const playing = !!session || starting;
   if (!playing && calm() && await reloadFor(rev, 'nothing on the page to lose', true)) return;
   log.add(`[app] the server has game ${rev} now, this page ${loaded.info.rev}: ${playing ? 'said over the game, offered when it ends' : 'Reload offered'}`);
-  if (playing) toast('A new version of the game is on the server. Quit when it suits you: the start page offers it, and your saves stay.', 10000);
+  if (playing) toast(t('A new version is out. Quit when it suits you to get it; your saves stay.'), 10000);
   showNewer();
 }
 /** nothing on the start page a reload would lose, and no tool driving it */
@@ -855,17 +1611,24 @@ function afterUpdate() {
 /** the offer (once a game has run here, with a word on its log: only in this page, a reload clears it), or that
  *  this page is the new version */
 function showNewer() {
-  const line = $('#newer');
-  line.textContent = newer ? (byPlay() ? 'A new version of the game is on the server: Play reloads this page with it. Your saves and settings stay.'
-    : 'A new version of the game is on the server. Reload this page to play it: your saves and settings stay.') +
-    (lastExit ? ' Download the log first if you want to keep it: the reload clears it.' : '')
-    : updated ? 'This page reloaded for the new version of the game. Your saves and settings stayed.' : '';
+  const line = $('#newer'), byP = byPlay(), log = !!lastExit, n = newer, u = updated;
+  live(line, () => n ? (byP ? t('A new version is out: Play reloads the page with it. Your saves and settings stay.')
+    : t('A new version is out. Reload the page to play it; your saves and settings stay.')) +
+    (log ? ' ' + t('Download the log first if you want to keep it: the reload clears it.') : '')
+    : u ? t('Updated to the new version. Your saves and settings stayed.') : '');
   line.hidden = !newer && !updated;
   $('#reload').hidden = !newer;
 }
 async function reload() {
   await saves.settled();              // a rename or restore the Saves section is writing ends first
   await swOnline();
+  location.reload();
+}
+/** A reload offline mode's copies do not answer (otherBuild): the service worker goes first.  The page registers it
+ *  again once the module has loaded, and its install takes new copies from the server. */
+async function reloadFromServer() {
+  await saves.settled();
+  try { await (await navigator.serviceWorker?.getRegistration())?.unregister(); } catch { /* none, or not here */ }
   location.reload();
 }
 /** Offline mode's copies answer first for a while after the server did not (sw.ts); it answers now, so the start
@@ -888,13 +1651,13 @@ function showOverrides(given: string[], dev: boolean) {
   o.hidden = !given.length;
   if (!given.length) return;
   if (!dev) {
-    o.textContent = `This page's address carries test settings (${given.join(', ')}). They work only on a development server and are ignored here: the game runs with your own settings.`;
+    live(o, T('This page\'s address has test settings ({names}), which work only on a development server and are ignored here.', { names: given.join(', ') }));
     return;
   }
   const env = Object.entries(ENVIRONMENT).map(([k, v]) => `${k}=${v}`);
-  o.textContent = `Test settings from this page's address (development server): save folder "${SAVE}"` +
-    (env.length ? `; ${env.join(', ')} (wins over Settings)` : '') +
-    ['fresh', 'reg', 'script', 'artifacts', 'dumpscale', 'away'].filter(k => q.has(k)).map(k => `; ${k}`).join('') + '.';
+  live(o, () => t('Test settings from this page\'s address (development server): save folder "{folder}"', { folder: SAVE }) +
+    (env.length ? t('; {vars} (wins over Settings)', { vars: env.join(', ') }) : '') +
+    ['fresh', 'reg', 'script', 'artifacts', 'dumpscale', 'away', 'playtime'].filter(k => q.has(k)).map(k => `; ${k}`).join('') + '.');
 }
 
 export async function boot() {
@@ -902,48 +1665,109 @@ export async function boot() {
   const asked = TEST_PARAMS.some(k => addr.has(k));
   const dev = asked && await devServer();
   const given = takeParams(dev);
+  // this browser's id, put back in a store that lost it before anything reads it (page-id.ts); counted for the day
+  // (a test page is not)
+  void keepPageId();
+  if (!asked) seen('page');
   instance = claimInstance(`nfsu2-saves:${SAVE}`);
+  // the last game of this save folder that did not get to its end (Safari stopped the page, say): its log is offered
+  keeper = new LastGameKeeper(SAVE, log, logLine, text => privacy.scrub(text));
+  lastGame = lastGameToOffer(SAVE);
+  if (lastGame) {
+    log.keep(lastGameLine(lastGame));
+    // a reload or a closed tab is the player's own doing: the log stays at hand (a frozen game, reloaded), unasked for
+    const end = lastGameEnd(lastGame), why = lastGame.ended?.why;
+    live($('#lastgame'), end === 'stopped' ? T('Your last game stopped without warning. Phones do this when they run low on memory.')
+      : end === 'error' ? T('Your last game stopped with an error.')
+      : T('Reloaded after a problem? Download log still has your last game\'s log.'),
+      end === 'error' && why !== 'exit' ? why : undefined);
+    $('#log-btn').hidden = $('#lastgame').hidden = false;
+    $('#report').hidden = end === 'left';
+  }
   fps = new FpsOverlay($('#fps'));
   lobbyPanel = new LobbyPanel($('#lobby'), $('#lobby-cover'), logLine);
   // made here once: a closure made per game (in startGame) would keep that game's scope reachable
   fps.extra = () => session?.stats() ?? {};
+  // the language this browser showed last, at once (settings.ini says which it is: applyLanguage, once it is read)
+  void setLanguage(lastLanguage(), logLine);
   settings = new SettingsPanel($('#settings'), {
-    // another language counts other files as the game data (its language pack); a keyphrase sends the file
-    saveDir: SAVE, environment: ENVIRONMENT, defaults: DEVICE, onSaved: t => { const was = language(); settingsText = t; if (language() !== was) void saves.refresh(); vault?.changed(); },
+    // another language or texture pack counts other files as the game data (its pack); a keyphrase sends the file
+    saveDir: SAVE, environment: ENVIRONMENT, defaults: DEVICE, onSaved: text => {
+      const was = language() + '/' + texpack(); settingsText = text;
+      if (language() + '/' + texpack() !== was) void saves.refresh();
+      vault?.changed(); players?.now();
+      applyLanguage();
+    },
+    onLoaded: applyLanguage,
     // the tab that owns the saves is the one whose Play reads the file: another tab only looks
-    readOnly: () => !instance.owner, say: pageToast,
+    readOnly: () => !instance.owner, say: pageToast, confirm: confirmBox,
+    nameRow: (row, input, ctl) => nameRow.attach(row, input, ctl),
   }, $('#online'));
-  // who plays on this server now (Online): only while no game runs here
-  players = watchPlayers(line => settings.setStatus(line), () => !session && !starting, setReach);
+  // the language picker at the top: the same setting as Settings, Game, Language
+  const pick = $<HTMLSelectElement>('#lang-pick');
+  pick.replaceChildren(...LANGUAGES.map(l => Object.assign(document.createElement('option'), { value: l, textContent: NATIVE[l], lang: LOCALE[l] })));
+  pick.onchange = () => void settings.set('language', pick.value);
+  // Donate at the top: a popup with the Ko-fi link, closed as Ko-fi opens in its own tab
+  $('#donate-btn').onclick = () => $<HTMLDialogElement>('#donate').showModal();
+  $('#donate-go').onclick = () => $<HTMLDialogElement>('#donate').close();
+  // who plays on this server now (Online): only while no game runs here; with free roam on in a room, that room too,
+  // and in crews (free roam on or not: the row shows them either way), how many are in each (on the Crews row's lines)
+  players = watchPlayers((line, crews) => { settings.setStatus(line); settings.setCrewCounts(crews); }, () => !session && !starting, setReach,
+    () => { const e = resolved().env; return e.NFSU2_ROAM === '1' ? e.NFSU2_ROAM_ROOM ?? '' : ''; },
+    () => crewList(resolved().env.NFSU2_ROAM_CREW ?? '').map(roomHash));
   window.addEventListener('online', () => players?.now());
   window.addEventListener('resize', placeNotices);
   window.addEventListener('resize', placeLobby);
-  download = new Predownload(s => saves.showData(s), logLine, () => language());
+  download = new Predownload(s => saves.showData(s), logLine, () => language(), () => texpack());
   saves = new SavesPanel($('#saves'), $('#game-data'), {
     saveDir: SAVE, busy: () => !!session || starting || !instance.owner, confirm: confirmBox,
     onRestored: () => { void loadSettings(); void settings.refresh(); }, download, onChanged: () => vault.changed(),
   });
   // keyphrase saves (on a server that keeps them): synced by the tab that owns the saves, once its settings are loaded
+  // the claimed names: asked with the keyphrase's token (claim.ts); the line under Your name (claim-ui.ts)
+  claims = new NameClaims(() => vault ? vault.token() : Promise.resolve(null));
+  nameRow = new NameRow({
+    claims, seed: pageId, linked: () => !!vault?.linked(), enable: enableCloud, showPassphrase,
+    profileName: async () => (await newestProfile())?.name ?? null,
+    save: n => settings.putName(n), writable: () => instance.owner,
+    kept: n => vault?.showClaim(n), say: pageToast, log: logLine,
+  });
   vault = new VaultPanel($('#vault'), {
     saveDir: SAVE, owner: () => instance.owner, playing: () => !!session, busy: () => !!session || starting || !instance.owner,
-    confirm: confirmBox, onRestored: () => { void loadSettings(); void settings.refresh(); void saves.refresh(); }, log: logLine,
+    confirm: confirmBox, choose: (title, body, ok, cancel) => choiceBox(title, body, ok, cancel),
+    onRestored: () => { void loadSettings(); void settings.refresh(); void saves.refresh(); }, log: logLine,
+    // another passphrase here (or none): the line under Your name asks again with it
+    onLink: () => void nameRow.ask(),
   });
   $<HTMLButtonElement>('#play').onclick = () => void play();
   $<HTMLButtonElement>('#retry').onclick = () => void loadModule();
   $<HTMLButtonElement>('#reload').onclick = () => void reload();
   $<HTMLButtonElement>('#log-btn').onclick = downloadLog;
   $('#menu').addEventListener('click', e => { const a = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-act]'); if (a) void menuAction(a.dataset.act!); });
-  $('#menu').addEventListener('close', () => { $('#stage').classList.remove('cursor'); $('#stage').querySelector('canvas')?.focus(); });
+  $('#playlist-body').addEventListener('change', setTrackMode);
+  $('#playlist-shuffle').addEventListener('change', setShuffle);
+  $('#menu').addEventListener('close', () => {
+    const pop = $<HTMLDialogElement>('#crews-pop'); if (pop.open) pop.close();      // the menu's Crews go with it
+    $('#stage').classList.remove('cursor'); $('#stage').querySelector('canvas')?.focus();
+  });
+  // the menu's Crews popup: Done closes it; back on the menu's Crews button, with its count as it is now
+  $('#crews-pop').addEventListener('click', e => { if ((e.target as HTMLElement).closest('[data-act="crews-done"]')) $<HTMLDialogElement>('#crews-pop').close(); });
+  $('#crews-pop').addEventListener('close', () => {
+    const b = $<HTMLButtonElement>('#menu [data-act="crews"]');
+    b.textContent = crewsLabel();
+    if ($<HTMLDialogElement>('#menu').open) b.focus();
+  });
 
   // F8 / F9 belong to the page while the game runs (the game binds neither,
   // Chrome reserves neither); caught first, so the game never sees them.  F12
-  // too: the page's screenshot, not the game's (whose copy of the frame comes
-  // out black in this port) nor the browser's developer tools.
+  // too: photo mode in the world, its picture while it is on, else the page's
+  // screenshot (not the game's, whose copy of the frame comes out black in
+  // this port, nor the browser's developer tools).
   window.addEventListener('keydown', e => {
     if (session && (e.code === 'F8' || e.code === 'F9' || e.code === 'F12')) {
       e.preventDefault(); e.stopImmediatePropagation();
       if (e.repeat) return;
-      if (e.code === 'F8') toast(`Frame-rate counter: ${fps.cycle()}`, 1500); else if (e.code === 'F9') openMenu(); else void screenshot();
+      if (e.code === 'F8') toast(fpsLabel(fps.cycle()), 1500); else if (e.code === 'F9') openMenu(); else photo.f12();
       return;
     }
     // Enter plays only when nothing else has the focus (or Play itself does): a
@@ -955,23 +1779,49 @@ export async function boot() {
     }
   }, { capture: true });
   window.addEventListener('beforeunload', e => { if (session) { e.preventDefault(); e.returnValue = ''; } });
-  document.addEventListener('fullscreenchange', () => { if (!isFullscreen() && session) toast(`Full screen left. ${cap(menuName())} has it.`, 3000); });
+  // a game running when the page goes away (closed, reloaded): said so in its copy (Safari stopping it says nothing)
+  window.addEventListener('pagehide', () => { if (session) keeper.end(-2, 'page closed'); });
+  // a hidden page is what a phone stops first: the copy then, and how long it was away in the log
+  document.addEventListener('visibilitychange', () => {
+    if (!session) return;
+    if (document.hidden) hiddenAt = performance.now();
+    else if (hiddenAt) { log.add(`[app] the page was hidden for ${((performance.now() - hiddenAt) / 1000).toFixed(1)} s (t=${((performance.now() - session.started) / 1000).toFixed(0)} s into the game)`); hiddenAt = 0; }
+    keeper.hidden(document.hidden);
+  });
+  document.addEventListener('fullscreenchange', () => { if (!isFullscreen() && session) toast(t('Full screen left. {menu} has it.', { menu: cap(menuName()) }), 3000); });
+  noPinchZoom();
   // the menu's button on the game: on a touch screen from the start, elsewhere from the first touch
   markTouch();
+  keySheet = controlsSheet($('#keys'), 'keys', { follow: true });
+  // what the page drew itself, again in the language picked (the markup and the live texts redraw themselves)
+  onLanguage(() => {
+    renderProblems(); evaluate(); settings.render(); void saves.refresh(); vault.refresh(); keySheet.relabel(); lobbyPanel.redraw(); touch.relabel();
+    helpSheet = null; $('#help-body').replaceChildren();
+    syncPicker();
+  });
   const stageMenu = $<HTMLButtonElement>('#stage-menu');
   stageMenu.onpointerdown = e => e.preventDefault();     // the canvas keeps the focus (and with it the keyboard)
   stageMenu.onclick = () => { if (session) openMenu(); };
   $('#stage').addEventListener('pointerdown', e => { if (e.pointerType === 'touch') stageMenu.hidden = false; }, { capture: true });
-  touch = new TouchControls($('#stage'), { toast, log: logLine });
+  quickChat = new QuickChat($('#stage'), { line: chatLine, lobby: (name, text) => lobbyPanel.say(name, text), place: placeNotices, log: logLine });
+  touch = new TouchControls($('#stage'), { toast, log: logLine, chat: () => quickChat.toggle(), settings: () => openHelp('keys') });
+  textField = new TextField($('#stage'), { log: logLine });
+  pauseHint = new PauseHint($('#stage'), {
+    open: openMenu, log: logLine,
+    roam: () => solidCars !== null && !!session?.net?.solid,
+    fullscreen: () => canFullscreen() || !fromHomeScreen(),
+  });
+  driftPanel = new DriftPanel($('#stage'), { toast, wide: () => hudWide, log: logLine });
+  photo = new PhotoMode($('#stage'), { shoot: screenshot, screenshot: () => void screenshot(), log: logLine });
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { void checkNewer(); vault.shown(); } });
   setInterval(() => { if (document.visibilityState === 'visible') void checkNewer(); }, NEWER_EVERY_MS);
 
   setCheck(checkBrowser());
   setCheck(checkIsolation());
-  setCheck({ id: 'gpu', label: 'WebGPU', state: 'pending', detail: 'Asking for a graphics adapter.' });
-  setCheck({ id: 'storage', label: 'Browser storage', state: 'pending', detail: 'Checking.' });
-  setCheck({ id: 'module', label: 'Game module', state: 'pending', detail: 'Loading.' });
-  setPhase('boot', 'Loading', 'Loading the game.');
+  setCheck(check('gpu', N('Graphics (WebGPU)'), 'pending', N('Checking.')));
+  setCheck(check('storage', N('Browser storage'), 'pending', N('Checking.')));
+  setCheck(check('module', N('Game module'), 'pending', N('Loading.')));
+  setPhase('boot', T('Loading'), T('Loading the game.'));
   setProgress(0);
 
   showOverrides(given, dev);
@@ -981,19 +1831,24 @@ export async function boot() {
   void settings.refresh();
   void saves.refresh();
   void vault.start();
-  void instance.whenOwner.then(async () => { await loadSettings(); evaluate(); void settings.refresh(); void saves.refresh(); vault.ownerNow(); });
-  void checkGpu().then(setCheck);
+  void instance.whenOwner.then(async () => { await loadSettings(); evaluate(); void settings.refresh(); void saves.refresh(); vault.ownerNow(); syncPicker(); });
+  // invite links: the one this page was opened with, one pasted into its address later, one another tab took for it
+  hearInvites();
+  takeInvite();
+  window.addEventListener('hashchange', takeInvite);
+  void checkGpu(lastGame?.ended?.why === 'GPU-LOST').then(c => { setCheck(c); if (c.code === 'GPU-ADAPTER-AFTER-LOST') recheckGpu(); });
   // Firefox's answer to its storage prompt comes later: the check again then
   void checkStorage().then(({ answer, ...c }) => { setCheck(c); void answer?.then(setCheck); });
   refreshMeasured = measureRefresh(60).then(r => { displayHz = r.hz; log.add(`[app] display refresh ${r.raw.toFixed(1)} Hz -> ${r.hz}`); });
 
   if (crossOriginIsolated) await loadModule();
-  else setCheck({ id: 'module', label: 'Game module', state: 'fail', detail: 'Not loaded: the page is not isolated (see above).' });
+  else setCheck(check('module', N('Game module'), 'fail', N('Not loaded: the page is not isolated (see above).'), 'MODULE-NOT-ISOLATED'));
   evaluate();
   (window as any).__nfsu2 = {
     get phase() { return phase; }, get lastExit() { return lastExit; }, get fps() { return { game: fps.gameFps, page: fps.pageFps, source: $('#fps').dataset.source }; },
     get session() { return session; }, log, save: SAVE, download: () => download.status, offline: () => offline, displayHz: () => displayHz, retryModule: () => loadModule(),
-    newer: () => newer, tried: () => tried, touch: () => touch.state(),
+    newer: () => newer, tried: () => tried, touch: () => touch.state(), textField: () => textField.state(), renderCheck: () => renderCheck?.state() ?? null,
+    quickChat: () => quickChat.state(), quickChatStick: (x: number, y: number) => quickChat.stick(x, y),
     env: () => resolved().env, settingsText: () => settingsText, checks: () => [...checks.values()],
     fpsMode: (m?: FpsMode) => { if (m && FPS_MODES.includes(m)) fps.set(m); return fps.mode; },
     quitTimes: { forcedCloseMaxMs: FORCED_CLOSE_MAX_MS, stopAfterMs: STOP_AFTER_MS },

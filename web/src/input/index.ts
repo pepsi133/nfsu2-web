@@ -5,19 +5,28 @@
 //        layout independent) and its Windows virtual-key code; e.key gives
 //        the characters the layout typed (WM_CHAR, cp1252).  The C side
 //        applies keyboard_mac.m's delivery rules (Alt and SYS messages,
-//        autorepeat, keys whose release was lost).  Every key the game uses
-//        has its browser default prevented; Meta combinations stay the
-//        browser's, and Meta going down releases every held key because
-//        macOS browsers send no keyup for keys released while Cmd is held.
+//        autorepeat, keys whose release was lost, keys held through a
+//        release, which their next autorepeat presses again).  Every key
+//        the game uses has its browser default prevented; Meta combinations
+//        stay the browser's, and Meta going down releases every held key
+//        because macOS browsers send no keyup for keys released while Cmd
+//        is held.
 // Mouse: positions relative to the shown image (the C side maps them into
 //        the game's client area and HUD), buttons with pointer capture, the
 //        wheel in WHEEL_DELTA units.  The OS cursor is hidden over the game.
 // Touch: one finger is the mouse, so a tap is a left click (the game's menus
-//        take clicks); other fingers are left alone.
+//        take clicks); two are a middle-button drag (the garage turns the
+//        car); other fingers are left alone.  Where the first finger lands
+//        is marked (IKF_TOUCH): the C side makes the cursor arrive with a
+//        move the menus see, also on the spot it already is.
+// Text:  the game's text entry while it is up (a seqlock the game writes at
+//        each Present), and characters typed with no key (a phone's
+//        keyboard, app/textentry.ts) as WM_CHAR.
 // Pads:  polled every frame (gamepad.ts), with the page's share (padPage) and
 //        the touch controls' virtual controller merged in (touchPad).
 // Life:  blur and a hidden page deactivate the game (it parks, as after an
-//        alt-tab on Windows) and release everything held; focus and a visible
+//        alt-tab on Windows) and release everything held (a key still down
+//        is pressed again by its next autorepeat); focus and a visible
 //        page reactivate it; requestQuit() is WM_CLOSE.  Fullscreen locks the
 //        keyboard (navigator.keyboard.lock) so Escape and the browser's
 //        reserved shortcuts reach the game; holding Escape leaves fullscreen.
@@ -31,12 +40,13 @@ import { CODES, cp1252, isMeta, keyChars, keyVk } from './keymap';
 import { PadPoller, type PadPage, type TouchPad } from './gamepad';
 import { SynthDriver } from './synth';
 import {
-  IEV_FOCUS, IEV_KEY_DOWN, IEV_KEY_TAP, IEV_KEY_UP, IEV_MOUSE_DOWN, IEV_MOUSE_MOVE, IEV_MOUSE_UP, IEV_QUIT,
-  IEV_RELEASE_ALL, IEV_WHEEL, IKF_ALT, IKF_CTRL, IKF_DEAD, IKF_REPEAT, IKF_SHIFT, IKF_SYNTH, IM_ATTACHED, IM_EV_DROP,
-  IM_EV_R, IM_EV_W, IM_EVENTS, IM_GAME_INACTIVE, IM_HDR_WORDS, IM_KEYS_HELD, IM_MAGIC, IM_MOUSE_X, IM_MOUSE_Y,
-  IM_NAMES_GEN, IM_OFF_EV, IM_OFF_NAMES, IM_OFF_SYN, IM_QUIT_REQ, IM_SYN_R, IM_SYN_W, IM_VERSION, INPUT_EV_N,
-  INPUT_MAGIC, INPUT_NAME_LEN, INPUT_SYN_N, INPUT_VERSION, IREASON_ELEMENT, IREASON_FULLSCREEN, IREASON_META,
-  IREASON_PAGE, IREASON_PAGEHIDE, IREASON_SCRIPT, IREASON_VISIBILITY, IREASON_WINDOW,
+  IEV_FOCUS, IEV_KEY_DOWN, IEV_KEY_TAP, IEV_KEY_UP, IEV_LOG, IEV_MOUSE_DOWN, IEV_MOUSE_MOVE, IEV_MOUSE_UP, IEV_QUIT, IEV_SMS,
+  IEV_PHOTO, IEV_RELEASE_ALL, IEV_TEXT, IEV_WHEEL, IKF_ALT, IKF_CTRL, IKF_DEAD, IKF_REPEAT, IKF_SHIFT, IKF_SYNTH, IKF_TOUCH, IM_ATTACHED,
+  IM_EV_DROP, IM_EV_R, IM_EV_W, IM_EVENTS, IM_GAME_INACTIVE, IM_HDR_WORDS, IM_KEYS_HELD, IM_MAGIC, IM_MOUSE_X,
+  IM_MOUSE_Y, IM_NAMES_GEN, IM_OFF_EV, IM_OFF_NAMES, IM_OFF_SYN, IM_QUIT_REQ, IM_SYN_R, IM_SYN_W, IM_TEXT,
+  IM_TEXT_KIND, IM_TEXT_LEN, IM_TEXT_MAX, IM_TEXT_SEQ, IM_MENU_SCALE, IM_VERSION, IM_VIEW_ROLL, INPUT_EV_N, INPUT_MAGIC, INPUT_NAME_LEN,
+  INPUT_SYN_N, INPUT_TEXT_BYTES, INPUT_VERSION, IREASON_ELEMENT, IREASON_FULLSCREEN, IREASON_META, IREASON_PAGE,
+  IREASON_PAGEHIDE, IREASON_SCRIPT, IREASON_VISIBILITY, IREASON_WINDOW,
 } from './proto';
 
 export interface ViewRect { x: number; y: number; w: number; h: number }
@@ -66,6 +76,9 @@ export interface InputStats {
 }
 /** the numeric counters (the app's overlay contract: names to numbers) */
 export interface InputCounters { [k: string]: number; 'input events': number; 'keys held': number; 'pad connected': number }
+/** the game's text entry (runtime/web/input_web.c): the most characters it takes, its kind (which characters
+ *  besides letters and digits), its text now */
+export interface TextEntry { max: number; kind: number; text: string }
 export interface InputHandle {
   /** WM_CLOSE to the game.  Before the game's mailbox exists (the first ~0.2 s
    *  after the start) the request waits and is sent when it registers.  false:
@@ -73,6 +86,13 @@ export interface InputHandle {
   requestQuit(): boolean;
   /** whether requestQuit() can still reach the game */
   canQuit(): boolean;
+  /** Download log: the game writes how long ago it drew its last frame, after a while what every thread is doing,
+   *  then "[watchdog] log download ready" (runtime/watchdog.c).  false: it cannot reach the game */
+  logReport(): boolean;
+  /** a text message of ours for the game's phone (runtime/sms.c), by its number.  false: it cannot reach the game */
+  sms(id: number): boolean;
+  /** photo mode (runtime/photo.c): what (its PH_* number) and its values.  false: it cannot reach the game */
+  photo(what: number, a?: number, b?: number): boolean;
   enterFullscreen(): Promise<boolean>;
   exitFullscreen(): Promise<void>;
   toggleFullscreen(): Promise<void>;
@@ -84,12 +104,22 @@ export interface InputHandle {
   /** performance.now() of the player's last key, mouse or controller input (the attach before any); null
    *  while the game's own driver writes the event ring (an input script without the page's input) */
   lastInput(): number | null;
-  /** a key the page presses or lets go for the player (the touch controls), by KeyboardEvent.code */
+  /** a key the page presses or lets go for the player (the touch controls), by KeyboardEvent.code; Enter and Escape
+   *  also type their characters, as a keyboard's do */
   key(code: string, down: boolean): void;
   /** the touch controls' virtual controller, merged with a real one (null: none) */
   touchPad(t: TouchPad | null): void;
+  /** the touch controls' level horizon: the phone's tilt the game's 3D view turns against, radians, + = clockwise */
+  viewRoll(rad: number): void;
+  /** the menus' small buttons' size, 1 = the game's own (touch.ts: the Menu button size): the scroller arrows', and
+   *  with bar the help bar's too (else it keeps the game's own) */
+  menuScale(s: number, bar: boolean): void;
   /** performance.now() of a real controller's last button press (0: none) */
   padPressed(): number;
+  /** the game's text entry while it is up, else null */
+  textEntry(): TextEntry | null;
+  /** characters typed with no key (a phone's keyboard), cp1252: WM_CHAR each, 8 deletes, 13 accepts */
+  text(chars: number[]): void;
   /** diagnostic: n empty events, each timed from the page's write until the
    *  input thread has handled it (busy-waits on the main thread, max 20 ms each);
    *  returns the times in microseconds */
@@ -99,6 +129,10 @@ export interface InputHandle {
 
 /** what counts as the player's use of keyboard and mouse (lastInput) */
 const USE_EVENTS = ['keydown', 'pointerdown', 'pointermove', 'wheel'];
+
+/** the characters a key the page presses types, as a keyboard's does: the game's text fields and some of its prompts
+ *  take Enter and Escape only as characters (runtime/dinput_pad.c fe_keys) */
+const PAGE_KEY_CHARS: Record<string, number[]> = { Enter: [13], Escape: [27] };
 
 const detectMac = () => {
   const p = (navigator as unknown as { userAgentData?: { platform?: string } }).userAgentData?.platform ?? navigator.platform ?? '';
@@ -118,11 +152,17 @@ export function attachInput(proc: GameProcess, element: HTMLElement, opts: Input
   let active: boolean | null = null;
   let pads: PadPoller | null = null, synth: SynthDriver | null = null;
   let raf = 0, timer = 0, detached = false;
+  const f32 = new Float32Array(1), f32Bits = new Int32Array(f32.buffer);   // a float's bits for a mailbox word
+  let menu = 0;                     // the menus' size asked for (0: none; negative: the arrows' alone), written once the mailbox is there
+  const putMenu = () => { if (h && !detached && menu) { f32[0] = menu; Atomics.store(h, IM_MENU_SCALE, f32Bits[0]); } };
   // the mailbox was not ours (another writer, another layout): requests cannot reach the game
   let refused = false;
   // quit requests made before the mailbox registered: sent once it does
   let quitPending = 0;
   const dropped = { n: 0 };
+  // the game's text entry: the last consistent copy (kept while the game is writing it)
+  let textNow: TextEntry | null = null;
+  const win1252 = new TextDecoder('windows-1252');
   let lastUse = performance.now();
   const onUse = () => { lastUse = performance.now(); };
 
@@ -208,7 +248,7 @@ export function attachInput(proc: GameProcess, element: HTMLElement, opts: Input
   }
   function onPointerMove(e: PointerEvent) {
     if (detached) return;
-    if (e.pointerType === 'touch') { if (e.pointerId === finger) push(IEV_MOUSE_MOVE, 0, 0, flagsOf(e), [], ...pos(e)); return; }
+    if (e.pointerType === 'touch') { onFingerMove(e); return; }
     const [x, y] = pos(e);
     push(IEV_MOUSE_MOVE, 0, 0, flagsOf(e), [], x, y);
     if ((e.buttons & 31) !== buttons) syncButtons(e);
@@ -230,21 +270,53 @@ export function attachInput(proc: GameProcess, element: HTMLElement, opts: Input
     try { element.releasePointerCapture(e.pointerId); } catch { /* not captured */ }
   }
 
-  // ---- touch: one finger is the mouse ------------------------------------------------
+  // ---- touch: one finger is the mouse, two turn the car --------------------------------
   // A tap is a move, a press and a release within a frame or two; the game
   // takes mouse changes one a frame (runtime/web/input_web.c), so it sees the
   // cursor arrive, then the button go down, then up, however slow its frames.
-  let finger = -1;
+  // A second finger makes the two a middle-button drag, the PC game's way to
+  // turn the car in the garage (its only use of that button, 0x4a5d90): the
+  // first finger's button goes up, the cursor to the point between them, then
+  // the middle button goes down and the cursor follows that point.  When one of
+  // the two lifts, the button goes up and no finger is the mouse until all are.
+  let finger = -1, second = -1;
+  const fingers = new Map<number, [number, number]>();
+  const between = (): [number, number] => {
+    const a = fingers.get(finger)!, b = fingers.get(second)!;
+    return [Math.round((a[0] + b[0]) / 2), Math.round((a[1] + b[1]) / 2)];
+  };
   function onFingerDown(e: PointerEvent) {
-    if (!e.isPrimary) return;
+    fingers.set(e.pointerId, pos(e));
+    if (!e.isPrimary) {
+      if (finger < 0 || second >= 0) return;
+      second = e.pointerId;
+      push(IEV_MOUSE_UP, 0, 0, flagsOf(e), [], 0);
+      push(IEV_MOUSE_MOVE, 0, 0, flagsOf(e), [], ...between());
+      push(IEV_MOUSE_DOWN, 0, 0, flagsOf(e), [], 2);
+      buttons = (buttons & ~1) | 4;
+      return;
+    }
     finger = e.pointerId;
-    push(IEV_MOUSE_MOVE, 0, 0, flagsOf(e), [], ...pos(e));
+    push(IEV_MOUSE_MOVE, 0, 0, flagsOf(e) | IKF_TOUCH, [], ...pos(e));
     push(IEV_MOUSE_DOWN, 0, 0, flagsOf(e), [], 0);
     buttons |= 1;
     if (document.activeElement !== element && element.tabIndex >= 0) element.focus({ preventScroll: true });
     e.preventDefault();
   }
+  function onFingerMove(e: PointerEvent) {
+    if (!fingers.has(e.pointerId)) return;
+    fingers.set(e.pointerId, pos(e));
+    if (second >= 0) { if (e.pointerId === finger || e.pointerId === second) push(IEV_MOUSE_MOVE, 0, 0, flagsOf(e), [], ...between()); }
+    else if (e.pointerId === finger) push(IEV_MOUSE_MOVE, 0, 0, flagsOf(e), [], ...pos(e));
+  }
   function onFingerUp(e: PointerEvent) {
+    fingers.delete(e.pointerId);
+    if (second >= 0 && (e.pointerId === finger || e.pointerId === second)) {
+      finger = second = -1;
+      push(IEV_MOUSE_UP, 0, 0, flagsOf(e), [], 2);
+      buttons &= ~4;
+      return;
+    }
     if (e.pointerId !== finger) return;
     finger = -1;
     push(IEV_MOUSE_UP, 0, 0, flagsOf(e), [], 0);
@@ -324,6 +396,21 @@ export function attachInput(proc: GameProcess, element: HTMLElement, opts: Input
       return true;
     },
     canQuit() { return !detached && !refused; },
+    logReport() {
+      if (!h || !api.canQuit()) return false;
+      push(IEV_LOG, 0, 0, 0, [], 0, IREASON_PAGE);
+      return true;
+    },
+    sms(id) {
+      if (!h || !api.canQuit()) return false;
+      push(IEV_SMS, 0, 0, 0, [], id, IREASON_PAGE);
+      return true;
+    },
+    photo(what, a = 0, b = 0) {
+      if (!h || !api.canQuit()) return false;
+      push(IEV_PHOTO, what, 0, 0, [], a, b);
+      return true;
+    },
     async enterFullscreen() {
       try {
         if (document.fullscreenElement !== element) await element.requestFullscreen({ navigationUI: 'hide' });
@@ -358,14 +445,35 @@ export function attachInput(proc: GameProcess, element: HTMLElement, opts: Input
     lastInput() { return refused ? null : lastUse; },
     key(code, down) {
       const k = CODES[code];
-      if (k && !detached) push(down ? IEV_KEY_DOWN : IEV_KEY_UP, k.dik, k.vk, 0);
+      if (k && !detached) push(down ? IEV_KEY_DOWN : IEV_KEY_UP, k.dik, k.vk, 0, down ? PAGE_KEY_CHARS[code] ?? [] : []);
     },
     touchPad(t) { pads?.setTouch(t); },
+    viewRoll(rad) { if (h && !detached) { f32[0] = rad; Atomics.store(h, IM_VIEW_ROLL, f32Bits[0]); } },
+    menuScale(s, bar) { menu = bar ? s : -s; putMenu(); },
     padPressed() { return pads?.lastPress ?? 0; },
+    textEntry() {
+      if (!h || !u8) return null;
+      for (let tries = 0; tries < 4; tries++) {
+        const s0 = Atomics.load(h, IM_TEXT_SEQ);
+        if (s0 & 1) continue;
+        const max = Atomics.load(h, IM_TEXT_MAX), kind = Atomics.load(h, IM_TEXT_KIND);
+        const len = Math.min(Atomics.load(h, IM_TEXT_LEN), INPUT_TEXT_BYTES), o = base + IM_TEXT * 4;
+        const bytes = u8.slice(o, o + len);
+        if (Atomics.load(h, IM_TEXT_SEQ) !== s0) continue;
+        textNow = max > 0 ? { max, kind, text: win1252.decode(bytes) } : null;
+        break;
+      }
+      return textNow;
+    },
+    text(chars) {
+      if (detached) return;
+      for (let i = 0; i < chars.length; i += 3) push(IEV_TEXT, 0, 0, 0, chars.slice(i, i + 3));
+    },
     detach() {
       if (detached) return;
       // whatever the game holds is let go (it may outlive the page's input, e.g. a test page)
       push(IEV_RELEASE_ALL, 0, 0, 0, [], 0, IREASON_PAGE);
+      api.viewRoll(0);
       if (h) Atomics.compareExchange(h, IM_ATTACHED, 1, 0);   // only our own claim (2 = the C ns* driver)
       detached = true; quitPending = 0; cancelAnimationFrame(raf); clearInterval(timer);
       pads?.dispose(); pads = null; synth = null;
@@ -420,6 +528,7 @@ export function attachInput(proc: GameProcess, element: HTMLElement, opts: Input
       return;
     }
     h = view; u8 = new Uint8Array(buf); i32 = new Int32Array(buf); base = reg.ptr;
+    putMenu();
     synth = new SynthDriver({
       element, mac, layout: () => layout, log,
       // nsfocus: the page's blur/focus path, sent even if the page state already matches

@@ -128,6 +128,9 @@ WEAK void metal_register_ps(int id, const char *src){ (void)id; (void)src; }
 WEAK void metal_register_vs(int id, const char *src){ (void)id; (void)src; }
 WEAK int  metal_vs_ready(int id){ (void)id; return 1; }
 WEAK void metal_blit(unsigned s, unsigned d){ (void)s; (void)d; }
+WEAK void metal_blit_rect(unsigned s, unsigned d, const int *r){ (void)s; (void)d; (void)r; }
+/* no GPU: the lock buffer keeps what it has */
+WEAK int  metal_read_texture(unsigned id, void *dst, unsigned pitch, unsigned rows){ (void)id; (void)dst; (void)pitch; (void)rows; return 0; }
 WEAK void metal_clear_target_ex(unsigned argb, unsigned flags, float z){ (void)argb; (void)flags; (void)z; }
 WEAK void metal_clear_target(unsigned argb){ metal_clear_target_ex(argb, 1u, 1.f); }
 WEAK void metal_set_blend(unsigned key, float aref){ (void)key; (void)aref; }
@@ -204,7 +207,7 @@ static PadState g_synth;
 WEAK int  gamepad_env_flag(const char *nm, int dflt){ const char *e = getenv(nm); if (!e || !*e) return dflt; return !(e[0] == '0' || !strcmp(e, "off") || !strcmp(e, "no")); }
 WEAK void gamepad_init(void){ }
 WEAK int  gamepad_read(PadState *s){ if (g_synth.connected){ *s = g_synth; return 1; } memset(s, 0, sizeof *s); return 0; }
-WEAK void gamepad_synth_connect(int on){ g_synth.connected = on; g_synth.synthetic = 1; g_synth.family = PADF_XBOX; snprintf(g_synth.name, sizeof g_synth.name, "script pad"); }
+WEAK void gamepad_synth_connect(int on){ g_synth.connected = !!on; g_synth.wheel = on == 2; g_synth.synthetic = 1; g_synth.family = PADF_XBOX; snprintf(g_synth.name, sizeof g_synth.name, "script pad"); }
 WEAK void gamepad_synth_button(int b, int down){ if (b >= 0 && b < PAD_NBUTTONS){ if (down) g_synth.buttons |= 1u << b; else g_synth.buttons &= ~(1u << b); } }
 WEAK void gamepad_synth_axis(int a, float v){ if (a >= 0 && a < PAD_NAXES) g_synth.axis[a] = v; }
 WEAK int  gamepad_button_by_name(const char *nm){
@@ -229,8 +232,9 @@ WEAK void perflog_guest_frame(void){ }
 
 /* ------------------------------------------------- texture packs */
 /* texrep.m (optional upscaled-texture packs, "textures = upscaled") is
- * Metal/Objective-C.  The browser has no pack support yet (the tex track's
- * job): every guest-side hook is inert, as texrep.m is with the option off.
+ * Metal/Objective-C.  The browser's texture packs (ui_textures) are
+ * texrep_web.c's; without it every guest-side hook is inert, as texrep.m is
+ * with the option off.
  * The frame-rate counter (fpscounter.m) needs no stand-in: nothing outside
  * metal.m calls it, and the page draws its own (web/src/app overlay). */
 WEAK void texrep_created(unsigned mid, unsigned w, unsigned h, unsigned levels, unsigned d3dfmt, unsigned usage, unsigned pool){
@@ -242,8 +246,7 @@ WEAK void texrep_released(unsigned mid){ (void)mid; }
 WEAK void texrep_frame(void){ }
 WEAK void texrep_report(void){ }
 WEAK int  texrep_wanted(void){ return 0; }
-WEAK void texrep_set_shown(int on){
-    static int said; if (on != 0 && !said++) fprintf(stderr, "[texrep] texture packs are not available in the browser yet\n"); }
+WEAK void texrep_set_shown(int on){ (void)on; }
 WEAK int  texrep_shown(void){ return 0; }
 WEAK int  texrep_status(char *buf, size_t n){ (void)buf; (void)n; return 0; }
 

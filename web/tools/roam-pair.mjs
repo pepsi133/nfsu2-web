@@ -6,7 +6,8 @@
 //        [--timeout 1200] [--drive 3600] [--watch 2400] [--stagger 2] [--bounce <s>]
 //        [--a Alice:roam_mp_drive.txt] [--b Bob:roam_mp_watch.txt] [--c Carol:<script>] [--d Dave:<script>] [--solo]
 //        [--env K=V ...] [--headed]
-//        (an instance's own settings after its script: --a Alice:roam_mp_ram_a.txt:NFSU2_ROAM_COLLIDE=0,K=V)
+//        (an instance's own settings after its script: --a Alice:roam_mp_ram_a.txt:NFSU2_ROAM_COLLIDE=0,K=V; a comma
+//        not followed by a K= stays in the value: NFSU2_ROAM_CREW=Blue Room, Night Owls)
 //        [--base http://localhost:8616]   (use a server that is already running instead)
 //        [--https]   the pages load from https://localhost:<port> (the switch over wss://): our own server
 //                    gets a test certificate (web/test/cf-sim.mjs makeTestCerts, --tls-cert), whose
@@ -16,22 +17,46 @@
 //                    NFSU2_ROAM=1); the default is test/hostcheck.html (null renderer, net=<name>).  A page of
 //                    1600x900 (--size), and a script line `log SHOT <name>` saves the page as the player sees it
 //                    (the game and the page's own overlays) as <out>/<instance>-<name>.png; `log SHOT clean_<name>`
-//                    without the race lobby's panel (tests/scripts/mprace_shots_a/b.txt)
+//                    without the race lobby's panel (tests/scripts/mprace_shots_a/b.txt); `log MENU <item>` opens
+//                    the page menu (F9), clicks that item (its data-act, e.g. solid) and goes back to the game;
+//                    `log KEY <code> ...` presses those keys on the page as the player does (KeyboardEvent.code: the
+//                    script's own keys reach only the game, never the page) and `log STICK <x> <y>` moves the right
+//                    stick there for the page (quick chat's picker: tests/scripts/roam_say_view_a.txt); with
+//                    --touch the pages take taps (the touch controls show), and `log TAP <selector>` taps there
+//                    (tests/scripts/roam_say_touch.txt), `log HOLD <ms> <selector>` holds a finger there that long
+//                    (tests/scripts/roam_touch_status.txt)
+//                    `log CREW join <name>` / `log CREW leave <name>` / `log CREW colour <k> <name>` (the palette's
+//                    k-th colour, from 0) do that in the menu's Crews popup (F9, Crews) and go back (Done, Back to
+//                    the game), `log CREW shot <name>` saves the page with the popup open
+//                    (tests/scripts/roam_crew_menu.txt); `log INVITE <fragment>` opens that invite link in the page
+//                    as a link pasted into its address does (the fragment without its #, which starts a comment in a
+//                    script: room=Blue%20Room), saves the question as <out>/<instance>-invite-<k>.png (k from 1) and
+//                    presses Join; `log INVITE-NO <fragment>` presses Not now (tests/scripts/roam_invite.txt)
 //        [--page play [--size 960x540] [--play-only Bob]]   the renderer's test page (test/play.html, WebGPU)
 //                    instead: frame dumps go to the server's /artifacts/ as <name>-*.png (a server of our own
 //                    gets --artifacts <out>); --play-only: only that instance renders, the others run hostcheck
+//        [--page-arg bc=0]  more of the page address (each page's, repeated for several): play.html's bc=0 takes a
+//                    phone's texture path (DXT1 as ASTC, the rest unpacked) on this Mac
+//        [--download-log]  with --page app: at the end each page's Download log, as a player gets it (privacy.ts:
+//                    no names or addresses), as <out>/<name>.download.log
 //        [--fetch snd.raw]  a file of each page's save folder (OPFS) copied out as <out>/<name>.<file>,
 //                    e.g. the sound output of --env SNDDUMP=/save/snd.raw (s16le stereo, 44.1 kHz)
+//        [--speedhack Cat:3]  that page's game threads (each game-worker.js, as it loads) see performance.now and
+//                    Date.now run 3 times as fast, as a speed hack in the browser makes them: the whole game runs
+//                    faster (the server's cheat watch sees it: tests/scripts/roam_cheat_c.txt)
 //        [--hide Bob:60:8]  that page reports itself hidden (document.hidden + visibilitychange, as when
 //                    its tab goes to the background; headless pages are never really hidden) at 60 s
 //                    after the first page opened, for 8 s
 //        [--crowd <n>]  web/tools/roam-crowd.mjs's n simulated players on the same server for the whole run
 //                    (<out>/crowd.log): with 5 or more friends the first cars of our own come into use, in the AI range
+//        [--crowd-args "--cars all"]  more of roam-crowd's options, as one argument
 //        [--crowd-race 1-3:200:320]  roam-crowd's --race: those players are in a race meanwhile
 //        [--seed <save tree>]  every page starts from that save (web/tools/save-seed.mjs, as run-suite's
 //                    NFSU2_SAVE_SEED: e.g. a player's "Download a backup" unzipped) instead of a fresh one
 //        [--fresh Neo]  that page starts from a fresh profile all the same (a new career's prologue beside
 //                    --seed's careers: tests/scripts/mprace_nocar_b.txt)
+//        [--seed-for Bob:<save tree>]  that page starts from its own save instead (two careers' cars in one
+//                    race: mprace_lobby_a.txt + mprace_card_b.txt at a race open in its career)
 //
 // Without --base it starts its own server (web/tools/server-cmd.mjs, --dev on the given
 // ports, the game folder from --data or NFSU2_DATA) and stops it at the end.
@@ -49,6 +74,7 @@
 // <out>/summary.json; then runs tools/roam_compare.py for the first (the driver)
 // against every other instance.
 import { chromium } from 'playwright';
+import { pickBrowser } from './browser.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -77,12 +103,17 @@ const SPECS = (argv.includes('--solo') ? [opt('a', 'Alice:roam_mp_drive.txt')]
   .filter(Boolean).map(x => x.split(':'));
 const N = SPECS.length;
 const APP = opt('page', 'test') === 'app';
+const DOWNLOAD_LOG = APP && argv.includes('--download-log');
 const PLAY = opt('page', 'test') === 'play', SIZE = opt('size', opt('page', 'test') === 'app' ? '1600x900' : '960x540').split('x').map(Number), PLAY_ONLY = opt('play-only', '');
 const FETCH = opts('fetch');                 // files of each page's save folder to copy out, as <out>/<name>.<file>
 const SEED = opt('seed', '');               // a save tree each page starts from
 const FRESH = opts('fresh');                 // pages that start from a fresh profile all the same
-const seeded = name => SEED && !FRESH.includes(name);
+const SEED_FOR = new Map(opts('seed-for').map(s => [s.slice(0, s.indexOf(':')), s.slice(s.indexOf(':') + 1)]));   // a page's own
+const seedOf = name => SEED_FOR.get(name) || (FRESH.includes(name) ? '' : SEED);
+const seeded = name => !!seedOf(name);
+const SPEEDHACK = new Map(opts('speedhack').map(x => [x.split(':')[0], +(x.split(':')[1] ?? 3)]));
 const HIDE = opts('hide').map(x => { const [n, at, dur] = x.split(':'); return { name: n, at: +at * 1000, dur: +(dur ?? 8) * 1000 }; });
+const TOUCH = argv.includes('--touch');      // the pages take taps (`log TAP <selector>`): the touch controls show
 fs.mkdirSync(OUT, { recursive: true });
 
 const COMMON = {
@@ -97,7 +128,7 @@ for (const kv of opts('env')) COMMON[kv.slice(0, kv.indexOf('='))] = kv.slice(kv
 
 function url(i, name, script, own) {
   const env = { ...COMMON, NFSU2_ROAM_NAME: name, ROAM_PROFILE: name };
-  for (const kv of own ? own.split(',') : []) env[kv.slice(0, kv.indexOf('='))] = kv.slice(kv.indexOf('=') + 1);
+  for (const kv of own ? own.split(/,(?=[A-Za-z0-9_]+=)/) : []) env[kv.slice(0, kv.indexOf('='))] = kv.slice(kv.indexOf('=') + 1);
   if (MODE === 'vlan') env.NFSU2_ROAM_WEBTEST = 'vlan';
   else {
     env.NFSU2_ROAM_PORT = String(47300 + i);
@@ -110,6 +141,7 @@ function url(i, name, script, own) {
   const play = PLAY && (!PLAY_ONLY || PLAY_ONLY === name);
   if (play) { q.set('w', String(SIZE[0])); q.set('h', String(SIZE[1])); q.set('artifacts', `/artifacts/${name}-`); q.set('dumpscale', '1'); }
   for (const [k, v] of Object.entries(env)) if (!(APP && (k === 'NFSU2_SAVEDIR'))) q.append('env', `${k}=${v}`);
+  for (const kv of opts('page-arg')) q.append(kv.slice(0, kv.indexOf('=')), kv.slice(kv.indexOf('=') + 1));
   const fresh = seeded(name) ? '' : '&fresh';
   return APP ? `${BASE}/?${q}${fresh}` : `${BASE}/test/${play ? 'play' : 'hostcheck'}.html?${q}${fresh}`;
 }
@@ -145,17 +177,20 @@ let crowd = null;
 if (CROWD) {
   const log = fs.openSync(path.join(OUT, 'crowd.log'), 'w');
   crowd = spawn(process.execPath, [path.join(REPO, 'web/tools/roam-crowd.mjs'), '--base', BASE, '--n', String(CROWD), '--seconds', String(TMO / 1000),
-    ...(opt('crowd-race', '') ? ['--race', opt('crowd-race', '')] : [])],
+    ...(opt('crowd-race', '') ? ['--race', opt('crowd-race', '')] : []), ...opt('crowd-args', '').split(' ').filter(Boolean)],
     { cwd: REPO, stdio: ['ignore', log, log] });
 }
 
-const browser = await chromium.launch({ channel: 'chrome', headless: !argv.includes('--headed') });
+// CHROME_ARGS: more of the browser's options, separated by spaces (inside WSL: the Vulkan ones of online-pair's note)
+const browser = await chromium.launch({ ...pickBrowser(), headless: !argv.includes('--headed'), args: process.env.CHROME_ARGS ? process.env.CHROME_ARGS.split(' ') : [] });
 const t0 = Date.now();
 const inst = [];
 async function start(i, name, script, own) {
-  const ctx = await browser.newContext({ ...(HTTPS ? { ignoreHTTPSErrors: true } : {}), ...(APP ? { viewport: { width: SIZE[0], height: SIZE[1] } } : {}) });
+  const ctx = await browser.newContext({ ...(HTTPS ? { ignoreHTTPSErrors: true } : {}), ...(APP ? { viewport: { width: SIZE[0], height: SIZE[1] } } : {}),
+    ...(TOUCH ? { hasTouch: true } : {}), ...(DOWNLOAD_LOG ? { acceptDownloads: true } : {}) });
   const page = await ctx.newPage();
   const log = fs.createWriteStream(path.join(OUT, `${name}.log`));
+  let invites = 0;                                      // (the page's invite links so far: log INVITE)
   const w = (s) => log.write(`${((Date.now() - t0) / 1000).toFixed(3)} ${s}\n`);
   page.on('console', m => {
     w(m.text());
@@ -164,10 +199,89 @@ async function start(i, name, script, own) {
     if (k) void (k[1].startsWith('clean') ? page.evaluate(() => { for (const id of ['lobby', 'lobby-cover']) document.getElementById(id).hidden = true; }) : Promise.resolve())
       .then(() => page.screenshot({ path: path.join(OUT, `${name}-${k[1]}.png`) }))
       .then(() => w(`[shot] ${k[1]}`), e => w(`[shot] ${k[1]} failed: ${e}`));
+    // the page menu as the player uses it, at a script's `log MENU <item>` (its data-act: solid, fps ...): F9, the
+    // item, back to the game
+    const mk = APP && /LOG MENU (\S+)/.exec(m.text());
+    if (mk) void page.keyboard.press('F9').then(() => page.click(`#menu [data-act="${mk[1]}"]`, { timeout: 5000 }))
+      .then(() => page.click('#menu [data-act="resume"]'))
+      .then(() => w(`[menu] ${mk[1]}`), e => w(`[menu] ${mk[1]} failed: ${e}`));
+    // keys pressed on the page, and the right stick as the page reads it, at a script's `log KEY <code> ...` and
+    // `log STICK <x> <y>`
+    const kk = APP && /LOG KEY ([\w ]+)/.exec(m.text());
+    if (kk) void kk[1].trim().split(/\s+/).reduce((p, c) => p.then(() => page.keyboard.press(c)), Promise.resolve())
+      .then(() => w(`[key] ${kk[1].trim()}`), e => w(`[key] ${kk[1]} failed: ${e}`));
+    const sk = APP && /LOG STICK (-?[\d.]+) (-?[\d.]+)/.exec(m.text());
+    if (sk) void page.evaluate(([x, y]) => window.__nfsu2.quickChatStick(x, y), [+sk[1], +sk[2]])
+      .then(r => w(`[stick] ${sk[1]} ${sk[2]}: ${r ? 'the picker' : 'not used'}`), e => w(`[stick] failed: ${e}`));
+    // a finger's tap on the page (--touch), at a script's `log TAP <selector>`
+    const tk = APP && TOUCH && /LOG TAP (.+)$/.exec(m.text());
+    if (tk) void page.tap(tk[1].trim(), { timeout: 5000 }).then(() => w(`[tap] ${tk[1].trim()}`), e => w(`[tap] ${tk[1]} failed: ${e}`));
+    // a finger held there for so many ms (a long press; Playwright taps only), at a script's `log HOLD <ms> <selector>`
+    const hk = APP && TOUCH && /LOG HOLD (\d+) (.+)$/.exec(m.text());
+    if (hk) void (async () => {
+      const box = await page.locator(hk[2].trim()).boundingBox({ timeout: 5000 });
+      if (!box) throw new Error('not shown');
+      const cdp = await page.context().newCDPSession(page);
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: box.x + box.width / 2, y: box.y + box.height / 2 }] });
+      await page.waitForTimeout(+hk[1]);
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+      await cdp.detach();
+    })().then(() => w(`[hold] ${hk[1]} ms ${hk[2].trim()}`), e => w(`[hold] ${hk[2]} failed: ${e}`));
+    // a finger swiped up so many px in the middle of it, and how far it scrolled, at a script's
+    // `log SCROLL <px> <selector>`
+    const sc = APP && TOUCH && /LOG SCROLL (\d+) (.+)$/.exec(m.text());
+    if (sc) void (async () => {
+      const sel = sc[2].trim(), el = page.locator(sel), box = await el.boundingBox({ timeout: 5000 });
+      if (!box) throw new Error('not shown');
+      const top = () => el.evaluate(d => d.scrollTop);
+      const was = await top();
+      const cdp = await page.context().newCDPSession(page);
+      await cdp.send('Input.synthesizeScrollGesture', { x: box.x + box.width / 2, y: box.y + box.height * 0.7, yDistance: -sc[1], gestureSourceType: 'touch', speed: 800 });
+      await cdp.detach();
+      await page.waitForTimeout(300);
+      return `${was} -> ${await top()}`;
+    })().then(r => w(`[scroll] ${sc[2].trim()}: ${r}`), e => w(`[scroll] ${sc[2]} failed: ${e}`));
+    // the menu's Crews popup as the player uses it, at a script's `log CREW <op> ...`: F9, Crews, the act in the popup,
+    // Done, Back to the game
+    const ck = APP && /LOG CREW (join|leave|colour|shot) (?:(\d+) )?(.+)$/.exec(m.text());
+    if (ck) {
+      const [, op, k, arg] = ck, pop = '#crews-pop', crew = () => page.locator(`${pop} li.crew`, { has: page.locator('.crew-name', { hasText: arg.trim() }) });
+      const act = op === 'join' ? () => page.fill('#crews-pop-input', arg.trim()).then(() => page.press('#crews-pop-input', 'Enter'))
+        : op === 'leave' ? () => crew().locator('.crew-leave').click({ timeout: 5000 })
+        : op === 'colour' ? () => crew().locator('.crew-dot').click({ timeout: 5000 }).then(() => page.locator(`${pop} .crew-colours .swatch`).nth(+k).click({ timeout: 5000 }))
+        : () => page.waitForTimeout(300).then(() => page.screenshot({ path: path.join(OUT, `${name}-${arg.trim()}.png`) }));
+      void page.keyboard.press('F9').then(() => page.click('#menu [data-act="crews"]', { timeout: 5000 }))
+        .then(() => page.waitForSelector(`${pop}[open]`, { timeout: 5000 })).then(act)
+        .then(() => page.waitForTimeout(200)).then(() => page.click(`${pop} [data-act="crews-done"]`))
+        .then(() => page.click('#menu [data-act="resume"]'))
+        .then(() => w(`[crew] ${op} ${k ?? ''} ${arg}`), e => w(`[crew] ${op} ${arg} failed: ${e}`));
+    }
+    // an invite link opened in the page, at a script's `log INVITE <fragment>`: the question box, its picture and
+    // what it says, then Join (or Not now)
+    const ik = APP && /LOG INVITE(-NO)? (\S+)/.exec(m.text());
+    if (ik) {
+      const [, no, frag] = ik, shot = path.join(OUT, `${name}-invite-${++invites}.png`);
+      void page.evaluate(f => { location.hash = '#' + f; }, frag)
+        .then(() => page.waitForSelector('#confirm[open]', { timeout: 10000 }))
+        .then(() => page.waitForTimeout(300)).then(() => page.screenshot({ path: shot }))
+        .then(() => page.evaluate(() => `${document.getElementById('confirm-title').textContent} | ${document.getElementById('confirm-body').innerText.replace(/\s*\n+\s*/g, ' / ')}`))
+        .then(said => { w(`[invite] ${frag}: ${said}`); return page.click(no ? '#confirm-cancel' : '#confirm-ok'); })
+        .then(() => page.waitForTimeout(500)).then(() => page.evaluate(() => [document.getElementById('toast').textContent, document.getElementById('page-toast').textContent].filter(Boolean).join(' | ')))
+        .then(told => w(`[invite] ${no ? 'not now' : 'joined'}: ${told}`), e => w(`[invite] ${frag} failed: ${e}`));
+    }
   });
   page.on('pageerror', e => w('PAGEERROR ' + e));
+  // a speed hack: the game threads' clocks k times as fast from their start (a worker's own loop never yields to
+  // anything sent to it later, so the hack goes in with its script, as a browser extension's does)
+  const k = SPEEDHACK.get(name);
+  if (k) await ctx.route(r => r.pathname.endsWith('/host/game-worker.js'), async (route) => {
+    const res = await route.fetch();
+    const hook = `{ const p = performance, real = p.now.bind(p), rd = Date.now, d0 = rd(); p.now = () => real() * ${k}; Date.now = () => d0 + (rd() - d0) * ${k}; }\n`;
+    w(`[speedhack] ${route.request().url()}: its clocks ${k} times as fast`);
+    await route.fulfill({ response: res, body: hook + await res.text() });
+  });
   const u = url(i, name, script, own);
-  if (seeded(name)) w(`[roam-pair] save seed: ${await seedSave(page, BASE, `roam-${name}`, SEED)} files from ${SEED}`);
+  if (seeded(name)) w(`[roam-pair] save seed: ${await seedSave(page, BASE, `roam-${name}`, seedOf(name))} files from ${seedOf(name)}`);
   w(`URL ${u}`);
   await page.goto(u);
   if (APP) {
@@ -184,6 +298,15 @@ async function start(i, name, script, own) {
         const n = globalThis.nfsu2Net; return n ? { ...n.stats(), peers: n.peers } : null;
       });
       if (s) w(`NETSTAT ${JSON.stringify(s)}`);
+      // the app page: what its copy of the log for a stopped page says the game held (lastgame.ts)
+      const held = APP && await page.evaluate(() => {
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (k?.startsWith('nfsu2.lastgame.')) return JSON.parse(localStorage.getItem(k) ?? 'null')?.held ?? '';
+        }
+        return null;
+      });
+      if (held) w(`HELD ${held}`);
     } catch {}
   }, 10000);
   const r = { name, page, ctx, log, w, timer, done: null };
@@ -247,6 +370,13 @@ for (const x of inst) {
       fs.writeFileSync(path.join(OUT, as), buf);
       console.log(`roam-pair: ${as} ${buf.length} bytes`);
     } catch (e) { console.log(`roam-pair: no ${f} from ${x.name}: ${e}`); }
+  }
+  if (DOWNLOAD_LOG) {
+    try {
+      const [dl] = await Promise.all([x.page.waitForEvent('download', { timeout: 15000 }), x.page.click('#log-btn', { timeout: 15000 })]);
+      await dl.saveAs(path.join(OUT, `${x.name}.download.log`));
+      console.log(`roam-pair: ${x.name}.download.log`);
+    } catch (e) { console.log(`roam-pair: no downloaded log from ${x.name}: ${e}`); }
   }
   x.log.end();
 }

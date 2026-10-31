@@ -10,6 +10,9 @@
 // server down: a failed request, a 5xx from a proxy in front of it, or no
 // answer to the page within NAV_WAIT_MS), the copies answer, and for
 // OFFLINE_MS after that they answer first, so one start uses one set of them.
+// An answer from the server in that time does not end it: the page's script
+// from a copy beside /game.json from the server would be two versions, whose
+// renderer and module do not fit (a start that failed so, 2026-10-25).
 // A page that finds the server again and reloads for its newer version (a
 // deploy restarts the server, so its players' pages may start from the copies:
 // shell.ts) says so first ('online'): that start is the server's.  After every start page that came from the server, the files it loads only
@@ -31,6 +34,8 @@ const PAGE = '/', MODULE = '/game.wasm';
 const KEPT = ['/', '/main.js', '/main.css', '/game.json', '/data-manifest',
   '/host/game-worker.js', '/host/io-worker.js', '/host/predownload-worker.js', '/gpu/png-worker.js', '/audio/worklet.js'];
 const LATER = KEPT.slice(4);
+/** the start page's language files (i18n.ts): one is kept once the page fetched it, and kept up to date with the rest */
+const LANG = /^\/lang\/[a-z]+\.json$/;
 const NAV_WAIT_MS = 4000, OFFLINE_MS = 30_000;
 let offlineUntil = 0;
 
@@ -41,7 +46,7 @@ function keyOf(r: Request): string | null {
   if (u.origin !== self.location.origin) return null;
   if (r.mode === 'navigate') return u.pathname === '/' || u.pathname === '/index.html' ? PAGE : null;
   if (u.pathname === MODULE) return /^\?v=[\w-]+$/.test(u.search) ? MODULE + u.search : null;
-  return !u.search && KEPT.includes(u.pathname) ? u.pathname : null;
+  return !u.search && (KEPT.includes(u.pathname) || LANG.test(u.pathname)) ? u.pathname : null;
 }
 
 /** keep a 200 answer, unless the copy has its ETag already; a module replaces the one kept before */
@@ -85,10 +90,9 @@ async function answer(e: FetchEvent, key: string): Promise<Response> {
       if (!res) e.waitUntil(net.then(r => keep(cache, key, r, kept)).catch(() => {}));
       return kept!;
     }
-    offlineUntil = 0;
     e.waitUntil((async () => {
       await keep(cache, key, res.clone(), kept);
-      if (key === PAGE) await refresh(cache, LATER);
+      if (key === PAGE) await refresh(cache, [...LATER, ...(await cache.keys()).map(r => new URL(r.url).pathname).filter(p => LANG.test(p))]);
     })().catch(() => {}));
     return res;
   } catch (err) {

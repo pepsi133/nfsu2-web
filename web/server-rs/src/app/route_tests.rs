@@ -42,9 +42,9 @@ async fn every_share_comes_back_when_the_client_goes() {
     // a download read a little, then reset
     for (path, enc) in [
         ("/data/TRACKS/noise.bin", ""),
-        ("/data-blocks/TRACKS/big.bin?b=0&n=8", "zstd"),
-        ("/data-blocks/TRACKS/big.bin?b=0&n=8", "br"),
-        ("/data-blocks/TRACKS/big.bin?b=0&n=8", "gzip"),
+        ("/data-blocks/v2/TRACKS/big.bin?b=0&n=8", "zstd"),
+        ("/data-blocks/v2/TRACKS/big.bin?b=0&n=8", "br"),
+        ("/data-blocks/v2/TRACKS/big.bin?b=0&n=8", "gzip"),
     ] {
         let mut s = kit.send(path, &[("Accept-Encoding", enc)]).await;
         let mut b = [0u8; 4096];
@@ -143,7 +143,7 @@ async fn runs_come_back_exact() {
     let raw = std::fs::read(kit.path("game/TRACKS/mixed.bin")).unwrap();
     for enc in ["zstd", "br", "gzip", ""] {
         for (b, n) in [(0u64, 3u64), (3, 2), (2, 8), (4, 1)] {
-            let a = kit.get(&format!("/data-blocks/TRACKS/mixed.bin?b={b}&n={n}"), &[("Accept-Encoding", enc)]).await;
+            let a = kit.get(&format!("/data-blocks/v2/TRACKS/mixed.bin?b={b}&n={n}"), &[("Accept-Encoding", enc)]).await;
             assert_eq!(a.status, 200);
             let want = &raw[(b << 20) as usize..raw.len().min(((b + n) << 20) as usize)];
             let got_enc = a.header("content-encoding").unwrap_or("");
@@ -154,6 +154,108 @@ async fn runs_come_back_exact() {
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(kit.app.compressors.count(), 0);
+}
+
+/// a game file's m and s, as the manifest names them
+fn version(kit: &Kit, rel: &str) -> String {
+    let md = std::fs::metadata(kit.path(&format!("game/{rel}"))).unwrap();
+    format!("m={}&s={}", super::etag::num(super::etag::mtime_s(&md)), md.len())
+}
+
+// One block to a client that takes br: compressed as it is sent and kept by a shared cache for a while only, until
+// its block is kept at brotli's best; then that, with its length, kept for good.  Noise is sent as it is, a run of
+// more blocks and a client without br as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_block_goes_out_as_kept_once_it_is() {
+    let kit = Kit::start_keeping(1, |_| {}).await;
+    // a file the manifest does not have yet: only the answers queue its blocks
+    let mut raw = data(1 << 20, false);
+    raw.extend(data((1 << 20) + 777, true));
+    std::fs::write(kit.path("game/TRACKS/late.bin"), &raw).unwrap();
+    let v = version(&kit, "TRACKS/late.bin");
+    let block = |b: usize| raw[b << 20..raw.len().min((b + 1) << 20)].to_vec();
+    let all = [("Accept-Encoding", "zstd, br, gzip")];
+    let a = kit.get(&format!("/data-blocks/v2/TRACKS/late.bin?b=1&n=1&{v}"), &all).await;
+    assert_eq!(a.status, 200);
+    assert_eq!(a.header("content-encoding"), Some("zstd"), "compressed as it is sent");
+    assert_eq!(a.header("cloudflare-cdn-cache-control"), Some(super::blocks::EDGE_WHILE));
+    assert_eq!(decoded("zstd", &a.body), block(1));
+    let mut kept = None;
+    let t0 = std::time::Instant::now();
+    while kept.is_none() {
+        assert!(t0.elapsed() < Duration::from_secs(20), "block 1 kept");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let a = kit.get(&format!("/data-blocks/v2/TRACKS/late.bin?b=1&n=1&{v}"), &all).await;
+        if a.header("content-encoding") == Some("br") {
+            kept = Some(a);
+        }
+    }
+    let a = kept.unwrap();
+    assert_eq!(a.header("content-length"), Some(a.body.len().to_string().as_str()));
+    assert_eq!(a.header("cloudflare-cdn-cache-control"), Some(nfsu2_headers::EDGE_KEEP));
+    assert_eq!(a.header("cdn-cache-control"), Some(nfsu2_headers::EDGE_KEEP));
+    assert_eq!(decoded("br", &a.body), block(1));
+    // the address from before /v2: none; one that names no version: never kept by a shared cache
+    let old = kit.get(&format!("/data-blocks/TRACKS/late.bin?b=1&n=1&{v}"), &all).await;
+    assert_eq!(old.status, 404);
+    let bare = kit.get("/data-blocks/v2/TRACKS/late.bin?b=1&n=1", &all).await;
+    assert_eq!(bare.header("cloudflare-cdn-cache-control"), Some("no-store"));
+    // a HEAD: the kept block's head
+    let head = kit.request("HEAD", &format!("/data-blocks/v2/TRACKS/late.bin?b=1&n=1&{v}"), &all, b"").await;
+    assert_eq!((head.header("content-encoding"), head.header("content-length")), (Some("br"), a.header("content-length")));
+    // noise: as it is, a while, then for good once kept as one sent as it is
+    let a = kit.get(&format!("/data-blocks/v2/TRACKS/late.bin?b=0&n=1&{v}"), &all).await;
+    assert_eq!((a.header("content-encoding"), a.header("cloudflare-cdn-cache-control")), (None, Some(super::blocks::EDGE_WHILE)));
+    assert_eq!(a.body, block(0));
+    let t0 = std::time::Instant::now();
+    loop {
+        let a = kit.get(&format!("/data-blocks/v2/TRACKS/late.bin?b=0&n=1&{v}"), &all).await;
+        assert_eq!((a.header("content-encoding"), &a.body), (None, &block(0)));
+        if a.header("cloudflare-cdn-cache-control") == Some(nfsu2_headers::EDGE_KEEP) {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(20), "block 0 kept as it is");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // a client without br, and a run of two: compressed as they are sent, kept for good as before
+    let a = kit.get(&format!("/data-blocks/v2/TRACKS/late.bin?b=1&n=1&{v}"), &[("Accept-Encoding", "gzip")]).await;
+    assert_eq!((a.header("content-encoding"), a.header("cloudflare-cdn-cache-control")), (Some("gzip"), Some(nfsu2_headers::EDGE_KEEP)));
+    assert_eq!(decoded("gzip", &a.body), block(1));
+    let a = kit.get(&format!("/data-blocks/v2/TRACKS/late.bin?b=0&n=2&{v}"), &all).await;
+    assert_eq!(a.header("cloudflare-cdn-cache-control"), Some(nfsu2_headers::EDGE_KEEP));
+    assert_eq!(decoded(a.header("content-encoding").unwrap_or(""), &a.body), raw[..2 << 20]);
+    // the 5-minute line's counts, then none
+    let line = kit.app.sent.take();
+    assert!(
+        line.starts_with(|c: char| c.is_ascii_digit() && c != '0') && line.contains(" kept, ") && line.contains(" as they are"),
+        "{line}"
+    );
+    assert_eq!(kit.app.sent.take(), "");
+}
+
+// The manifest's files: every block kept without being asked for (the sweep at the start)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_manifests_blocks_are_kept_unasked() {
+    let kit = Kit::start_keeping(2, |root| std::fs::write(root.join("game/TRACKS/swept.bin"), data((2 << 20) + 5000, true)).unwrap()).await;
+    let raw = std::fs::read(kit.path("game/TRACKS/swept.bin")).unwrap();
+    let v = version(&kit, "TRACKS/swept.bin");
+    // swept.bin's three blocks kept: a HEAD of a kept one is br (of one not kept, the head of the block as it is), and
+    // queues none.  (Counting the files in blocks/ took the half-written ones too, and the manifest's other blocks: it
+    // went on before these were all kept.)
+    let t0 = std::time::Instant::now();
+    for b in 0..3usize {
+        let path = format!("/data-blocks/v2/TRACKS/swept.bin?b={b}&n=1&{v}");
+        while kit.request("HEAD", &path, &[("Accept-Encoding", "br")], b"").await.header("content-encoding") != Some("br") {
+            assert!(t0.elapsed() < Duration::from_secs(30), "the manifest's block {b} kept in 30 s");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    for b in 0..3usize {
+        let a = kit.get(&format!("/data-blocks/v2/TRACKS/swept.bin?b={b}&n=1&{v}"), &[("Accept-Encoding", "br")]).await;
+        assert_eq!(a.header("content-encoding"), Some("br"), "block {b}");
+        assert!(a.header("content-length").is_some());
+        assert_eq!(decoded("br", &a.body), raw[b << 20..raw.len().min((b + 1) << 20)], "block {b}");
+    }
 }
 
 // A file put in place while it is asked for (a build or a deploy renames the new version over the old one): every
@@ -202,6 +304,30 @@ async fn a_file_put_in_place_meanwhile_is_answered_as_one_version() {
     assert!(bad.is_empty(), "{} of {n} answers: {:?}", bad.len(), &bad[..bad.len().min(5)]);
 }
 
+// /seen: the page's load and its Play counted for the day (days.rs), each browser once; anything else answered the
+// same and not counted
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seen_counts_each_browser_once() {
+    let kit = Kit::start(&[], |_| {}).await;
+    let (a, b) = ("AAAAAAAAAAAAAAAAAAAAAA", "BBBBBBBBBBBBBBBBBBBBBB");
+    for path in [
+        format!("/seen?at=page&id={a}"),
+        format!("/seen?at=page&id={a}"),
+        format!("/seen?at=play&id={a}"),
+        format!("/seen?at=page&id={b}"),
+        format!("/seen?at=roam&id={b}"),
+        "/seen?at=play&id=not%20an%20id".to_string(),
+        "/seen?at=play".to_string(),
+    ] {
+        let r = kit.get(&path, &[]).await;
+        assert_eq!(r.status, 204, "{path}");
+        assert!(r.body.is_empty());
+    }
+    let r = kit.request("HEAD", &format!("/seen?at=play&id={b}"), &[], b"").await;
+    assert_eq!(r.status, 204);
+    assert_eq!(kit.app.days.today(nfsu2_util::now_ms()).1, [2, 1, 0, 0]);
+}
+
 /// an answer's whole length once its head is in (its Content-Length; none: no body)
 fn answer_len(b: &[u8]) -> Option<usize> {
     let end = b.windows(4).position(|w| w == b"\r\n\r\n")?;
@@ -226,7 +352,7 @@ fn bench_routes() {
         ("/index.html 200", "/index.html", String::new()),
         ("/index.html 304", "/index.html", format!("If-None-Match: {etag}\r\n")),
         ("/data/ range", "/data/GLOBAL/small.bin", "Range: bytes=0-99\r\n".to_string()),
-        ("/data-blocks/ as is", "/data-blocks/GLOBAL/small.bin?b=0&n=1", String::new()),
+        ("/data-blocks/ as is", "/data-blocks/v2/GLOBAL/small.bin?b=0&n=1", String::new()),
         ("404", "/nothing/here.js", String::new()),
     ] {
         // (NFSU2_BENCH_ROUTE: that one alone, for a profiler)

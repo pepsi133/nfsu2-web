@@ -1,7 +1,8 @@
 //! The switch's test harness: `start` and `start_full` (a switch behind a listener on 127.0.0.1:0 that answers the
-//! upgrade to /lan and attaches with ?resume, ?g= and ?s=), the fake browser `Client` (tokio-tungstenite), `raw_ws`
-//! and `raw_peer` (plain sockets that read only when told to), `frame_of`, `bundle_of`, `throttle`.  The listener also
-//! answers GET /state with what the page tests read of the switch (they run in node: tests/page.mjs).
+//! upgrade to /lan and attaches with ?resume, ?queue, ?g= and ?s=), the fake browser `Client` (tokio-tungstenite),
+//! `raw_ws` and `raw_peer` (plain sockets that read only when told to), `frame_of`, `bundle_of`, `throttle`.  The listener also
+//! answers GET /state with what the page tests read of the switch (they run in node: tests/page.mjs), and GET
+//! /expel?vip=&code=&msg= with the operator's kick or ban of that player.
 #![allow(dead_code)]
 
 use std::collections::HashSet;
@@ -41,9 +42,9 @@ pub fn ip_str(v: u32) -> String {
     nfsu2_util::vip_str(v)
 }
 
-/// every address the switch hands out: host bytes 2-251 in each /24 of 10.77.0.0/20
+/// every address the switch hands out: host bytes 2-251 in each of 10.77.0-27.x (10.77.0.0/19)
 pub fn all_vips() -> Vec<u32> {
-    (0..16u32).flat_map(|b| (0..250u32).map(move |i| (10 << 24) | (77 << 16) | (b << 8) | (i + 2))).collect()
+    (0..28u32).flat_map(|b| (0..250u32).map(move |i| (10 << 24) | (77 << 16) | (b << 8) | (i + 2))).collect()
 }
 
 /// the tests' options: WebSocket messages of up to 1 MiB taken (max_payload), so that the switch's own limits decide
@@ -113,6 +114,17 @@ async fn serve(lan: Arc<LanSwitch>, mut s: TcpStream) {
         .find(|(k, _)| k.trim().eq_ignore_ascii_case("sec-websocket-key"))
         .map(|(_, v)| v.trim().to_string());
     let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+    // the operator's kick (code 4001) or ban (4003) of vip, with msg: the page tests remove their page this way
+    if path == "/expel" {
+        let arg = |k: &str| query.split('&').find_map(|kv| kv.strip_prefix(&format!("{k}="))).unwrap_or("").to_string();
+        let code: u16 = arg("code").parse().unwrap_or(4001);
+        let m = json!({ "t": if code == 4001 { "kick" } else { "ban" }, "msg": arg("msg") });
+        let done = lan.expel(arg("vip").parse().unwrap_or(0), Bytes::from(m.to_string()), code);
+        let answer =
+            format!("HTTP/1.1 {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", if done { "200 OK" } else { "404 Not Found" });
+        let _ = s.write_all(answer.as_bytes()).await;
+        return;
+    }
     if path == "/state" {
         let body = state(&lan).await.to_string();
         let answer = format!(
@@ -126,20 +138,36 @@ async fn serve(lan: Arc<LanSwitch>, mut s: TcpStream) {
     if s.write_all(&nfsu2_ws::handshake_response(&key, None)).await.is_err() {
         return;
     }
-    let mut resume = false;
+    let (mut resume, mut queue) = (false, false);
     let (mut group, mut site) = (None, None);
+    let (mut ident, mut refuse, mut gate) = (None, None, None);
     for kv in query.split('&').filter(|kv| !kv.is_empty()) {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
         match k {
             "resume" => resume = true,
+            "queue" => queue = true,
             "g" if group.is_none() => group = Some(v.to_string()),
             "s" if site.is_none() => site = Some(v.to_string()),
+            // the server's bans: its id for the client's address, a client it turns away at once, a page id or a
+            // keyphrase's owner it turns away at the hello (with {"t":"ban","msg":<what matched>,"ids":[...]})
+            "ident" => ident = Some(v.to_string()),
+            "refuse" => refuse = Some(Bytes::from(json!({ "t": "ban", "msg": v }).to_string())),
+            "gate" => gate = Some(v.to_string()),
             _ => {}
         }
     }
+    let on_hello: Option<nfsu2_lan::OnHello> = gate.map(|g| {
+        Box::new(move |h: &nfsu2_lan::Hello| {
+            let hit = h.ids.iter().copied().chain(h.owner).find(|x| *x == g)?;
+            Some(Bytes::from(json!({ "t": "ban", "msg": hit, "ids": h.ids }).to_string()))
+        }) as nfsu2_lan::OnHello
+    });
+    // a keyphrase's owner: "owner-" and its token (the server's is a hash: nfsu2-claims)
+    let on_claim: nfsu2_lan::OnClaim = Box::new(|c| Some(format!("owner-{c}").into()));
     let pre = Bytes::copy_from_slice(&buf[end..]);
     let (r, w) = s.into_split();
-    lan.attach(r, w, pre, AttachOpts { resume, group, site, ..AttachOpts::default() });
+    let on_claim = Some(on_claim);
+    lan.attach(r, w, pre, AttachOpts { resume, queue, group, site, ident, refuse, on_hello, on_claim, ..AttachOpts::default() });
 }
 
 /// what the page tests read of the switch (sw.lan.peers, info(), reserved)
@@ -293,15 +321,17 @@ enum Cmd {
 
 #[derive(Default, Clone, Copy)]
 pub struct Opts {
-    pub deltas: bool,
+    /// LAN play in its hello: 0 or 1 (None: 1, the LAN screens open, so that it hears every player and broadcast)
     pub lan: Option<u8>,
     pub bundle: bool,
     /// and compact bundles (kind 33): its frames come as they are in `frames`, `unpack_compact` takes them apart
     pub compact: bool,
-}
-
-pub fn deltas() -> Opts {
-    Opts { deltas: true, ..Opts::default() }
+    /// its page's id (the hello's "id"), the ones its page found besides it ("was"), its keyphrase's token ("claim")
+    pub id: Option<&'static str>,
+    pub was: Option<&'static [&'static str]>,
+    pub claim: Option<&'static str>,
+    /// the players its page blocks (the hello's "block")
+    pub block: Option<&'static [&'static str]>,
 }
 
 pub fn lan(on: u8) -> Opts {
@@ -313,8 +343,8 @@ pub fn bundles() -> Opts {
 }
 
 /// A fake browser: collects control messages and frames; `resume` = (vip, token): reconnects as the page does
-/// (/lan?resume, then a hello with the old address and the token before anything else); its hello says deltas,
-/// lan and bundle as `Opts` say.
+/// (/lan?resume, then a hello with the old address and the token before anything else); its hello says lan and
+/// bundle as `Opts` say.
 pub struct Client {
     pub name: String,
     pub vip: u32,
@@ -338,17 +368,24 @@ impl Client {
 
     pub async fn new(port: u16, name: &str, query: &str, resume: Option<(u32, &str)>, o: Opts) -> Client {
         let mut extra = Map::new();
-        if o.deltas {
-            extra.insert("deltas".into(), 1.into());
-        }
-        if let Some(l) = o.lan {
-            extra.insert("lan".into(), l.into());
-        }
+        extra.insert("lan".into(), o.lan.unwrap_or(1).into());
         if o.bundle {
             extra.insert("bundle".into(), 1.into());
         }
         if o.compact {
             extra.insert("compact".into(), 1.into());
+        }
+        if let Some(id) = o.id {
+            extra.insert("id".into(), id.into());
+        }
+        if let Some(w) = o.was {
+            extra.insert("was".into(), w.into());
+        }
+        if let Some(c) = o.claim {
+            extra.insert("claim".into(), c.into());
+        }
+        if let Some(b) = o.block {
+            extra.insert("block".into(), b.into());
         }
         let q = match (resume.is_some(), query.is_empty()) {
             (true, true) => "?resume".to_string(),
@@ -661,12 +698,13 @@ pub fn drain(mut s: TcpStream) -> JoinHandle<()> {
     })
 }
 
-/// a host on the switch for the tests (the breakdown's: its address, name and vips())
+/// a host on the switch for the tests (the breakdown's: its address, name and vips(); the browsers it heard leave)
 pub struct FakeHost {
     pub vip: u32,
     pub name: String,
     pub listed: bool,
     pub vips: Arc<Mutex<HashSet<u32>>>,
+    pub gone: Arc<Mutex<Vec<u32>>>,
 }
 
 impl Host for FakeHost {
@@ -680,7 +718,9 @@ impl Host for FakeHost {
         self.listed
     }
     fn frame(&self, _from: u32, _data: Bytes, _ctx: nfsu2_util::FrameCtx) {}
-    fn peer_gone(&self, _vip: u32) {}
+    fn peer_gone(&self, vip: u32) {
+        self.gone.lock().unwrap().push(vip);
+    }
     fn info(&self) -> oneshot::Receiver<Value> {
         let (tx, rx) = oneshot::channel();
         let _ = tx.send(json!({}));
@@ -690,6 +730,40 @@ impl Host for FakeHost {
         let (tx, rx) = oneshot::channel();
         let _ = tx.send(self.vips.lock().unwrap().clone());
         rx
+    }
+    fn stop(&self) {}
+}
+
+/// a free-roam hub on the switch for the tests that keeps what it is told of blocks (`Host::blocks`): (vip, names), and
+/// (vip, none) for a browser that left (`Host::peer_gone`)
+pub struct BlockHub(pub Arc<Mutex<Vec<(u32, Vec<String>)>>>);
+
+impl Host for BlockHub {
+    fn vip(&self) -> u32 {
+        ip("10.77.0.253")
+    }
+    fn name(&self) -> &str {
+        "hub"
+    }
+    fn listed(&self) -> bool {
+        false
+    }
+    fn frame(&self, _from: u32, _data: Bytes, _ctx: nfsu2_util::FrameCtx) {}
+    fn peer_gone(&self, vip: u32) {
+        self.0.lock().unwrap().push((vip, Vec::new()));
+    }
+    fn info(&self) -> oneshot::Receiver<Value> {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(json!({}));
+        rx
+    }
+    fn vips(&self) -> oneshot::Receiver<HashSet<u32>> {
+        let (tx, rx) = oneshot::channel();
+        let _ = tx.send(HashSet::new());
+        rx
+    }
+    fn blocks(&self, vip: u32, names: Vec<String>) {
+        self.0.lock().unwrap().push((vip, names));
     }
     fn stop(&self) {}
 }

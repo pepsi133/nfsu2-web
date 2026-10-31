@@ -19,7 +19,8 @@
 #                                    keeps the rest of the VPS its share; docs/web/VPS.md, "A share of the VPS")
 # then:  docker compose up -d && docker compose logs -f server
 # Port 80 taken by something else on the VPS: compose.443.yml.  A Cloudflare Tunnel instead of Caddy:
-# compose.tunnel.yml.  Cloudflare's proxy (orange cloud) in front of Caddy: compose.cloudflare.yml.
+# compose.tunnel.yml.  Cloudflare's proxy (orange cloud) in front of Caddy: compose.cloudflare.yml.  Cloudflare's
+# proxy straight to the server (no Caddy, no tunnel): compose.origin.yml.
 name: nfsu2-web
 services:
   caddy:
@@ -42,12 +43,15 @@ services:
       NFSU2_THREADS: ${NFSU2_THREADS:-}
       # the room for keyphrase saves, in GB (docs/web/VPS.md, "Keyphrase saves"; 50 when not set, 0: none)
       NFSU2_VAULT_GB: ${NFSU2_VAULT_GB:-}
+      # Cloudflare Turnstile's keys for claiming a name (docs/web/VPS.md, "Claimed names"; none: no check)
+      NFSU2_TURNSTILE_SITE: ${NFSU2_TURNSTILE_SITE:-}
+      NFSU2_TURNSTILE_SECRET: ${NFSU2_TURNSTILE_SECRET:-}
     volumes:
       - ${NFSU2_DATA:-./game}:/game:ro
       - ${NFSU2_MODULE:-./module}:/module:ro
       - state:/state
     # what the systemd unit (nfsu2-web.service) allows the server, as far as a container goes: nothing to write
-    # but its state, no capabilities, no swap, 65536 open files (the Rust image's 4000 players take up to 32000
+    # but its state, no capabilities, no swap, 65536 open files (the Rust image's 7000 players take up to 56000
     # connections, 8 each); 8 GB of memory, not the unit's 3 GB (the live Node server reached 2.6 GB with 110 players)
     read_only: true
     cap_drop: [ALL]
@@ -57,13 +61,17 @@ services:
     ulimits: { nofile: 65536 }
     # the game's share of the VPS's CPU, with Caddy's (or cloudflared's): web/deploy/nfsu2.slice
     cgroup_parent: ${NFSU2_SLICE:-nfsu2.slice}
+    # the VPS's cgroup tree (read only), not one of its own, so that the server sees what the whole slice uses: over
+    # 85 % of its quota free roam gives players fewer friends (the console's "CPU quota" line at the start says the
+    # quota it found, the [players] lines what the slice used)
+    cgroup: host
     # the console, kept by Docker in files it rotates (5 of 20 MB), so the log never fills the VPS's disk
     logging: { driver: local }
 configs:
   caddyfile:
     # web/deploy/Caddyfile for NFSU2_HOST.  Caddy names no software (no Server or Via header, also not on its
     # redirects and errors), closes a connection for any other name (the bare address, a scanner's made-up name)
-    # without an answer, and opens at most 31900 connections to the server (the Rust image takes 32000 with 4000
+    # without an answer, and opens at most 55900 connections to the server (the Rust image takes 56000 with 7000
     # players).  It believes no proxy in front: the client's address is the one that connected, and a
     # CF-Connecting-IP a client sends is replaced by it (behind Cloudflare's proxy: compose.cloudflare.yml).  The
     # admin API (127.0.0.1:2019) stays off: nothing reconfigures Caddy while it runs.
@@ -85,7 +93,7 @@ configs:
       	reverse_proxy 127.0.0.1:${NFSU2_HTTP_PORT:-8080} {
       		header_up CF-Connecting-IP {client_ip}
       		transport http {
-      			max_conns_per_host 31900
+      			max_conns_per_host 55900
       		}
       	}
       	header -Server

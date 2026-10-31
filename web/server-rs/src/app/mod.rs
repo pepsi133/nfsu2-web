@@ -11,16 +11,21 @@
 //! address and nickname, never by their real address (--access-log is the one opt-in that records client addresses).
 
 mod blocks;
+pub mod control;
+pub mod days;
 mod etag;
 mod files;
+mod kept;
 mod lan;
 mod manifest;
+mod names;
 mod pool;
 #[cfg(test)]
 mod route_tests;
 mod run;
 #[cfg(test)]
 mod testkit;
+mod turnstile;
 mod url;
 mod vault;
 mod wasm;
@@ -83,7 +88,7 @@ pub mod limits {
     pub const WS_MAX_PAYLOAD: usize = 64 << 10;
     pub const ARTIFACT_BYTES: usize = 64 << 20;
     /// each player holds at most 6 HTTP connections and a WebSocket, so with many players (a VPS with --max-peers
-    /// 4000) the port takes 8 per player
+    /// 6000) the port takes 8 per player
     pub fn max_connections(max_peers: usize) -> usize {
         1024.max(max_peers * 8)
     }
@@ -148,7 +153,7 @@ const STATUS: [(u16, &str); 8] = [
     (503, "Service Unavailable"),
 ];
 
-pub const ROBOTS_TXT: &str = "User-agent: *\nAllow: /\nDisallow: /data/\nDisallow: /data-manifest\nDisallow: /game.wasm\nDisallow: /game.json\nDisallow: /players\nDisallow: /lan\nDisallow: /vault";
+pub const ROBOTS_TXT: &str = "User-agent: *\nAllow: /\nDisallow: /data/\nDisallow: /data-manifest\nDisallow: /game.wasm\nDisallow: /game.json\nDisallow: /players\nDisallow: /seen\nDisallow: /lan\nDisallow: /vault\nDisallow: /names";
 
 /// what a client may ask a file to be sent as
 const TYPES: [(&str, &str); 11] = [
@@ -212,12 +217,22 @@ pub struct App {
     wasm: wasm::WasmCell,
     real_roots: Arc<Mutex<HashMap<String, String>>>,
     pool: Arc<pool::CpuPool>,
+    /// the game data's blocks at brotli's best (kept.rs), none with NFSU2_COMPRESS_THREADS=0
+    kept: Option<Arc<kept::KeptBlocks>>,
+    /// the /data-blocks/ answers since the 5-minute line
+    sent: blocks::Sent,
     pub lan: Arc<LanSwitch>,
     pub online: Option<Arc<OnlineHost>>,
     /// free roam's hub (its `crowded()` and `in_roam()` for /players), none with --roam-hub off
     pub roam: Option<Arc<nfsu2_roam::RoamHub>>,
     /// keyphrase saves (/vault), none with --vault-gb 0
     pub vault: Option<vault::VaultRoute>,
+    /// claimed names (/names), none without keyphrase saves
+    pub names: Option<names::NamesRoute>,
+    /// the operator's bans (the control socket: control.rs), checked at /lan
+    pub bans: Arc<nfsu2_bans::Bans>,
+    /// how many come each day (days.rs: /seen, the hellos, the sweep)
+    pub days: Arc<days::Days>,
     /// SO_SNDBUF for /lan connections (NFSU2_LAN_SNDBUF, a measurement knob; 0: the kernel's own, which Linux grows
     /// to megabytes, ahead of the switch's own queue rules)
     lan_sndbuf: usize,
@@ -241,16 +256,50 @@ impl App {
         online: Option<Arc<OnlineHost>>,
         roam: Option<Arc<nfsu2_roam::RoamHub>>,
         vault: Option<Arc<nfsu2_vault::Vault>>,
+        names: Option<names::NamesRoute>,
+        bans: Arc<nfsu2_bans::Bans>,
+        days: Arc<days::Days>,
         pool_threads: usize,
         lan_sndbuf: usize,
+        compress_threads: usize,
     ) -> App {
         let host_check = HostCheck::new(&o.hosts);
+        let real_roots: Arc<Mutex<HashMap<String, String>>> = Arc::default();
+        let manifest: Arc<manifest::ManifestCell> = Arc::default();
+        // the kept blocks: in the state folder, swept again for each new manifest
+        let kept = (compress_threads > 0)
+            .then(|| match kept::KeptBlocks::open(std::path::Path::new(&real_state).join("blocks"), compress_threads) {
+                Ok(k) => Some(k),
+                Err(e) => {
+                    log::error(&format!("kept blocks: none ({e})"));
+                    None
+                }
+            })
+            .flatten();
+        if let Some(k) = &kept {
+            let (k, data, roots, state) = (k.clone(), o.data.clone(), real_roots.clone(), real_state.clone());
+            manifest.on_new(Arc::new(move |m: &manifest::Manifest| {
+                let (data, roots, state) = (data.clone(), roots.clone(), state.clone());
+                k.sweep(&m.etag, m.files.clone(), move |rel| {
+                    let file = files::resolve_game(&data, &format!("/{rel}"))?;
+                    let f = files::locate_sync(&roots, &state, &data, &file)?;
+                    Some((f.real, f.md))
+                });
+            }));
+        }
         let mut base = Vec::new();
         for hsts in [false, true] {
             for noindex in [false, true] {
                 for cache in [Cache::Store, Cache::Revalidate, Cache::Immutable] {
                     let mut h: Vec<(String, String)> =
                         security_headers(hsts, noindex).into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+                    // Cloudflare's check where names are claimed (turnstile.rs): its script and frame
+                    if names.as_ref().is_some_and(|n| n.turnstile.is_some()) {
+                        for (k, v) in h.iter_mut().filter(|(k, _)| k == "content-security-policy") {
+                            let _ = k;
+                            *v = nfsu2_headers::CSP_TURNSTILE.to_string();
+                        }
+                    }
                     for (k, v) in cache_headers(cache) {
                         h.push((k.to_string(), v.to_string()));
                     }
@@ -290,14 +339,19 @@ impl App {
                 blocks::COMPRESSORS_TOTAL,
                 0.0,
             )),
-            manifest: Arc::default(),
+            manifest,
             wasm: wasm::WasmCell::default(),
-            real_roots: Arc::new(Mutex::new(HashMap::new())),
+            real_roots,
             pool: Arc::new(pool::CpuPool::new(pool_threads, "nfsu2-blocks")),
+            kept,
+            sent: blocks::Sent::default(),
             lan,
             online,
             roam,
             vault: vault.map(vault::VaultRoute::new),
+            names,
+            bans,
+            days,
             lan_sndbuf,
             o,
         }
@@ -488,9 +542,12 @@ impl App {
         if q.method == "PUT" && self.o.dev && !self.o.artifacts.is_empty() && p.starts_with("/artifacts/") {
             return self.put_artifact(q, s, &p[11..]).await;
         }
-        // keyphrase saves: their own methods and bodies (vault.rs)
+        // keyphrase saves and claimed names: their own methods and bodies (vault.rs, names.rs)
         if p == "/vault" {
             return self.vault(q, s, &u).await;
+        }
+        if p == "/names" {
+            return self.names(q, s, &u).await;
         }
         if q.method != "GET" && q.method != "HEAD" {
             return self
@@ -516,6 +573,10 @@ impl App {
         if let Some(rest) = p.strip_prefix("/data-blocks")
             && rest.starts_with('/')
         {
+            // (the manifest's addresses since blocks are kept; the ones from before, without /v2, are no more)
+            let Some(rest) = rest.strip_prefix(blocks::V2).filter(|r| r.starts_with('/')) else {
+                return self.not_found(q, s).await;
+            };
             let file = files::resolve_game(&self.o.data, rest);
             return self.send_blocks(q, s, file, &u).await;
         }
@@ -526,7 +587,10 @@ impl App {
             return self.send_game_json(q, s).await;
         }
         if p == "/players" {
-            return self.send_players(q, s).await;
+            return self.send_players(q, s, &u).await;
+        }
+        if p == "/seen" {
+            return self.send_seen(q, s, &u).await;
         }
         if p == "/robots.txt" {
             return self.plain(q, s, 200, ROBOTS_TXT, &[], Cache::Revalidate, false).await;
@@ -599,10 +663,15 @@ impl App {
     /// /players: how many play on this server now (the start page's Multiplayer settings): three counts, whether it
     /// is full and whether free roam is busy, nothing else, no names, addresses or times; online: in the game's Online
     /// mode (logged in, or racing an online race), null with --online off; roam: driving in free roam, or paused
-    /// there, as of the hub's last tick (nfsu2-roam), null with --roam-hub off; full: a game that connects now gets
-    /// "LAN full"; roamBusy: the hub gives fewer than askCap links a player, so the page does not ask the free-roam
-    /// question now (false with --roam-hub off)
-    async fn send_players(&self, q: &Request, s: &mut Response) -> Res {
+    /// there, as of the hub's last tick (nfsu2-roam), null with --roam-hub off; full: a game that connects now waits in
+    /// line (a connection without ?queue, which cannot wait: "LAN full"); queue: the pages waiting in line (nfsu2-lan queue.rs); roamBusy: the
+    /// hub gives fewer than askCap links a player, so the page does not ask the free-roam question now (false with
+    /// --roam-hub off).  ?room=<hash> (roam_core's rc_room_hash of a Room setting, decimal,
+    /// not 0) adds room: how many of roam are in that room (with --roam-hub on).  ?crews=<hash>,<hash>,... (the
+    /// rc_room_hash of each of the Crews setting's words, decimal; the first 4 that are numbers and not 0, the rest
+    /// left out) adds crews: how many of roam are in each of those crews, in any room, in that order (with --roam-hub
+    /// on, and one of them at least); both as of the hub's last tick, from its counts (nothing waits for its thread)
+    async fn send_players(&self, q: &Request, s: &mut Response, u: &url::Url) -> Res {
         let info = match &self.online {
             Some(h) => {
                 let rx = nfsu2_util::Host::info(h.as_ref());
@@ -627,7 +696,19 @@ impl App {
         m.insert("online".into(), online);
         m.insert("roam".into(), roam);
         m.insert("full".into(), serde_json::Value::Bool(self.lan.full()));
+        m.insert("queue".into(), serde_json::Value::from(self.lan.waiting()));
         m.insert("roamBusy".into(), serde_json::Value::Bool(self.roam.as_ref().is_some_and(|r| r.crowded())));
+        let room = u.param("room").and_then(|r| r.parse::<u32>().ok()).filter(|&r| r != 0);
+        if let (Some(room), Some(r)) = (room, &self.roam) {
+            m.insert("room".into(), serde_json::Value::from(r.in_room(room).min(players)));
+        }
+        let crews: Vec<u32> = u.param("crews").map_or(Vec::new(), |c| {
+            c.split(',').filter_map(|h| h.parse::<u32>().ok()).filter(|&h| h != 0).take(nfsu2_roam::CREWS).collect()
+        });
+        if let Some(r) = self.roam.as_ref().filter(|_| !crews.is_empty()) {
+            let n = r.in_crews(&crews).into_iter().map(|n| serde_json::Value::from(n.min(players))).collect();
+            m.insert("crews".into(), serde_json::Value::Array(n));
+        }
         let body = nfsu2_util::json::stringify(&serde_json::Value::Object(m));
         let mut h = self.headers(q, Cache::Store, true);
         h.set("content-type", "application/json");
@@ -636,6 +717,22 @@ impl App {
         if q.method != "HEAD" {
             send(s, body.as_bytes()).await?;
         }
+        finish(s).await
+    }
+
+    /// /seen?at=page|play&id=<the page's id>: a browser opened the page or pressed Play, counted for the day
+    /// (days.rs); 204, no body, whatever it said
+    async fn send_seen(&self, q: &Request, s: &mut Response, u: &url::Url) -> Res {
+        let what = match u.param("at").as_deref() {
+            Some("page") => Some(days::Seen::Page),
+            Some("play") => Some(days::Seen::Play),
+            _ => None,
+        };
+        if let (Some(what), Some(id), "GET") = (what, u.param("id"), q.method.as_str()) {
+            self.days.seen(&id, what, nfsu2_util::now_ms());
+        }
+        let h = self.headers(q, Cache::Store, true);
+        s.head(204, h.0);
         finish(s).await
     }
 

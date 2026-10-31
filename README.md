@@ -6,7 +6,7 @@ Web Audio. You bring your own copy of the game.
 
 > Not affiliated with or endorsed by Electronic Arts. This repository contains none of the game's code or data.
 
-![The start page: Play, the controls, the settings and your saves](docs/web/start-page.png)
+![The start page: Play, the controls, your saves and Online](docs/web/start-page.png)
 
 ## What you need
 
@@ -36,8 +36,10 @@ web/start.sh --data "/path/to/Need for Speed Underground 2"
 
 Open **http://localhost:8080/** in Chrome or Firefox and press **Play**. The start page has the settings, your saves
 and the controls. The player's guide is [docs/web/PLAYING.md](docs/web/PLAYING.md). The game plays in any of its
-thirteen languages, in Brazilian Portuguese or in Polish; the dubbed voices and movies and the Portuguese and Polish
-text come from mods, as language packs ([docs/web/VPS.md](docs/web/VPS.md#languages)).
+thirteen languages, in Brazilian Portuguese, in Polish, in Turkish or in Hungarian; the dubbed voices and movies and the
+Portuguese, Polish, Turkish and Hungarian text come from mods, as language packs
+([docs/web/VPS.md](docs/web/VPS.md#languages)). The menus and HUD can be redrawn at four times their size, from a mod
+as a texture pack ([docs/web/VPS.md](docs/web/VPS.md#texture-packs)).
 
 To play with friends, run the server behind HTTPS, for example on a small VPS with Docker:
 [docs/web/VPS.md](docs/web/VPS.md).
@@ -62,8 +64,13 @@ Based on Talha Müderrisoğlu's static recompilation of NFSU2 for Apple Silicon,
 [N64: Recompiled](https://github.com/N64Recomp/N64Recomp) and [XenonRecomp](https://github.com/hedge-dev/XenonRecomp).
 The language packs are built from KyoriAsh's [Multi 13 languages mod](https://nfsmods.xyz/mod/5749) (with Lee-Ryo's
 Thai support, whose patch `runtime/language.c` follows), from TraduMix's and MixMods' Brazilian Portuguese
-translation (Fyro, Beater, Kerlyston F.; Junior_Djjr, SideWinder, Elyzandro) and from PLProjekt's Polish translation
-(Daniel Graszka, MaDeR, Marcin Piech, Nati, Mateusz Wilkowski, alter). Built with the help of Claude Code.
+translation (Fyro, Beater, Kerlyston F.; Junior_Djjr, SideWinder, Elyzandro), from PLProjekt's Polish translation
+(Daniel Graszka, MaDeR, Marcin Piech, Nati, Mateusz Wilkowski, alter), from VileStuff's
+[English Subtitles Fixed](https://nfsmods.xyz/mod/5286), from muntazam's
+[Turkish translation](https://www.moddb.com/mods/need-for-speed-underground-2-turkish-translation-patch) and from
+GameHunter's [Hungarian translation](http://www.gamehunter.hu/2010/08/need-for-speed-underground-2-pc.html)
+(L_zooltan). The texture pack is built from LunicAura106's
+[Upscaled HUD](https://nfsmods.xyz/mod/4319). Built with the help of Claude Code.
 
 ## License
 

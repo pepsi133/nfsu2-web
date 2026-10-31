@@ -17,6 +17,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{AttachCtx, BUNDLE_OUT, CLOSE_TIMEOUT, KIND_BUNDLE, LanSwitch, Peer, Stats, compact};
 
+/// how a page takes its datagrams (`Conn::compact`): as bundles of before, compact bundles, compact bundles with deltas,
+/// and with friends' car states by their fields (fpred.rs)
+pub(crate) const PLAIN: u8 = 0;
+pub(crate) const COMPACT: u8 = 1;
+pub(crate) const DELTAS: u8 = 2;
+pub(crate) const FPRED: u8 = 3;
+/// with DELTAS or FPRED: every other datagram as what changed too (its hello said "ldelta":1: compact.rs `Refs::other`)
+pub(crate) const OTHERS: u8 = 0x10;
+
 /// ws's readyState
 const OPEN: u8 = 1;
 const CLOSING: u8 = 2;
@@ -34,11 +43,13 @@ pub(crate) enum Out {
         src: u32,
         dst: u32,
     },
-    /// a datagram to a peer that takes bundles: into the writer's next bundle (one alone goes as a `Frame`)
+    /// a datagram to a peer that takes bundles: into the writer's next bundle (one alone goes as a `Frame`); `at`: when
+    /// it was queued (`now_us`), for a free-roam ping or pong only (compact.rs `timed`), else 0
     Dgram {
         data: Bytes,
         src: u32,
         dst: u32,
+        at: u32,
     },
     Ping([u8; 8]),
     Pong(Bytes),
@@ -80,8 +91,8 @@ pub(crate) struct OutQueue {
     /// datagrams waiting for the bundle clock (their bytes as bundle entries)
     dgram: AtomicUsize,
     wake: Notify,
-    /// on the bundle clock's list for its next tick
-    armed: AtomicBool,
+    /// on the bundle clock's list for its next tick, and on the slow clock's (`Clock::lane`)
+    armed: [AtomicBool; 2],
 }
 
 impl OutQueue {
@@ -123,9 +134,20 @@ pub(crate) struct Conn {
     pub(crate) peer: Mutex<Option<Arc<Peer>>>,
     /// stream segments wait at the switch for this connection (a hint for its writer: pump after each write)
     pub(crate) streaming: AtomicBool,
-    /// its datagrams go as compact bundles (its hello said "compact":1, compact.rs), to the address it holds
-    pub(crate) compact: AtomicBool,
+    /// how its datagrams go (its hello said "compact":1, "delta":1 and "fpred":1: compact.rs): `PLAIN`, `COMPACT`,
+    /// `DELTAS` or `FPRED`, with `OTHERS` when it said "ldelta":1 too;
+    /// compact ones leave out the address it holds.  One word, so that its writer never sees compact without the
+    /// deltas its page takes (the page keeps the last bodies of every compact bundle it was sent)
+    pub(crate) compact: AtomicU8,
     pub(crate) vip: AtomicU32,
+    /// while it waits in line for a place (queue.rs): its place, and what it sent meanwhile
+    pub(crate) wait: Mutex<crate::queue::Wait>,
+    /// the operator removed it (a kick or a ban: `LanSwitch::expel_conn`)
+    pub(crate) expelled: AtomicBool,
+    /// the id its page keeps (its hello's "id"), for `who`
+    pub(crate) browser: std::sync::OnceLock<Arc<str>>,
+    /// the keyphrase its page plays with, as the server knows it (its hello's "claim": `AttachOpts::on_claim`)
+    pub(crate) owner: std::sync::OnceLock<Arc<str>>,
 }
 
 impl Conn {
@@ -140,13 +162,17 @@ impl Conn {
                 buffered: AtomicUsize::new(0),
                 dgram: AtomicUsize::new(0),
                 wake: Notify::new(),
-                armed: AtomicBool::new(false),
+                armed: [AtomicBool::new(false), AtomicBool::new(false)],
             },
             close: Mutex::new(CloseState::default()),
             peer: Mutex::new(None),
             streaming: AtomicBool::new(false),
-            compact: AtomicBool::new(false),
+            compact: AtomicU8::new(PLAIN),
             vip: AtomicU32::new(0),
+            wait: Mutex::new(Default::default()),
+            expelled: AtomicBool::new(false),
+            browser: Default::default(),
+            owner: Default::default(),
         }
     }
 
@@ -202,12 +228,14 @@ impl Conn {
         let n = 4 + data.len();
         let total = {
             let mut q = self.out.q.lock();
-            q.push(Out::Dgram { data, src, dst });
+            let at = if compact::timed(&data) { now_us() | 1 } else { 0 };
+            q.push(Out::Dgram { data, src, dst, at });
             self.out.dgram.fetch_add(n, Relaxed) + n
         };
         match clock {
             Some(c) if total <= BUNDLE_OUT => {
-                if !self.out.armed.load(Relaxed) && !self.out.armed.swap(true, AcqRel) {
+                let armed = &self.out.armed[c.lane];
+                if !armed.load(Relaxed) && !armed.swap(true, AcqRel) {
                     c.arm(self);
                 }
             }
@@ -263,6 +291,13 @@ impl Conn {
         self.close.lock().received.clone().unwrap_or((1006, Bytes::new()))
     }
 
+    /// its page let go of its place itself (1000 "idle" or "closed": no network feature in use, or the game ended),
+    /// or the operator removed it: nothing is kept for it (its address, its place in line)
+    pub(crate) fn let_go(&self) -> bool {
+        let (code, reason) = self.close_code();
+        (code == 1000 && (&reason[..] == b"idle" || &reason[..] == b"closed")) || self.expelled.load(Relaxed)
+    }
+
     /// ws's closeTimeout: a client that never answers the close frame is cut after 30 s
     fn close_timer(self: &Arc<Self>) {
         let me = self.clone();
@@ -276,7 +311,7 @@ impl Conn {
 }
 
 /// a close frame's payload for a code and its reason (1005: none, ws's `close()`)
-fn close_payload(code: u16, reason: &[u8]) -> Bytes {
+pub(crate) fn close_payload(code: u16, reason: &[u8]) -> Bytes {
     if code == 1005 {
         return Bytes::new();
     }
@@ -326,6 +361,10 @@ async fn write_loop<W: AsyncWrite + Unpin>(sw: Arc<LanSwitch>, conn: Arc<Conn>, 
     let mut items: Vec<Out> = Vec::new();
     let mut buf: Vec<u8> = Vec::new();
     let mut close_sent = false;
+    // a compact bundle as it is made, and the last bodies its page was sent (compact.rs `Refs`)
+    let mut body: Vec<u8> = Vec::new();
+    let mut refs = compact::Refs::default();
+    let mut fp = crate::fpred::Fpred::default();
     loop {
         conn.out.wake.notified().await;
         loop {
@@ -341,8 +380,16 @@ async fn write_loop<W: AsyncWrite + Unpin>(sw: Arc<LanSwitch>, conn: Arc<Conn>, 
                 std::mem::swap(&mut *q, &mut items);
                 conn.out.dgram.store(0, Relaxed);
             }
-            let compact = conn.compact.load(Relaxed).then(|| conn.vip.load(Relaxed));
-            let e = encode(&sw.stats, &items, &mut buf, &mut close_sent, compact);
+            let m = conn.compact.load(Relaxed);
+            let (mode, others) = (m & !OTHERS, m & OTHERS != 0);
+            let c = (mode != PLAIN).then(|| Compact {
+                own: conn.vip.load(Relaxed),
+                refs: (mode >= DELTAS).then_some(&mut refs),
+                fp: (mode == FPRED).then_some(&mut fp),
+                others: others && mode >= DELTAS,
+                body: &mut body,
+            });
+            let e = encode(&sw.stats, &items, &mut buf, &mut close_sent, c);
             conn.out.buffered.fetch_add(e.extra, Relaxed);
             // what the kernel takes leaves `buffered` as it goes (what was skipped after a close frame at the end)
             let mut at = 0;
@@ -382,6 +429,9 @@ async fn write_loop<W: AsyncWrite + Unpin>(sw: Arc<LanSwitch>, conn: Arc<Conn>, 
         if buf.capacity() > KEEP_BUF {
             buf = Vec::new();
         }
+        if body.capacity() > KEEP_BUF {
+            body = Vec::new();
+        }
         if items.capacity() > KEEP_ITEMS {
             items = Vec::new();
         }
@@ -398,18 +448,25 @@ struct Encoded {
     end: bool,
 }
 
-/// the items into `buf`: the datagrams first, as bundles (compact ones for a page that takes them: the address it
-/// holds), then the rest in order; nothing after a close frame
-fn encode(stats: &Stats, items: &[Out], buf: &mut Vec<u8>, close_sent: &mut bool, compact: Option<u32>) -> Encoded {
+/// A page that takes compact bundles: the address it holds, the last bodies it was sent when it takes deltas (and the
+/// last car states, when it takes them by their fields), and the writer's buffer for the bundle being made.
+pub(crate) struct Compact<'a> {
+    own: u32,
+    refs: Option<&'a mut compact::Refs>,
+    fp: Option<&'a mut crate::fpred::Fpred>,
+    /// every other datagram as what changed too (`OTHERS`)
+    others: bool,
+    body: &'a mut Vec<u8>,
+}
+
+/// the items into `buf` in order, the datagrams as bundles (compact ones for a page that takes them) where the first
+/// of them stands: what was queued before it goes first (a newcomer's welcome before its first datagrams: a page in
+/// line said hello before its welcome, so its datagrams are bundles from the start, and a page that takes deltas keeps
+/// the last bodies of every bundle it is sent; the datagrams were all written ahead of the batch's other items once);
+/// nothing after a close frame
+fn encode(stats: &Stats, items: &[Out], buf: &mut Vec<u8>, close_sent: &mut bool, compact: Option<Compact<'_>>) -> Encoded {
     let mut e = Encoded::default();
-    if !*close_sent {
-        let start = buf.len();
-        match compact {
-            Some(own) => bundle_compact(stats, items, buf, own),
-            None => bundle(stats, items, buf),
-        }
-        e.extra = buf.len() - start;
-    }
+    let mut compact = Some(compact);
     for it in items {
         e.counted += it.wire_len();
         if matches!(it, Out::End) {
@@ -420,7 +477,17 @@ fn encode(stats: &Stats, items: &[Out], buf: &mut Vec<u8>, close_sent: &mut bool
             continue;
         }
         match it {
-            Out::Dgram { .. } => {}
+            Out::Dgram { .. } => {
+                // (every datagram of the batch, once)
+                if let Some(c) = compact.take() {
+                    let start = buf.len();
+                    match c {
+                        Some(c) => bundle_compact(stats, items, buf, c),
+                        None => bundle(stats, items, buf),
+                    }
+                    e.extra = buf.len() - start;
+                }
+            }
             Out::Text(b) => frame::encode(frame::TEXT, b, buf),
             Out::Raw(b) => frame::encode(frame::BINARY, b, buf),
             Out::Frame { data, src, dst } => one_frame(buf, data, *src, *dst),
@@ -455,7 +522,7 @@ fn one_frame(buf: &mut Vec<u8>, data: &[u8], src: u32, dst: u32) {
 /// goes as it is
 fn bundle(stats: &Stats, items: &[Out], buf: &mut Vec<u8>) {
     let mut dgrams = items.iter().filter_map(|it| match it {
-        Out::Dgram { data, src, dst } => Some((data, *src, *dst)),
+        Out::Dgram { data, src, dst, .. } => Some((data, *src, *dst)),
         _ => None,
     });
     let Some(mut next) = dgrams.next() else { return };
@@ -501,34 +568,42 @@ fn bundle(stats: &Stats, items: &[Out], buf: &mut Vec<u8>) {
 
 /// the datagrams as compact bundles (compact.rs) of BUNDLE_OUT at most, a datagram alone in one too (its 16-byte
 /// header costs more than a bundle's 4 and an entry's 5)
-fn bundle_compact(stats: &Stats, items: &[Out], buf: &mut Vec<u8>, own: u32) {
-    let mut dgrams = items
-        .iter()
-        .filter_map(|it| match it {
-            Out::Dgram { data, src, dst } => Some((data, *src, *dst)),
-            _ => None,
-        })
-        .peekable();
-    let mut chunk: smallvec::SmallVec<[(&Bytes, u32, u32); 32]> = smallvec::SmallVec::new();
-    while dgrams.peek().is_some() {
-        chunk.clear();
-        let mut sum = 4;
-        while let Some(&(d, src, dst)) = dgrams.peek() {
-            let l = compact::entry_len(d, src, dst, own);
-            if !chunk.is_empty() && sum + l > BUNDLE_OUT {
-                break;
-            }
-            sum += l;
-            chunk.push((d, src, dst));
-            dgrams.next();
+fn bundle_compact(stats: &Stats, items: &[Out], buf: &mut Vec<u8>, c: Compact<'_>) {
+    let Compact { own, mut refs, mut fp, others, body } = c;
+    body.clear();
+    body.extend_from_slice(&[compact::KIND_COMPACT, 0, 0, 0]);
+    let mut n = 0;
+    let (now, mut moved) = (now_us(), [0u8; compact::TIMED_MAX]);
+    for it in items {
+        let Out::Dgram { data, src, dst, at: queued } = it else { continue };
+        let data = compact::waited(data, if *queued != 0 { now.wrapping_sub(*queued) } else { 0 }, &mut moved);
+        let at = body.len();
+        compact::entry_fp(body, data, *src, *dst, own, refs.as_deref_mut(), fp.as_deref_mut(), others);
+        stats.entry_out(data, *dst, &body[at..]);
+        // a bundle takes datagrams while it stays within BUNDLE_OUT (the one that would not fit begins the next; it
+        // was written as the next one, in order, so the page reads the same entries the writer made)
+        if n > 0 && body.len() > BUNDLE_OUT {
+            compact_out(stats, buf, &body[..at]);
+            body.drain(4..at);
+            n = 0;
         }
-        frame::header(frame::BINARY, sum, buf);
-        buf.extend_from_slice(&[compact::KIND_COMPACT, 0, 0, 0]);
-        for (d, src, dst) in &chunk {
-            compact::entry(buf, d, *src, *dst, own);
-        }
-        stats.bundles_out.inc();
+        n += 1;
     }
+    if n > 0 {
+        compact_out(stats, buf, body);
+    }
+}
+
+/// the switch's clock for a datagram's wait for the bundle clock: µs since its first reading, wrapping
+pub(crate) fn now_us() -> u32 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_micros() as u32
+}
+
+fn compact_out(stats: &Stats, buf: &mut Vec<u8>, bundle: &[u8]) {
+    frame::header(frame::BINARY, bundle.len(), buf);
+    buf.extend_from_slice(bundle);
+    stats.bundles_out.inc();
 }
 
 const SHARDS: usize = 16;
@@ -541,16 +616,39 @@ struct Shard(Mutex<Vec<Arc<Conn>>>);
 /// connection, so that senders to different receivers rarely meet on one lock, and each shard ticks on a task of its
 /// own, at a phase of its own: the wake-ups of a crowd's writers are spread over the tick and over the runtime's
 /// workers (one task waking them all put them all on its own worker, for the others to steal).  Its tick can change
-/// while it runs (the switch's `bundle_tick`).
+/// while it runs (the switch's `bundle_tick`).  Each tick is the period give or take `jitter` of it, at random: the game
+/// takes the smallest delay of a friend's snapshots in 2 s for the path's (roam_core.c off_estimate) and draws a solid
+/// car where its driver is now from it, and a tick as long as the time between those snapshots (50 ms, roam_rate 20)
+/// made each wait about as long as the one before, so the car came out behind by that wait (roam-pair, 2026-10-24: up
+/// to 14 ms, 0.22 m off on average).  A tick that wanders gives each snapshot another wait, and the smallest of 2 s
+/// is about none.
 pub(crate) struct Clock {
     shards: Box<[Shard]>,
     period_us: AtomicU64,
+    jitter: f64,
+    /// which of a connection's two flags says it is on this clock's list: 0 the bundle clock, 1 the slow one (away.rs).
+    /// Either's tick wakes the writer, which takes all that waits.
+    lane: usize,
 }
 
 impl Clock {
-    pub(crate) fn new(period: Duration) -> Self {
+    pub(crate) fn new(period: Duration, jitter: f64, lane: usize) -> Self {
         let shards = (0..SHARDS).map(|_| Shard(Mutex::new(Vec::new()))).collect();
-        Clock { shards, period_us: AtomicU64::new(period.as_micros() as u64) }
+        let jitter = if jitter.is_finite() { jitter.clamp(0.0, 0.9) } else { 0.0 };
+        Clock { shards, period_us: AtomicU64::new(period.as_micros() as u64), jitter, lane: lane.min(1) }
+    }
+
+    /// the next tick's length: the period, give or take `jitter` of it (`rng` a shard's own xorshift state)
+    fn next_period(&self, rng: &mut u64) -> Duration {
+        let p = self.period();
+        if self.jitter <= 0.0 {
+            return p;
+        }
+        *rng ^= *rng << 13;
+        *rng ^= *rng >> 7;
+        *rng ^= *rng << 17;
+        let u = (*rng >> 11) as f64 / (1u64 << 53) as f64;
+        p.mul_f64(1.0 + self.jitter * (2.0 * u - 1.0))
     }
 
     pub(crate) fn period(&self) -> Duration {
@@ -570,7 +668,7 @@ impl Clock {
     fn tick(&self, shard: usize, spare: &mut Vec<Arc<Conn>>) {
         std::mem::swap(&mut *self.shards[shard].0.lock(), spare);
         for c in spare.drain(..) {
-            c.out.armed.store(false, Release);
+            c.out.armed[self.lane].store(false, Release);
             c.out.wake.notify_one();
         }
     }
@@ -581,6 +679,8 @@ impl Clock {
         for shard in 0..SHARDS {
             let me = me.clone();
             let phase = period * shard as u32 / SHARDS as u32;
+            let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+            let mut rng = (seed ^ (shard as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1;
             tokio::spawn(async move {
                 let mut next = tokio::time::Instant::now() + phase;
                 let mut spare = Vec::new();
@@ -589,7 +689,7 @@ impl Clock {
                     let Some(c) = me.upgrade() else { return };
                     c.tick(shard, &mut spare);
                     // a tick that came late does not make the next ones come sooner
-                    next = (next + c.period()).max(tokio::time::Instant::now());
+                    next = (next + c.next_period(&mut rng)).max(tokio::time::Instant::now());
                 }
             });
         }
@@ -603,7 +703,20 @@ mod tests {
     fn dg(len: usize, dst: u32) -> Out {
         let mut d = vec![1u8; len];
         d[8..12].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
-        Out::Dgram { data: Bytes::from(d), src: 0x0A4D_0002, dst }
+        Out::Dgram { data: Bytes::from(d), src: 0x0A4D_0002, dst, at: 0 }
+    }
+
+    #[test]
+    fn a_tick_wanders_within_its_jitter_and_keeps_its_mean() {
+        let c = Clock::new(Duration::from_millis(50), 0.4, 0);
+        let mut rng = 0x1234_5678_9ABC_DEF1u64;
+        let ticks: Vec<Duration> = (0..10_000).map(|_| c.next_period(&mut rng)).collect();
+        assert!(ticks.iter().all(|t| (Duration::from_millis(30)..=Duration::from_millis(70)).contains(t)));
+        let mean = ticks.iter().sum::<Duration>() / ticks.len() as u32;
+        assert!((Duration::from_micros(49_500)..=Duration::from_micros(50_500)).contains(&mean), "{mean:?}");
+        assert!(ticks.iter().any(|t| *t < Duration::from_millis(32)) && ticks.iter().any(|t| *t > Duration::from_millis(68)));
+        assert_eq!(Clock::new(Duration::from_millis(50), 0.0, 0).next_period(&mut rng), Duration::from_millis(50));
+        assert_eq!(Clock::new(Duration::from_millis(50), f64::NAN, 0).next_period(&mut rng), Duration::from_millis(50));
     }
 
     #[test]
@@ -648,6 +761,24 @@ mod tests {
         encode(&stats, &items, &mut buf, &mut cs, None);
         assert_eq!(stats.bundles_out.get(), 2);
         assert_eq!(u16::from_be_bytes([buf[2], buf[3]]) as usize, 4 + 3 * 8196);
+    }
+
+    // a newcomer's welcome, queued before its first datagrams, goes before their bundle (a page in line takes bundles
+    // from its first moment); what came after the first datagram goes after the bundle; after a close frame nothing
+    #[test]
+    fn the_welcome_goes_before_the_first_bundle() {
+        let stats = Stats::default();
+        let (mut buf, mut cs) = (Vec::new(), false);
+        let items = vec![Out::Text(Bytes::from_static(b"w")), dg(20, 1), Out::Text(Bytes::from_static(b"p")), dg(20, 2)];
+        encode(&stats, &items, &mut buf, &mut cs, None);
+        assert_eq!(&buf[..3], &[0x81, 1, b'w']);
+        assert_eq!(&buf[3..5], &[0x82, 4 + 2 * 24]);
+        assert_eq!(buf[5], KIND_BUNDLE);
+        assert_eq!(&buf[5 + 4 + 2 * 24..], &[0x81, 1, b'p']);
+        buf.clear();
+        let items = vec![Out::Close(Bytes::from_static(&[3, 0xE8])), dg(20, 1)];
+        encode(&stats, &items, &mut buf, &mut false, None);
+        assert_eq!(buf, [0x88, 2, 3, 0xE8], "nothing after the close frame");
     }
 
     #[test]

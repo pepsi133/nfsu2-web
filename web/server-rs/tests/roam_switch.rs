@@ -64,6 +64,12 @@ async fn on_the_switch_frames_to_the_hub_reach_it_its_lists_come_back_a_departur
     let list = a.until(|g| g.peers().filter(|l| l.len() == 3)).await;
     assert!(list.iter().all(|p| p["vip"] != ROAM_HUB_VIP), "{list:?}");
     assert!(list.iter().any(|p| p["vip"] == VHOST_VIP && p["server"] == true));
+    // back from the LAN screens: free roam alone
+    for x in [&a, &b] {
+        x.text(r#"{"t":"lan","on":0}"#);
+        x.text(r#"{"t":"ping","id":77}"#);
+        x.until(|g| g.ctl.iter().any(|m| m["t"] == "pong" && m["id"] == 77).then_some(())).await;
+    }
     let n = sw.lan.breakdown().await;
     assert_eq!((n.players, n.roam), (2, 2), "both counted in free roam (the console's [players] line): {n:?}");
     assert!(wait_for(2500, || hub.in_roam() == 2).await, "both driving in free roam (/players): {}", hub.in_roam());
@@ -136,5 +142,58 @@ async fn datagrams_to_the_hub_inside_bundles_reach_it() {
     assert_eq!(info["limited"], 0, "{info}");
     a.close().await;
     b.close().await;
+    sw.close().await;
+}
+
+// a claimed name (nfsu2-claims) on the switch: the hello's "claim" names the keyphrase its frames come with, and the
+// hub links a player under a claimed name only when that keyphrase claimed it
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claimed_name_is_its_keyphrases_on_the_switch() {
+    let claims = std::sync::Arc::new(nfsu2_claims::Claims::in_memory());
+    let (a_token, c_token) = ("A".repeat(43), "C".repeat(43));
+    claims.claim("Alex", &nfsu2_claims::owner_of_token(&a_token).unwrap(), nfsu2_util::now_ms()).unwrap();
+    let lines = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+    let l2 = lines.clone();
+    let hub = RoamHub::spawn_with(RoamOptions::default(), std::sync::Arc::new(move |l: &str| l2.lock().push(l.to_string())), Some(claims));
+    let sw = start(LanOptions { max_payload: 1 << 20, ..LanOptions::default() }, None, Some(hub.clone())).await;
+    let hello = |b: &Browser, name: &str, claim: Option<&str>| {
+        let mut m = serde_json::json!({ "t": "hello", "name": name });
+        if let Some(c) = claim {
+            m["claim"] = c.into();
+        }
+        b.text(&m.to_string());
+    };
+    // the owner, a player of no keyphrase and one of another under the same name, and a bystander
+    let a = Browser::open(sw.port, "", None).await;
+    hello(&a, "Alex", Some(&a_token));
+    let b = Browser::open(sw.port, "", None).await;
+    hello(&b, "Bob", None);
+    let c = Browser::open(sw.port, "", None).await;
+    hello(&c, "Alex", Some(&c_token));
+    let d = Browser::open(sw.port, "", None).await;
+    hello(&d, "Alex", None);
+    for (x, id, name, at) in [(&a, 501, &b"Alex"[..], 0.0), (&b, 502, b"Bob", 10.0), (&c, 503, b"alex", 20.0), (&d, 504, b"Alex", 30.0)] {
+        x.binary(to_hub(&roam_hello_named(id, name)));
+        x.binary(to_hub(&roam_snap(id, [at, 0.0, 0.0])));
+    }
+    assert_eq!(hub_until(&hub, |v| v["players"] == 4).await["players"], 4);
+    let (_, vip, _) = b.until_ms(2500, |g| list_from_hub(g, b.vip)).await;
+    assert_eq!(vip, a.vip, "Bob's list: the owner, nearest of the two it may see");
+    sleep(1200).await;
+    let named = |x: &Browser| {
+        b.got().frames.iter().any(|f| {
+            f.len() >= 16 + 27 && f[0] == 1 && be32(f, 8) == b.vip && f[16 + 16] >= 1 && {
+                let n = f[16 + 16] as usize;
+                (0..n).any(|i| be32(f, 16 + 17 + 10 * i) == x.vip)
+            }
+        })
+    };
+    assert!(named(&a), "the owner is linked");
+    assert!(!named(&c) && !named(&d), "the others under its name are not");
+    let l = lines.lock().clone();
+    assert_eq!(l.iter().filter(|l| l.contains("a name another keyphrase claimed")).count(), 2, "{l:?}");
+    for x in [a, b, c, d] {
+        x.close().await;
+    }
     sw.close().await;
 }

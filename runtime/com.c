@@ -126,7 +126,7 @@ static uint32_t gbuf_alloc(uint32_t n){
 uint32_t com_scratch(uint32_t n){ return gbuf_alloc(n); }
 /* runtime/dinput_pad.c: the DirectInput gamepad (device kind 3) */
 int      dipad_guid(uint32_t guid);
-void     dipad_created(uint32_t dev);
+void     dipad_created(uint32_t dev, uint32_t guid);
 int      dipad_enum(CPU *c, uint32_t devtype, uint32_t cb, uint32_t ref, uint32_t flags);
 uint32_t dipad_call(CPU *c, uint32_t self, const char *nm, int nargs, const uint32_t *args);
 /* ... and its force-feedback effects (IDirectInputEffect) */
@@ -339,11 +339,18 @@ static void modes_refresh(void){
         unsigned hh = hts[i], ww = (unsigned)((double)hh * vw / vh + 0.5) & ~1u;
         g_modes[i][0] = ww; g_modes[i][1] = hh;
     }
-    /* NFSU2_RENDER (widescreen.c): backing pixels, panel pixels or a scale. */
-    double rf = ws_render_factor();
-    double dw = vw * rf, dh = vh * rf;
+    /* NFSU2_RENDER (widescreen.c): backing pixels, panel pixels or a scale.
+     * NFSMAXPIX bounds the size at a scale of 1 and below; a scale above 1 is
+     * chosen to go beyond it and multiplies the bounded size (bounded after
+     * the scale, 150% and 200% both came out at ~104% on a 4K screen), up to
+     * 8192 a side: WebGPU's default texture limit (gpu/index.ts asks for no
+     * more). */
+    double rf = ws_render_factor(), up = rf > 1.0 ? rf : 1.0;
+    double dw = vw * rf / up, dh = vh * rf / up;
     double maxpix = ws_max_pixels();
     if (maxpix > 1.0e5 && dw * dh > maxpix){ double k = sqrt(maxpix / (dw * dh)); dw *= k; dh *= k; }
+    dw *= up; dh *= up;
+    if (dw > 8192.0 || dh > 8192.0){ double k = 8192.0 / (dw > dh ? dw : dh); dw *= k; dh *= k; }
     unsigned w = (unsigned)dw & ~1u, h = (unsigned)dh & ~1u;
     g_modes[ROW_NATIVE][0] = w; g_modes[ROW_NATIVE][1] = h;
     /* The 4K row only if the display can show it (screen row >= 2160).
@@ -1568,6 +1575,59 @@ static void texproj_push(void){
     metal_set_texproj(sel);
 }
 
+/* vertices of a DrawPrimitiveUP call with n primitives: D3DPT_POINTLIST 1,
+ * LINELIST 2, LINESTRIP 3, TRIANGLELIST 4, TRIANGLESTRIP 5, TRIANGLEFAN 6 */
+static uint32_t prim_verts(uint32_t pt, uint32_t n){
+    switch (pt){
+    case 1: return n;
+    case 2: return n * 2u;
+    case 3: return n + 1u;
+    case 4: return n * 3u;
+    default: return n + 2u;
+    }
+}
+
+/* The renderers draw triangles only: each line segment becomes a quad across
+ * its minor axis (the diamond rule covers one pixel per column of an x-major
+ * line), from the transformed vertices.  D3D9 lines are one pixel wide, a
+ * hairline at today's sizes: these are one HUD pixel (of 640x480) wide, in
+ * whole pixels.  The dyno chart draws its curves and rpm marker as
+ * one-segment line strips (0x50dcd0): taken for a triangle strip, each got
+ * a third vertex from the game's stack, near the middle of the screen. */
+static void draw_lines(const TVert *tv, uint32_t nv, uint32_t pt){
+    void metal_tex_size(unsigned, unsigned *, unsigned *);
+    void metal_set_cull(unsigned);
+    unsigned w = g_bb_w, h = g_bb_h;
+    if (g_cur_rt) metal_tex_size(g_cur_rt, &w, &h);
+    if (!w || !h) return;
+    float px = fminf((float)w / 640.f, (float)h / 480.f);
+    px = px < 1.f ? 1.f : roundf(px);
+    static TVert q[64 * 6];
+    unsigned nq = 0;
+    uint32_t nseg = (pt == 2u) ? nv / 2u : nv - 1u;
+    metal_set_cull(1u);                      /* lines are never culled */
+    for (uint32_t s = 0; s < nseg; s++){
+        const TVert *a = &tv[(pt == 2u) ? 2u * s : s], *b = a + 1;
+        if (a->w <= 0.f || b->w <= 0.f) continue;
+        float dx = (b->x / b->w - a->x / a->w) * (float)w;
+        float dy = (b->y / b->w - a->y / a->w) * (float)h;
+        if (dx == 0.f && dy == 0.f) continue;
+        /* half the width either side: NDC spans 2 / size per pixel */
+        float ox = 0.f, oy = 0.f;
+        if (fabsf(dx) >= fabsf(dy)) oy = px / (float)h; else ox = px / (float)w;
+        TVert *o = &q[nq];
+        o[0] = *a; o[0].x += ox * a->w; o[0].y += oy * a->w;
+        o[1] = *b; o[1].x += ox * b->w; o[1].y += oy * b->w;
+        o[2] = *a; o[2].x -= ox * a->w; o[2].y -= oy * a->w;
+        o[3] = o[2]; o[4] = o[1];
+        o[5] = *b; o[5].x -= ox * b->w; o[5].y -= oy * b->w;
+        nq += 6;
+        if (nq == sizeof q / sizeof q[0]){ metal_draw_tv(q, nq, 4u, g_cur_tex); nq = 0; }
+    }
+    if (nq) metal_draw_tv(q, nq, 4u, g_cur_tex);
+    metal_set_cull(g_rs[22] ? g_rs[22] : 3u);
+}
+
 /* dip_indexed -> draw_up: this draw's vertices are to be read by index from
  * the copies in the pool (while n > 0).  If draw_up cannot take the GPU path
  * it returns 0 and the caller falls back to the old (index expansion) path. */
@@ -1660,8 +1720,10 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
      * MSL and run on the GPU; vertices are sent RAW, and the fetch layout is
      * taken from the D3D declaration and baked into the shader.
      * A shader that cannot be translated (flow control etc.) does not run
-     * silently wrong: vs_to_msl returns 0 and we fall back to the proven CPU path. */
-    if (prog && nel && stride && stride <= 256u && g_gpuvs){
+     * silently wrong: vs_to_msl returns 0 and we fall back to the proven CPU path.
+     * Lines take the CPU path: draw_lines widens them from the transformed vertices. */
+    int lines = (pt == 2u || pt == 3u);
+    if (prog && nel && stride && stride <= 256u && g_gpuvs && !lines){
         int gid = gpuvs_id(prog, g_cur_vs, g_cur_decl, el, nel);
         if (gid > 0){
             int  metal_draw_raw(const void*, unsigned, unsigned, unsigned,
@@ -1860,7 +1922,8 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
                         g_vsk.f[q][0],g_vsk.f[q][1],g_vsk.f[q][2],g_vsk.f[q][3]);
         }
     }
-    metal_draw_tv(tv, nv, pt, g_cur_tex);
+    if (lines) draw_lines(tv, nv, pt);
+    else metal_draw_tv(tv, nv, pt, g_cur_tex);
     return 1;
 }
 
@@ -2548,15 +2611,16 @@ int com_call(CPU *c, uint32_t magic){
                 draw_stats_save(ptype, stride_hist);
                 if (metal_available()){
                     uint32_t nprim=A(c,2), vp=A(c,3);
-                    uint32_t nv = (pt==4) ? nprim*3u : nprim+2u;
-                    if (vp && stride && nv >= 3 && nv < 4096u &&
+                    uint32_t nv = prim_verts(pt, nprim);
+                    /* points: never drawn by the game */
+                    if (vp && stride && pt >= 2u && pt <= 6u && nv >= 2u && nv < 4096u &&
                         mem_is_committed(vp) && mem_is_committed(vp + nv*stride - 1))
                         draw_up(pt, nv, vp, stride);
                 }
                 if (dd_on()){
                     static uint32_t last_decl = 0xFFFFFFFFu; static int nd = 0;
                     uint32_t nprim=A(c,2), vp=A(c,3);
-                    uint32_t nv = (pt==4) ? nprim*3u : nprim+2u;
+                    uint32_t nv = prim_verts(pt, nprim);
                     if (g_cur_decl != last_decl){ last_decl = g_cur_decl; dd_decl(g_cur_decl); }
                     if (nd++ < 40){
                         fprintf(stderr,"   #%-3d type=%u verts=%-4u stride=%u tex=%u\n",
@@ -2581,7 +2645,7 @@ int com_call(CPU *c, uint32_t magic){
                             pt, A(c,2), stride, d, g_cur_fvf, el);
                     /* dump the first vertices' data */
                     { uint32_t vp = A(c,3), nprim = A(c,2);
-                      uint32_t nv = (pt==6||pt==5) ? nprim+2u : nprim*3u;
+                      uint32_t nv = prim_verts(pt, nprim);
                       if (nv > 6) nv = 6;
                       for (uint32_t v=0; v<nv; v++){
                         uint32_t o = vp + v*stride;
@@ -2743,9 +2807,11 @@ int com_call(CPU *c, uint32_t magic){
                     }
                 }
             }
-            /* is the matrix sane? for c0..c3: last row like (0,0,0,1)
-             * or at least one element of reasonable magnitude */
-            if (sr==0 && n>=4 && pd && mem_is_committed(pd+63)){
+            /* MATCHECK: is the matrix sane? for c0..c3: last row like (0,0,0,1)
+             * or at least one element of reasonable magnitude (a count every
+             * 20,000 uploads, ~5 lines a second in a race: players' logs were
+             * mostly these) */
+            if (ENVC("MATCHECK") && sr==0 && n>=4 && pd && mem_is_committed(pd+63)){
                 static uint64_t good=0, bad=0, zero=0; static int shown=0;
                 int nz=0, big=0;
                 for (int q=0;q<16;q++){
@@ -3203,6 +3269,8 @@ int com_call(CPU *c, uint32_t magic){
             { extern int g_perflog; void perflog_guest_frame(void);
               if (g_perflog) perflog_guest_frame(); }
             { void mprot_rearm(void); mprot_rearm(); }
+            /* the wait for the next frame's slot, before the game reads its input (framerate.c) */
+            { void hfr_after_present(void); hfr_after_present(); }
             /* The game's own slot pools: an exhausted one prints its name in
              * red on screen.  List 0x828538 (tail) -> +4 (previous) ... 0x828534. */
             if (ENVC("POOLS") && (g_present_no % 150) == 20){
@@ -3291,9 +3359,28 @@ int com_call(CPU *c, uint32_t magic){
                             stex, so, ss?MR32(ss+4):0, ss?MR32(ss+8):0,
                             dtex, doo, ds?MR32(ds+4):0, ds?MR32(ds+8):0); }
             }
+            /* A source rectangle (the cover shoot's picture, 0x5C3120: the
+             * middle of the screen) is in the screen the game believes it has
+             * (g_req_w x g_req_h), whose 640x480 menus res_pick shows in the
+             * middle of the back buffer, ws_ui_x/y of its size: one from the
+             * back buffer is mapped the same way.  The destination is whole. */
+            uint32_t srp = A(c,2);
+            int sr[4], *srq = NULL;
+            if (srp && mem_is_committed(srp+15)){
+                for (int k = 0; k < 4; k++) sr[k] = (int)MR32(srp + 4u*(uint32_t)k);
+                uint32_t so = (ss && mem_is_committed(ss+43)) ? MR32(ss+40) : 0;
+                if (so == 1u && g_req_w && g_req_h){
+                    float ux = ws_ui_x(), uy = ws_ui_y();
+                    for (int k = 0; k < 4; k += 2){
+                        sr[k]   = (int)lroundf((float)g_bb_w * (0.5f + ((float)sr[k]   / (float)g_req_w - 0.5f) * ux));
+                        sr[k+1] = (int)lroundf((float)g_bb_h * (0.5f + ((float)sr[k+1] / (float)g_req_h - 0.5f) * uy));
+                    }
+                }
+                srq = sr;
+            }
             if (metal_available() && (stex || dtex) && stex != dtex){
-                void metal_blit(unsigned,unsigned);
-                metal_blit(stex, dtex);
+                void metal_blit_rect(unsigned,unsigned,const int*);
+                metal_blit_rect(stex, dtex, srq);
             }
             r=0; }
         else if (MID(SetRenderTarget)){
@@ -3835,6 +3922,12 @@ int com_call(CPU *c, uint32_t magic){
                                             : (self + 32u + 4u*level)) : 0;
             uint32_t buf = slot ? MR32(slot) : 0;
             if(!buf){ buf = gbuf_alloc(pitch*rows + 64u); if(slot) MR32(slot)=buf; }
+            /* a render target the game made lockable (CreateRenderTarget):
+             * what the GPU drew there, the cover shoot's picture (gpu_web.c) */
+            if (iface==IF_SURF && self && MR32(self+40)==3u && MR32(self+28) && metal_available()){
+                int metal_read_texture(unsigned, void *, unsigned, unsigned);
+                metal_read_texture(MR32(self+28), g_mem+buf, pitch, rows);
+            }
             if(plr){ mem_commit(plr,8); MR32(plr)=pitch; MR32(plr+4)=buf; }
             r=0; }
         else if (MID(UnlockRect)){
@@ -4273,7 +4366,7 @@ int com_call(CPU *c, uint32_t magic){
             }
             MR32(d+8) = kind;
             if (kind == 1) dikbd_created(d);
-            if (kind == 3) dipad_created(d);
+            if (kind == 3) dipad_created(d, g);
             if(pp) MR32(pp)=d; r=0; }
         else if (MID(EnumDevices)){
             /* (dwDevType, lpCallback, pvRef, dwFlags)

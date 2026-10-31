@@ -6,7 +6,8 @@
 // Steps (each prints PASS/FAIL with evidence):
 //   fresh     the page offers the folder but the movies (the game's files only) and says nothing is here yet
 //   full      the download ends with every file but the movies in the cache, byte for byte, and the page says
-//             so; it came in compressed blocks, zstd where the bytes compress, as they are where not
+//             so; it came in compressed blocks, zstd (or br, as the server keeps them) where the bytes compress,
+//             as they are where not
 //   resume    with slow answers: Stop keeps what came, a reload offers the rest, and the rest completes
 //   retry     busy answers (503) and bodies cut short are tried again, and the result is still exact
 //   fail      a server that refuses one file (404): the download stops and says why, keeping the files before it
@@ -15,8 +16,12 @@
 //   delete    "Delete the game data on this PC" while it preloads stops it and leaves nothing
 //   language  with French chosen in Settings: the French language pack's files but its movies, the folder's
 //             but the file the pack has in its place, and no other language's
+//             (no step before fetches a texture pack: Menus and HUD is on Original by default)
+//   texpack   with Menus and HUD on Upscaled: the game data counted gains TEXPACKS/uhud.pak, the rest to preload
+//             is the pack, and it is all that is fetched
 // The game module is out/web/nfsu2.wasm, as for the server (--wasm to use another).
 import { chromium } from 'playwright';
+import { pickBrowser } from './browser.mjs';
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import http from 'node:http';
@@ -61,14 +66,18 @@ make('LANGPACKS/french/SOUND/TINY.BIN', 300);
 make('LANGPACKS/french/speech/UG2_Speech_FR.big', 3 * M + 5, true);
 make('LANGPACKS/french/MOVIES/BIG.VP6', 5 * M);
 make('LANGPACKS/german/speech/UG2_Speech_GR.big', 2 * M);
+// texture packs (runtime/web/texrep_web.c): only the one picked is fetched (none by default)
+make('TEXPACKS/uhud.pak', 2 * M + 3, true);
+make('TEXPACKS/other.pak', M);
 fs.writeFileSync(path.join(DATA, 'NOTES.TXT'), 'not the game: never served');
 // what the download fetches for a game in this language: all but the movies, of the language packs only its own,
-// and not the folder's files its pack has in their place
-function aheadOf(lang) {
+// and not the folder's files its pack has in their place; of the texture packs only the one picked (texpack)
+function aheadOf(lang, texpack = '') {
   const own = [...files.keys()].filter(f => f.startsWith(`LANGPACKS/${lang}/`));
   const covered = new Set(own.map(f => f.split('/').slice(2).join('/')));
   return [...files.keys()].filter(f => !f.startsWith('LANGPACKS/') && !covered.has(f)).concat(own)
-    .filter(f => f.split('/')[f.startsWith('LANGPACKS/') ? 2 : 0] !== 'MOVIES');
+    .filter(f => f.split('/')[f.startsWith('LANGPACKS/') ? 2 : 0] !== 'MOVIES')
+    .filter(f => !f.startsWith('TEXPACKS/') || f === `TEXPACKS/${texpack}.pak`);
 }
 const AHEAD = aheadOf('english');
 const sizeOf = list => list.reduce((a, f) => a + fs.statSync(path.join(DATA, f)).size, 0);
@@ -93,7 +102,7 @@ function report(step, ok, evidence) {
   console.log(`${ok ? 'PASS' : 'FAIL'} ${step}: ${typeof evidence === 'string' ? evidence : JSON.stringify(evidence)}`);
 }
 
-const pc = await chromium.launchPersistentContext(path.join(OUT, 'profile'), { channel: 'chrome', headless: !process.argv.includes('--headed'),
+const pc = await chromium.launchPersistentContext(path.join(OUT, 'profile'), { ...pickBrowser(), headless: !process.argv.includes('--headed'),
   viewport: { width: 1280, height: 900 }, args: ['--enable-unsafe-webgpu'] });
 // requests for the game's files, whoever makes them (the page's workers too)
 let dataRequests = 0;
@@ -104,7 +113,7 @@ const wire = [];
 pc.on('response', r => {
   const u = new URL(r.url());
   if (u.pathname.startsWith('/data-blocks/') && r.status() === 200)
-    wire.push({ url: u.pathname + u.search, path: decodeURIComponent(u.pathname.slice(13)), b: +u.searchParams.get('b'), n: +u.searchParams.get('n'),
+    wire.push({ url: u.pathname + u.search, path: decodeURIComponent(u.pathname.replace(/^\/data-blocks\/(v2\/)?/, '')), b: +u.searchParams.get('b'), n: +u.searchParams.get('n'),
       enc: r.headers()['content-encoding'] ?? 'none' });
 });
 const onWire = async () => {
@@ -184,7 +193,7 @@ try {
     // last byte of TRACKS/RUNPLUSONE.BIN does not), and the whole took fewer bytes
     const packed = p => /^(GLOBAL|TRACKS)\//.test(p) || /^CARS\/CAR(\d\d)\//.test(p) && +/CAR(\d\d)/.exec(p)[1] % 2 === 0;
     const runBytes = w => Math.min(fs.statSync(path.join(DATA, w.path)).size, (w.b + w.n) * M) - w.b * M;
-    const wrongEnc = wire.filter(w => (w.enc === 'zstd') !== (packed(w.path) && runBytes(w) > 16)).map(w => `${w.path}#${w.b}:${w.enc}`);
+    const wrongEnc = wire.filter(w => (w.enc === 'zstd' || w.enc === 'br') !== (packed(w.path) && runBytes(w) > 16)).map(w => `${w.path}#${w.b}:${w.enc}`);
     const bytesOnWire = await onWire();
     report('full', s.state === 'done' && s.have === TOTAL && s.total === TOTAL && c.ok && await page.locator('#fetch-all').isHidden() && /^The game data \(/.test(info) &&
       !ranges.length && wire.length > 0 && !wrongEnc.length && bytesOnWire < TOTAL * 0.8,
@@ -240,7 +249,7 @@ try {
   // ------------------------------------------------------------- fail --
   {
     await clearData();
-    await pc.route('**/data-blocks/SOUND/**', r => r.fulfill({ status: 404, body: 'no' }));
+    await pc.route('**/data-blocks/v2/SOUND/**', r => r.fulfill({ status: 404, body: 'no' }));
     await page.click('#fetch-all');
     const s = await until(s => s.state === 'done' || s.state === 'error');
     await unroute();
@@ -325,6 +334,25 @@ try {
     report('language', btn === want && s.state === 'done' && s.have === total && s.total === total && c.ok &&
       fr.includes('LANGPACKS/french/SOUND/TINY.BIN') && !fr.includes('SOUND/TINY.BIN') && !fr.some(f => /german|MOVIES/.test(f)),
       { btn, want, state: s.state, have: s.have, total, mismatched: c.bad, extra: c.extra });
+  }
+
+  // ---------------------------------------------------------- texpack --
+  {
+    // everything French is here (the language step): with the pack the count gains it, the rest is the pack, and it
+    // is all that comes
+    const up = aheadOf('french', 'uhud'), total = sizeOf(up), want = `Preload the rest (${(sizeOf(['TEXPACKS/uhud.pak']) / 1e6).toFixed(1)} MB)`;
+    wire.length = 0;
+    await page.$eval('input[name="set-ui_textures"][value="uhud"]', el => { el.checked = true; el.dispatchEvent(new Event('change')); });
+    const btn = await page.waitForFunction(w => document.querySelector('#fetch-all').textContent === w && w, want, { timeout: 15000 })
+      .then(h => h.jsonValue()).catch(() => text('#fetch-all'));
+    await page.click('#fetch-all');
+    const s = await until(s => s.state === 'done' || s.state === 'error');
+    await page.waitForTimeout(300);
+    const c = await cacheMatches(up), fetched = [...new Set(wire.map(w => w.path))];
+    report('texpack', btn === want && s.state === 'done' && s.have === total && s.total === total && c.ok &&
+      up.includes('TEXPACKS/uhud.pak') && !up.includes('TEXPACKS/other.pak') && !aheadOf('french').some(f => f.startsWith('TEXPACKS/')) &&
+      fetched.join() === 'TEXPACKS/uhud.pak',
+      { btn, want, state: s.state, have: s.have, total, fetched, mismatched: c.bad, extra: c.extra });
   }
 } catch (e) {
   report('run', false, String(e?.stack ?? e));
