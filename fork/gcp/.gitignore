@@ -1,0 +1,2 @@
+# The operator's own settings. Never commit them.
+config.env
